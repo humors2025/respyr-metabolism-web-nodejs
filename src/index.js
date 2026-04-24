@@ -5,7 +5,7 @@ const apiRoutes = require("./routes/apiRoutes");
 
 const app = express();
 
-console.log("🔥 Lambda function HIT hua");
+console.log("🔥 Lambda function gets HIT ");
 
 // =====================================================
 // ✅ CONDITIONAL CORS MIDDLEWARE (Works for both local and AWS)
