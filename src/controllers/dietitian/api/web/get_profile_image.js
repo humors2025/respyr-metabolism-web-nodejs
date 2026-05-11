@@ -1,59 +1,161 @@
-// controllers/dietitian/api/web/get_profile_image.js
+const pool = require("../../../../config/db");
+const { requireProfileAccess } = require("../../../../utils/accessControl");
 
-const pool = require('../../../../config/db');
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024; // 5 MB
+
+// 1x1 transparent PNG used as fallback
+const DEFAULT_IMAGE = Buffer.from(
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==",
+  "base64"
+);
+
+const detectImageType = (buf) => {
+  if (!buf || buf.length < 4) return null;
+  if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) return "image/png";
+  if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return "image/jpeg";
+  if (buf[0] === 0x52 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x46) return "image/webp";
+  return null;
+};
+
+const setSecureImageHeaders = (res, contentType, length) => {
+  res.setHeader("Content-Type", contentType);
+  res.setHeader("Content-Length", length);
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("Content-Security-Policy", "default-src 'none'");
+  res.setHeader("Cross-Origin-Resource-Policy", "same-origin");
+  res.setHeader("Referrer-Policy", "no-referrer");
+  res.setHeader("Cache-Control", "private, max-age=3600, no-transform");
+};
 
 exports.get_profile_image = async (req, res) => {
   try {
-    const { profile_id } = req.query;
-
-    if (!profile_id) {
-      return res.status(400).json({ error: "Profile ID is required" });
-    }
-
-    const [rows] = await pool.query(
-      "SELECT profile_image FROM table_clients WHERE profile_id = ?",
-      [profile_id]
+    const access = await requireProfileAccess(
+      req,
+      req.query.dietician_id,
+      req.query.profile_id
     );
 
-    if (rows.length && rows[0].profile_image) {
-      const imageBuffer = rows[0].profile_image;
-
-      // IMPORTANT: Send raw buffer
-      res.writeHead(200, {
-        "Content-Type": "image/png", // or image/jpeg
-        "Content-Length": imageBuffer.length,
-        "Cache-Control": "public, max-age=86400"
+    if (!access.allowed) {
+      return res.status(access.statusCode).json({
+        status: false,
+        ok: false,
+        message: access.message,
       });
-
-      return res.end(imageBuffer);
     }
 
-    // Default image (1x1 PNG)
-    const defaultImage = Buffer.from(
-      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==",
-      "base64"
+    const [rows] = await pool.execute(
+      "SELECT profile_image FROM table_clients WHERE profile_id = ? LIMIT 1",
+      [access.profileId]
     );
 
-    res.writeHead(200, {
-      "Content-Type": "image/png",
-      "Content-Length": defaultImage.length
+    if (!rows.length || !rows[0].profile_image) {
+      // Serve default placeholder for missing image
+      setSecureImageHeaders(res, "image/png", DEFAULT_IMAGE.length);
+      return res.end(DEFAULT_IMAGE);
+    }
+
+    const imageData = rows[0].profile_image;
+
+    if (imageData.length > MAX_IMAGE_BYTES) {
+      return res.status(500).json({
+        status: false,
+        ok: false,
+        message: "Image too large",
+      });
+    }
+
+    const contentType = detectImageType(imageData);
+    if (!contentType) {
+      return res.status(500).json({
+        status: false,
+        ok: false,
+        message: "Invalid image data",
+      });
+    }
+
+    setSecureImageHeaders(res, contentType, imageData.length);
+    return res.end(imageData);
+
+  } catch (error) {
+    console.error("get_profile_image error:", {
+      message: error.message,
+      dietician_id: req.query?.dietician_id,
+      profile_id: req.query?.profile_id,
     });
 
-    return res.end(defaultImage);
-
-  } catch (err) {
-    console.error("Image API error:", err);
-
-    const fallback = Buffer.from(
-      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==",
-      "base64"
-    );
-
-    res.writeHead(200, {
-      "Content-Type": "image/png",
-      "Content-Length": fallback.length
+    return res.status(500).json({
+      status: false,
+      ok: false,
+      message: "Internal server error",
     });
-
-    return res.end(fallback);
   }
 };
+
+
+
+
+
+
+
+
+
+
+// // controllers/dietitian/api/web/get_profile_image.js
+
+// const pool = require('../../../../config/db');
+
+// exports.get_profile_image = async (req, res) => {
+//   try {
+//     const { profile_id } = req.query;
+
+//     if (!profile_id) {
+//       return res.status(400).json({ error: "Profile ID is required" });
+//     }
+
+//     const [rows] = await pool.query(
+//       "SELECT profile_image FROM table_clients WHERE profile_id = ?",
+//       [profile_id]
+//     );
+
+//     if (rows.length && rows[0].profile_image) {
+//       const imageBuffer = rows[0].profile_image;
+
+//       // IMPORTANT: Send raw buffer
+//       res.writeHead(200, {
+//         "Content-Type": "image/png", // or image/jpeg
+//         "Content-Length": imageBuffer.length,
+//         "Cache-Control": "public, max-age=86400"
+//       });
+
+//       return res.end(imageBuffer);
+//     }
+
+//     // Default image (1x1 PNG)
+//     const defaultImage = Buffer.from(
+//       "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==",
+//       "base64"
+//     );
+
+//     res.writeHead(200, {
+//       "Content-Type": "image/png",
+//       "Content-Length": defaultImage.length
+//     });
+
+//     return res.end(defaultImage);
+
+//   } catch (err) {
+//     console.error("Image API error:", err);
+
+//     const fallback = Buffer.from(
+//       "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==",
+//       "base64"
+//     );
+
+//     res.writeHead(200, {
+//       "Content-Type": "image/png",
+//       "Content-Length": fallback.length
+//     });
+
+//     return res.end(fallback);
+//   }
+// };

@@ -67,6 +67,10 @@ const {
   get_calander_fill_data,
 } = require('../controllers/dietitian/api/web/get_calander_fill_data');
 
+const {
+  get_clients_data_total_missed_test,
+} = require('../controllers/dietitian/api/web/get_clients_data_total_missed_test');
+
 
 /* ===============================
    Middlewares
@@ -144,6 +148,7 @@ router.post(
 
 router.get(
   '/dietitian/api/web/get_client_image',
+    authMiddleware,
   getClientImageController.get_client_image
 );
 
@@ -163,7 +168,14 @@ router.post(
 
 router.get(
   '/dietitian/api/web/get_profile_image',
+   authMiddleware,
   getProfileImageController.get_profile_image
+);
+
+router.post(
+  '/dietitian/api/web/get_clients_data_total_missed_test',
+  authMiddleware,
+  get_clients_data_total_missed_test
 );
 
 module.exports = router;
