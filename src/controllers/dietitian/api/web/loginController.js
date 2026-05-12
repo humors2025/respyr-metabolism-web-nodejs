@@ -5,12 +5,20 @@ const crypto = require('crypto');
 
 exports.login = async (req, res) => {
   try {
-    // ✅ FIX 1: Handle Lambda body (string → JSON)
+    // Handle Lambda body string
     if (typeof req.body === 'string') {
-      req.body = JSON.parse(req.body);
+      try {
+        req.body = JSON.parse(req.body);
+      } catch (parseError) {
+        return res.status(400).json({
+          ok: false,
+          message: 'Invalid JSON body',
+        });
+      }
     }
 
-    const { identifier, password } = req.body;
+    const identifier = String(req.body?.identifier || '').trim().toLowerCase();
+    const password = String(req.body?.password || '');
 
     if (!identifier || !password) {
       return res.status(400).json({
@@ -19,7 +27,11 @@ exports.login = async (req, res) => {
       });
     }
 
-    // 🔍 Find dietician
+    /**
+     * ROOT FIX:
+     * Login should check table_dietician email/phone,
+     * not table_clients email.
+     */
     const [rows] = await pool.query(
       `SELECT 
          td.dietician_id,
@@ -32,12 +44,17 @@ exports.login = async (req, res) => {
        FROM table_dietician td
        LEFT JOIN table_clients tc 
          ON td.dietician_id = tc.dietician_id
-       WHERE tc.email = ?
+       WHERE LOWER(td.email) = ?
+          OR td.phone_no = ?
        LIMIT 1`,
-      [identifier]
+      [identifier, identifier]
     );
 
     if (!rows.length) {
+      console.log('LOGIN FAILED: dietician not found', {
+        identifier,
+      });
+
       return res.status(401).json({
         ok: false,
         message: 'Invalid email or password',
@@ -46,23 +63,56 @@ exports.login = async (req, res) => {
 
     const dietician = rows[0];
 
-    // 🔐 Verify password
-    const isPasswordValid = await bcrypt.compare(password, dietician.password);
-    if (!isPasswordValid) {
+    if (!dietician.password) {
+      console.log('LOGIN FAILED: password missing in DB', {
+        dietician_id: dietician.dietician_id,
+        email: dietician.email,
+      });
+
       return res.status(401).json({
         ok: false,
         message: 'Invalid email or password',
       });
     }
 
-    // ✅ FIX 2: BASE URL safe for Lambda + Local
+    /**
+     * bcrypt.compare works only if DB password is bcrypt hashed.
+     * Example hash starts with:
+     * $2a$, $2b$, or $2y$
+     */
+    const isPasswordValid = await bcrypt.compare(password, dietician.password);
+
+    if (!isPasswordValid) {
+      console.log('LOGIN FAILED: invalid password', {
+        dietician_id: dietician.dietician_id,
+        email: dietician.email,
+        password_hash_prefix: String(dietician.password).substring(0, 4),
+      });
+
+      return res.status(401).json({
+        ok: false,
+        message: 'Invalid email or password',
+      });
+    }
+
     const baseUrl =
       process.env.BASE_URL || `${req.protocol}://${req.get('host')}`;
 
     const logoUrl = `${baseUrl}/dietitian/api/web/get_client_image?dietician_id=${dietician.dietician_id}`;
-    const profileUrl = `${baseUrl}/dietitian/api/web/get_profile_image?profile_id=${dietician.profile_id}&dietician_id=${dietician.dietician_id}`;
 
-    // 🔑 ACCESS TOKEN
+    const profileUrl = dietician.profile_id
+      ? `${baseUrl}/dietitian/api/web/get_profile_image?profile_id=${dietician.profile_id}&dietician_id=${dietician.dietician_id}`
+      : null;
+
+    if (!process.env.JWT_SECRET || !process.env.JWT_REFRESH_SECRET) {
+      console.error('JWT secrets missing');
+
+      return res.status(500).json({
+        ok: false,
+        message: 'Server configuration error',
+      });
+    }
+
     const accessToken = jwt.sign(
       {
         sub: dietician.dietician_id,
@@ -81,7 +131,6 @@ exports.login = async (req, res) => {
       { expiresIn: '15m' }
     );
 
-    // 🔁 REFRESH TOKEN
     const refreshToken = jwt.sign(
       {
         sub: dietician.dietician_id,
@@ -91,7 +140,6 @@ exports.login = async (req, res) => {
       { expiresIn: '7d' }
     );
 
-    // 🔒 Hash refresh token
     const hashedToken = crypto
       .createHash('sha256')
       .update(refreshToken)
@@ -114,10 +162,14 @@ exports.login = async (req, res) => {
       refresh_token: refreshToken,
       expires_in: 900,
     });
-
   } catch (error) {
-    // ✅ FIX 3: Real error visibility in Lambda
-    console.error('LOGIN ERROR 🔥:', error);
+    console.error('LOGIN ERROR 🔥:', {
+      message: error.message,
+      code: error.code,
+      errno: error.errno,
+      sqlState: error.sqlState,
+      stack: error.stack,
+    });
 
     return res.status(500).json({
       ok: false,
@@ -132,8 +184,6 @@ exports.login = async (req, res) => {
 
 
 
-
-
 // const pool = require('../../../../config/db');
 // const jwt = require('jsonwebtoken');
 // const bcrypt = require('bcryptjs');
@@ -141,6 +191,11 @@ exports.login = async (req, res) => {
 
 // exports.login = async (req, res) => {
 //   try {
+//     // ✅ FIX 1: Handle Lambda body (string → JSON)
+//     if (typeof req.body === 'string') {
+//       req.body = JSON.parse(req.body);
+//     }
+
 //     const { identifier, password } = req.body;
 
 //     if (!identifier || !password) {
@@ -150,16 +205,25 @@ exports.login = async (req, res) => {
 //       });
 //     }
 
-//     // 🔍 Find user
+//     // 🔍 Find dietician
 //     const [rows] = await pool.query(
-//       `SELECT td.dietician_id, td.name, td.email, td.phone_no, td.location, td.password, tc.profile_id
-//        FROM table_dietician td left join table_clients tc on 
-//        td.dietician_id = tc.dietician_id
-//        WHERE tc.email = ? LIMIT 1`,
+//       `SELECT 
+//          td.dietician_id,
+//          td.name,
+//          td.email,
+//          td.phone_no,
+//          td.location,
+//          td.password,
+//          tc.profile_id
+//        FROM table_dietician td
+//        LEFT JOIN table_clients tc 
+//          ON td.dietician_id = tc.dietician_id
+//        WHERE tc.email = ?
+//        LIMIT 1`,
 //       [identifier]
 //     );
 
-//     if (rows.length === 0) {
+//     if (!rows.length) {
 //       return res.status(401).json({
 //         ok: false,
 //         message: 'Invalid email or password',
@@ -177,13 +241,14 @@ exports.login = async (req, res) => {
 //       });
 //     }
 
-//     // 🖼 Logo URL
-//     const logoUrl = `${process.env.BASE_URL}/dietitian/api/web/get_client_image?dietician_id=${dietician.dietician_id}`;
+//     // ✅ FIX 2: BASE URL safe for Lambda + Local
+//     const baseUrl =
+//       process.env.BASE_URL || `${req.protocol}://${req.get('host')}`;
 
-//     // 🖼 Profile URL
-//     const profileUrl = `${process.env.BASE_URL}/dietitian/api/web/get_profile_image?profile_id=${dietician.profile_id}&dietician_id=${dietician.dietician_id}`;
+//     const logoUrl = `${baseUrl}/dietitian/api/web/get_client_image?dietician_id=${dietician.dietician_id}`;
+//     const profileUrl = `${baseUrl}/dietitian/api/web/get_profile_image?profile_id=${dietician.profile_id}&dietician_id=${dietician.dietician_id}`;
 
-//     // 🔑 ACCESS TOKEN (SHORT-LIVED)
+//     // 🔑 ACCESS TOKEN
 //     const accessToken = jwt.sign(
 //       {
 //         sub: dietician.dietician_id,
@@ -195,11 +260,11 @@ exports.login = async (req, res) => {
 //           phone_no: dietician.phone_no,
 //           location: dietician.location,
 //           logo_url: logoUrl,
-//           profile_url: profileUrl
+//           profile_url: profileUrl,
 //         },
 //       },
 //       process.env.JWT_SECRET,
-//       { expiresIn: '15m' } // ⬅️ IMPORTANT
+//       { expiresIn: '15m' }
 //     );
 
 //     // 🔁 REFRESH TOKEN
@@ -212,7 +277,7 @@ exports.login = async (req, res) => {
 //       { expiresIn: '7d' }
 //     );
 
-//     // 🔒 Hash refresh token before storing
+//     // 🔒 Hash refresh token
 //     const hashedToken = crypto
 //       .createHash('sha256')
 //       .update(refreshToken)
@@ -223,7 +288,7 @@ exports.login = async (req, res) => {
 
 //     await pool.query(
 //       `UPDATE table_dietician
-//        SET refresh_token_hash = ?, refresh_token_expires_at = ?
+//        SET refresh_token_hash = ?, refresh_token_exp = ?
 //        WHERE dietician_id = ?`,
 //       [hashedToken, expiresAt, dietician.dietician_id]
 //     );
@@ -233,17 +298,24 @@ exports.login = async (req, res) => {
 //       token_type: 'Bearer',
 //       access_token: accessToken,
 //       refresh_token: refreshToken,
-//       expires_in: 900, // 15 minutes
+//       expires_in: 900,
 //     });
 
 //   } catch (error) {
-//     console.error('Login Error:', error);
+//     // ✅ FIX 3: Real error visibility in Lambda
+//     console.error('LOGIN ERROR 🔥:', error);
+
 //     return res.status(500).json({
 //       ok: false,
-//       message: 'Internal server error',
+//       error: error.message,
 //     });
 //   }
 // };
+
+
+
+
+
 
 
 
