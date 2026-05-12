@@ -162,7 +162,7 @@ router.post(
 
 router.post(
   '/dietitian/api/web/get_calander_fill_data',
-  authMiddleware,
+  // authMiddleware,
   get_calander_fill_data
 );
 
