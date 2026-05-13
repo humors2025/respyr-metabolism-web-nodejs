@@ -5,6 +5,13 @@ const ALLOWED_TYPES = ["all", "tested", "missed"];
 const PAGE_LIMIT = 10;
 const MAX_PAGE = 10000;
 
+/**
+ * TEMP DEBUG:
+ * Set API_DEBUG_ERRORS=true in Lambda env only while debugging.
+ * Remove/disable after issue is fixed for VAPT safety.
+ */
+const SHOULD_EXPOSE_DEBUG = process.env.API_DEBUG_ERRORS === "true";
+
 /* ===============================
    Helpers
 ================================ */
@@ -13,7 +20,22 @@ const normalizeDieticianId = (value) => {
   return String(value || "").trim().toUpperCase();
 };
 
-// YYYY-MM-DD validator
+const parseBodyIfNeeded = (req) => {
+  if (typeof req.body === "string") {
+    try {
+      req.body = JSON.parse(req.body);
+    } catch {
+      req.body = {};
+    }
+  }
+
+  if (!req.body || typeof req.body !== "object") {
+    req.body = {};
+  }
+
+  return req.body;
+};
+
 const isValidDate = (str) => {
   if (typeof str !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(str)) {
     return false;
@@ -37,14 +59,14 @@ const getMetabolismZone = (score) => {
     return null;
   }
 
-  const s = Number(score);
+  const numericScore = Number(score);
 
-  if (Number.isNaN(s)) {
+  if (Number.isNaN(numericScore)) {
     return null;
   }
 
-  if (s >= 80) return "Optimal";
-  if (s >= 70) return "Moderate";
+  if (numericScore >= 80) return "Optimal";
+  if (numericScore >= 70) return "Moderate";
 
   return "Focus";
 };
@@ -108,7 +130,10 @@ const getProfileImageUrl = (row) => {
     return null;
   }
 
-  if (typeof row.profile_image === "string" && isValidHttpUrl(row.profile_image)) {
+  if (
+    typeof row.profile_image === "string" &&
+    isValidHttpUrl(row.profile_image)
+  ) {
     return row.profile_image;
   }
 
@@ -126,7 +151,10 @@ const formatClientRows = (rows, selectedDate) => {
         ? Number(rawScore)
         : null;
 
+    const safeScore = Number.isNaN(score) ? null : score;
+
     const fitnessGoalRaw = row.fitness_goal ?? "";
+
     const fitnessGoalValue =
       String(fitnessGoalRaw).trim() !== "" ? fitnessGoalRaw : "weight_loss";
 
@@ -147,8 +175,8 @@ const formatClientRows = (rows, selectedDate) => {
       fitness_goal: fitnessGoalValue,
       fitness_goal_display: formatFitnessGoal(fitnessGoalRaw),
 
-      metabolism_score: Number.isNaN(score) ? null : score,
-      zone: getMetabolismZone(score),
+      metabolism_score: safeScore,
+      zone: getMetabolismZone(safeScore),
 
       test_taken_count: Number(row.test_taken_count ?? 0),
       last_logged_date: row.last_logged_date,
@@ -162,17 +190,7 @@ const formatClientRows = (rows, selectedDate) => {
   });
 };
 
-const getAuthorizedDieticianId = (req) => {
-  const requestedDieticianId = normalizeDieticianId(req.body?.dietician_id);
-
-  if (!requestedDieticianId) {
-    return {
-      allowed: false,
-      statusCode: 400,
-      message: "dietician_id is required",
-    };
-  }
-
+const getAuthorizedDieticianId = (req, requestedDieticianId) => {
   const access = requireDieticianSelfAccess(req, requestedDieticianId);
 
   if (!access.allowed) {
@@ -180,6 +198,7 @@ const getAuthorizedDieticianId = (req) => {
       allowed: false,
       statusCode: access.statusCode || 403,
       message: access.message || "Access denied",
+      access,
     };
   }
 
@@ -197,12 +216,14 @@ const getAuthorizedDieticianId = (req) => {
       allowed: false,
       statusCode: 401,
       message: "Invalid authentication token",
+      access,
     };
   }
 
   return {
     allowed: true,
     dieticianId,
+    access,
   };
 };
 
@@ -211,28 +232,47 @@ const getAuthorizedDieticianId = (req) => {
 ================================ */
 
 exports.get_clients_data_total_missed_test = async (req, res) => {
+  let debugStep = "controller_started";
+
   try {
-    const body = req.body || {};
+    res.setHeader("X-Controller-Version", "missed-test-v3");
 
-    /* ===============================
-       Auth / Access Control
-    ================================ */
+    debugStep = "parse_body";
+    const body = parseBodyIfNeeded(req);
 
-    const access = getAuthorizedDieticianId(req);
+    debugStep = "validate_dietician_id";
+    const requestedDieticianId = normalizeDieticianId(body.dietician_id);
 
-    if (!access.allowed) {
-      return res.status(access.statusCode).json({
+    if (!requestedDieticianId) {
+      return res.status(400).json({
         status: false,
         ok: false,
-        message: access.message,
+        message: "dietician_id is required",
       });
     }
 
-    const dieticianId = access.dieticianId;
+    debugStep = "access_check";
+    const authResult = getAuthorizedDieticianId(req, requestedDieticianId);
 
-    /* ===============================
-       Input Validation
-    ================================ */
+    console.log("GET_CLIENTS_MISSED_TEST_ACCESS_DEBUG", {
+      requestedDieticianId,
+      allowed: authResult.allowed,
+      dieticianId: authResult.dieticianId || null,
+      accessKeys: authResult.access ? Object.keys(authResult.access) : [],
+      userKeys: req.user ? Object.keys(req.user) : [],
+    });
+
+    if (!authResult.allowed) {
+      return res.status(authResult.statusCode).json({
+        status: false,
+        ok: false,
+        message: authResult.message,
+      });
+    }
+
+    const dieticianId = authResult.dieticianId;
+
+    debugStep = "validate_inputs";
 
     const type = ALLOWED_TYPES.includes(body.type) ? body.type : "all";
 
@@ -249,9 +289,7 @@ exports.get_clients_data_total_missed_test = async (req, res) => {
     const limit = PAGE_LIMIT;
     const offset = (page - 1) * limit;
 
-    /* ===============================
-       Summary Query
-    ================================ */
+    debugStep = "summary_query_build";
 
     const summarySql = `
       SELECT
@@ -278,19 +316,25 @@ exports.get_clients_data_total_missed_test = async (req, res) => {
       WHERE UPPER(TRIM(tc.dietician_id)) = ?
     `;
 
-    const [summaryRows] = await pool.execute(summarySql, [
+    const summaryParams = [
       selectedDate,
       selectedDate,
       dieticianId,
       dieticianId,
-    ]);
+    ];
+
+    debugStep = "summary_query_execute";
+
+    console.log("GET_CLIENTS_MISSED_TEST_SUMMARY_PARAMS", {
+      selectedDate,
+      dieticianId,
+    });
+
+    const [summaryRows] = await pool.execute(summarySql, summaryParams);
 
     const summary = summaryRows[0] || {};
 
-    /* ===============================
-       Filter Condition
-       Safe because value is whitelisted
-    ================================ */
+    debugStep = "filter_condition";
 
     let filterCondition = "";
 
@@ -300,9 +344,7 @@ exports.get_clients_data_total_missed_test = async (req, res) => {
       filterCondition = "AND ttd.profile_id IS NULL";
     }
 
-    /* ===============================
-       Main Query
-    ================================ */
+    debugStep = "main_query_build";
 
     const mainSql = `
       SELECT
@@ -392,7 +434,7 @@ exports.get_clients_data_total_missed_test = async (req, res) => {
       LIMIT ? OFFSET ?
     `;
 
-    const [rows] = await pool.execute(mainSql, [
+    const mainParams = [
       selectedDate,
       dieticianId,
       dieticianId,
@@ -400,7 +442,22 @@ exports.get_clients_data_total_missed_test = async (req, res) => {
       dieticianId,
       limit,
       offset,
-    ]);
+    ];
+
+    debugStep = "main_query_execute";
+
+    console.log("GET_CLIENTS_MISSED_TEST_MAIN_PARAMS", {
+      selectedDate,
+      dieticianId,
+      type,
+      page,
+      limit,
+      offset,
+    });
+
+    const [rows] = await pool.execute(mainSql, mainParams);
+
+    debugStep = "format_response";
 
     return res.status(200).json({
       status: true,
@@ -421,24 +478,37 @@ exports.get_clients_data_total_missed_test = async (req, res) => {
       clients: formatClientRows(rows, selectedDate),
     });
   } catch (error) {
-    console.error("get_clients_data_total_missed_test error:", {
+    const safeLog = {
+      step: debugStep,
       message: error?.message,
       code: error?.code,
       errno: error?.errno,
       sqlState: error?.sqlState,
-      sqlMessage:
-        process.env.NODE_ENV !== "production" ? error?.sqlMessage : undefined,
+      sqlMessage: error?.sqlMessage,
       dietician_id: req.body?.dietician_id,
-    });
+      method: req.method,
+      path: req.originalUrl,
+    };
 
-    return res.status(500).json({
+    console.error("get_clients_data_total_missed_test error:", safeLog);
+
+    const response = {
       status: false,
       ok: false,
       message: "Internal server error",
-    });
+    };
+
+    if (SHOULD_EXPOSE_DEBUG) {
+      response.debug = {
+        step: debugStep,
+        error: error?.sqlMessage || error?.message || "Unknown error",
+        code: error?.code || null,
+      };
+    }
+
+    return res.status(500).json(response);
   }
 };
-
 
 
 
