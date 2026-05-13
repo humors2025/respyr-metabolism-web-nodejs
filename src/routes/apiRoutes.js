@@ -184,8 +184,20 @@ router.get(
   getProfileImageController.get_profile_image
 );
 
+// router.post(
+//   '/dietitian/api/web/get_clients_data_total_missed_test',
+//   authMiddleware,
+//   get_clients_data_total_missed_test
+// );
+
+
 router.post(
-  '/dietitian/api/web/get_clients_data_total_missed_test',
+  "/dietitian/api/web/get_clients_data_total_missed_test",
+  (req, res, next) => {
+    console.log("ROUTE HIT: get_clients_data_total_missed_test v3");
+    res.setHeader("X-Route-Version", "missed-test-route-v3");
+    next();
+  },
   authMiddleware,
   get_clients_data_total_missed_test
 );
