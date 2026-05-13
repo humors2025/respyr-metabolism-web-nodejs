@@ -186,7 +186,7 @@ router.get(
 
 router.post(
   '/dietitian/api/web/get_clients_data_total_missed_test',
-  // authMiddleware,
+  authMiddleware,
   get_clients_data_total_missed_test
 );
 
