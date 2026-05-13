@@ -78,7 +78,12 @@ const {
 
 
 const authMiddleware = require('../middlewares/authMiddleware');
-const loginRateLimiter = require('../middlewares/loginRateLimiter');
+// const loginRateLimiter = require('../middlewares/loginRateLimiter');
+const {
+  loginRateLimiter,
+  loginIpRateLimiter,
+} = require('../middlewares/loginRateLimiter');
+
 const upload = require('../middlewares/upload');
 
 /* ===============================
@@ -104,8 +109,15 @@ authMiddleware,
 get_test_stat);
 
 // 🔐 LOGIN (Rate Limited – Sliding Window Counter)
+// router.post(
+//   '/auth/login',
+//   loginRateLimiter,
+//   loginController.login
+// );
+
 router.post(
   '/auth/login',
+  loginIpRateLimiter,
   loginRateLimiter,
   loginController.login
 );
