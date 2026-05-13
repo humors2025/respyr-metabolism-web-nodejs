@@ -41,8 +41,6 @@
 
 
 
-
-
 const rateLimit = require('express-rate-limit');
 const { ipKeyGenerator } = require('express-rate-limit');
 
@@ -65,13 +63,13 @@ const rateLimitHandler = (req, res) => {
   });
 };
 
-// Per-identifier+IP limiter (strict, prevents targeted brute force)
+// Strict limiter: per IP + identifier (catches targeted brute force)
 const loginRateLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 5,
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 5,                   // 5 attempts per window
   standardHeaders: true,
   legacyHeaders: false,
-  skipSuccessfulRequests: true, // don't count successful logins
+  skipSuccessfulRequests: true, // don't count successful logins against the limit
   keyGenerator: (req) => {
     const ip = ipKeyGenerator(req);
     const identifier = String(req.body?.identifier || 'unknown')
@@ -82,10 +80,10 @@ const loginRateLimiter = rateLimit({
   handler: rateLimitHandler,
 });
 
-// IP-only limiter (broad, prevents IP-based distributed attempts)
+// Broad limiter: per IP only (catches distributed identifier guessing)
 const loginIpRateLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 20,
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 20,                  // 20 attempts per IP per window
   standardHeaders: true,
   legacyHeaders: false,
   keyGenerator: (req) => `login-ip:${ipKeyGenerator(req)}`,
