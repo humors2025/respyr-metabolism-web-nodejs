@@ -1,285 +1,270 @@
-'use strict';
+const pool = require("../../../../config/db");
 
-const pool = require('../../../../config/db');
 const {
   normalizeId,
+  normalizeDieticianId,
   requireProfileAccess,
-} = require('../../../../utils/accessControl');
+} = require("../../../../utils/accessControl");
 
-/* ===============================
-   Constants
-================================ */
-const MAX_DAYS_LIMIT = 90;
-const ZONE_THRESHOLDS = {
-  FOCUS_MAX: 70,
-  MODERATE_MAX: 80,
+/**
+ * Same response format as old PHP API:
+ * {
+ *   status: boolean,
+ *   message: string,
+ *   data?: object
+ * }
+ */
+const sendResponse = (res, httpCode, status, message, data = null) => {
+  const response = {
+    status,
+    message,
+  };
+
+  if (data !== null) {
+    response.data = data;
+  }
+
+  return res.status(httpCode).json(response);
 };
 
-/* ===============================
-   Helpers
-================================ */
-
-/**
- * Sends a standardized JSON response.
- * Avoids leaking internal details to the client.
- */
-function sendResponse(res, httpCode, status, message, data = null) {
-  const payload = { status, message };
-  if (data !== null) payload.data = data;
-  return res.status(httpCode).json(payload);
-}
-
-/**
- * Classifies fat-loss / metabolism score into a zone.
- * Returns "NA" when the score is missing or not numeric.
- */
-function getZone(score) {
-  if (score === null || score === undefined || score === '') return 'NA';
-
-  const numericScore = Number(score);
-  if (!Number.isFinite(numericScore)) return 'NA';
-
-  if (numericScore < ZONE_THRESHOLDS.FOCUS_MAX) return 'Focus';
-  if (numericScore < ZONE_THRESHOLDS.MODERATE_MAX) return 'Moderate';
-  return 'Optimal';
-}
-
-/**
- * Safely converts a value to a finite float, or null.
- */
-function toFloatOrNull(value) {
-  if (value === null || value === undefined || value === '') return null;
-  const num = Number(value);
-  return Number.isFinite(num) ? num : null;
-}
-
-/**
- * Extracts the `final_macro_summary` block from the stored test_json blob.
- * Defensive against:
- *  - NULL / empty values
- *  - Buffer (BLOB) inputs
- *  - Malformed JSON
- *  - Unexpected shapes (final_macro_summary may live at root or under respyr_response)
- */
-function getFinalMacroSummary(testJson) {
-  const emptyMacro = {
-    calories: null,
-    protein_g: null,
-    carbs_g: null,
-    fat_g: null,
-    fiber_g: null,
-  };
-
-  if (testJson === null || testJson === undefined || testJson === '') {
-    return emptyMacro;
+const toNumberOrNull = (value) => {
+  if (value === null || value === undefined || value === "") {
+    return null;
   }
 
-  // Handle BLOB / Buffer from MySQL
-  let rawString;
-  if (Buffer.isBuffer(testJson)) {
-    rawString = testJson.toString('utf8');
-  } else if (typeof testJson === 'object') {
-    // Already parsed by driver
-    return pickMacro(testJson, emptyMacro);
-  } else {
-    rawString = String(testJson);
+  const numberValue = Number(value);
+
+  return Number.isFinite(numberValue) ? numberValue : null;
+};
+
+const getZone = (score) => {
+  const numericScore = toNumberOrNull(score);
+
+  if (numericScore === null) {
+    return "NA";
   }
 
-  let decoded;
+  if (numericScore < 70) {
+    return "Focus";
+  }
+
+  if (numericScore >= 70 && numericScore < 80) {
+    return "Moderate";
+  }
+
+  return "Optimal";
+};
+
+const getEmptyMacroSummary = () => ({
+  calories: null,
+  protein_g: null,
+  carbs_g: null,
+  fat_g: null,
+  fiber_g: null,
+});
+
+const safeJsonDecode = (testJson) => {
+  if (testJson === null || testJson === undefined || testJson === "") {
+    return null;
+  }
+
   try {
-    decoded = JSON.parse(rawString);
-  } catch (err) {
+    if (Buffer.isBuffer(testJson)) {
+      return JSON.parse(testJson.toString("utf8"));
+    }
+
+    if (typeof testJson === "object") {
+      return testJson;
+    }
+
+    if (typeof testJson === "string") {
+      return JSON.parse(testJson);
+    }
+
+    return null;
+  } catch (error) {
+    return null;
+  }
+};
+
+const getFinalMacroSummary = (testJson) => {
+  const emptyMacro = getEmptyMacroSummary();
+
+  const decoded = safeJsonDecode(testJson);
+
+  if (!decoded || typeof decoded !== "object" || Array.isArray(decoded)) {
     return emptyMacro;
   }
 
-  if (!decoded || typeof decoded !== 'object') return emptyMacro;
-
-  return pickMacro(decoded, emptyMacro);
-}
-
-function pickMacro(decoded, emptyMacro) {
   const macro =
-    (decoded.respyr_response && decoded.respyr_response.final_macro_summary) ||
-    decoded.final_macro_summary;
+    decoded?.respyr_response?.final_macro_summary ||
+    decoded?.final_macro_summary ||
+    null;
 
-  if (!macro || typeof macro !== 'object') return emptyMacro;
+  if (!macro || typeof macro !== "object" || Array.isArray(macro)) {
+    return emptyMacro;
+  }
 
   return {
-    calories: toFloatOrNull(macro.calories),
-    protein_g: toFloatOrNull(macro.protein_g),
-    carbs_g: toFloatOrNull(macro.carbs_g),
-    fat_g: toFloatOrNull(macro.fat_g),
-    fiber_g: toFloatOrNull(macro.fiber_g),
+    calories: toNumberOrNull(macro.calories),
+    protein_g: toNumberOrNull(macro.protein_g),
+    carbs_g: toNumberOrNull(macro.carbs_g),
+    fat_g: toNumberOrNull(macro.fat_g),
+    fiber_g: toNumberOrNull(macro.fiber_g),
   };
-}
+};
 
-/**
- * Formats a Date or date-like value as "DD MMM, YYYY" (e.g. "14 May, 2026").
- */
-function formatDisplayDate(value) {
-  if (!value) return null;
-  const d = value instanceof Date ? value : new Date(value);
-  if (Number.isNaN(d.getTime())) return null;
+const formatDisplayDate = (dateValue) => {
+  if (!dateValue) {
+    return "";
+  }
 
-  const months = [
-    'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
-    'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec',
-  ];
+  const dateString = String(dateValue).slice(0, 10);
+  const [year, month, day] = dateString.split("-");
 
-  const day = String(d.getDate()).padStart(2, '0');
-  const month = months[d.getMonth()];
-  const year = d.getFullYear();
+  if (!year || !month || !day) {
+    return "";
+  }
 
-  return `${day} ${month}, ${year}`;
-}
+  const months = {
+    "01": "Jan",
+    "02": "Feb",
+    "03": "Mar",
+    "04": "Apr",
+    "05": "May",
+    "06": "Jun",
+    "07": "Jul",
+    "08": "Aug",
+    "09": "Sep",
+    "10": "Oct",
+    "11": "Nov",
+    "12": "Dec",
+  };
 
-/**
- * Returns YYYY-MM-DD (date-only) string from a date value.
- */
-function toIsoDate(value) {
-  if (!value) return null;
-  const d = value instanceof Date ? value : new Date(value);
-  if (Number.isNaN(d.getTime())) return null;
+  return `${day} ${months[month] || month}, ${year}`;
+};
 
-  const yyyy = d.getFullYear();
-  const mm = String(d.getMonth() + 1).padStart(2, '0');
-  const dd = String(d.getDate()).padStart(2, '0');
-
-  return `${yyyy}-${mm}-${dd}`;
-}
-
-/* ===============================
-   Controller
-================================ */
-
-/**
- * POST /dietitian/api/web/get_profile_details_dates_taken
- *
- * Body: { profile_id: string, dietitian_id: string }
- *
- * Returns: list of distinct test dates (latest test per date) for the given
- * profile_id under the authenticated dietitian, plus total test count.
- *
- * Security:
- *  - Requires valid auth (via authMiddleware on the route).
- *  - Enforces dietitian self-access (token sub === dietitian_id).
- *  - Enforces ownership of profile_id under the authenticated dietitian.
- *  - Uses parameterized queries only (no string concatenation).
- *  - Generic error messages to the client; full errors logged server-side.
- */
-async function get_profile_details_dates_taken(req, res) {
+const get_profile_details_dates_taken = async (req, res) => {
   try {
-    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const body = req.body;
 
-    const profileIdRaw = body.profile_id;
-    const dietitianIdRaw = body.dietitian_id;
-
-    if (
-      profileIdRaw === undefined ||
-      profileIdRaw === null ||
-      String(profileIdRaw).trim() === ''
-    ) {
-      return sendResponse(res, 400, false, 'profile_id is required');
+    if (!body || typeof body !== "object" || Array.isArray(body)) {
+      return sendResponse(res, 400, false, "Invalid raw JSON body");
     }
 
-    if (
-      dietitianIdRaw === undefined ||
-      dietitianIdRaw === null ||
-      String(dietitianIdRaw).trim() === ''
-    ) {
-      return sendResponse(res, 400, false, 'dietitian_id is required');
+    const rawProfileId = body.profile_id;
+    const rawDietitianId = body.dietitian_id;
+
+    if (rawProfileId === undefined || rawProfileId === null || String(rawProfileId).trim() === "") {
+      return sendResponse(res, 400, false, "profile_id is required");
     }
 
-    // Validate IDs against strict whitelist regex (done inside accessControl).
-    if (!normalizeId(profileIdRaw)) {
-      return sendResponse(res, 400, false, 'Invalid profile_id');
+    if (rawDietitianId === undefined || rawDietitianId === null || String(rawDietitianId).trim() === "") {
+      return sendResponse(res, 400, false, "dietitian_id is required");
     }
 
-    // Auth + ownership check
-    const access = await requireProfileAccess(req, dietitianIdRaw, profileIdRaw);
+    const profileId = normalizeId(rawProfileId);
+    const requestedDietitianId = normalizeDieticianId(rawDietitianId);
+
+    if (!profileId) {
+      return sendResponse(res, 400, false, "Invalid profile_id");
+    }
+
+    if (!requestedDietitianId) {
+      return sendResponse(res, 400, false, "Invalid dietitian_id");
+    }
+
+    /**
+     * VAPT important:
+     * This checks:
+     * 1. JWT dietitian id matches requested dietitian_id
+     * 2. profile_id belongs to this dietitian in table_clients
+     */
+    const access = await requireProfileAccess(
+      req,
+      requestedDietitianId,
+      profileId
+    );
 
     if (!access.allowed) {
-      return sendResponse(res, access.statusCode, false, access.message);
+      return sendResponse(
+        res,
+        access.statusCode || 403,
+        false,
+        access.message || "Access denied"
+      );
     }
 
-    const { dieticianId, profileId } = access;
+    const dietitianId = access.dieticianId;
 
-    // -- 1) Total tests taken --------------------------------------------------
     const [countRows] = await pool.execute(
       `
         SELECT COUNT(*) AS total_test_taken
         FROM table_test_data
         WHERE profile_id = ?
-          AND dietitian_id = ?
+          AND UPPER(TRIM(dietitian_id)) = ?
       `,
-      [profileId, dieticianId]
+      [profileId, dietitianId]
     );
 
-    const totalTestTaken =
-      countRows && countRows[0]
-        ? parseInt(countRows[0].total_test_taken, 10) || 0
-        : 0;
+    const totalTestTaken = Number(countRows?.[0]?.total_test_taken || 0);
 
-    // -- 2) Latest test per date (last MAX_DAYS_LIMIT distinct dates) ----------
-    // NOTE: LIMIT is bound as a number to avoid integer-vs-string issues in
-    // some mysql2 versions; value is a hard-coded constant so it is safe.
-    const limitValue = MAX_DAYS_LIMIT;
-
-    const [rows] = await pool.query(
+    const [rows] = await pool.execute(
       `
-        SELECT
+        SELECT 
           t1.test_id,
-          DATE(t1.date_time) AS test_date,
-          t1.date_time,
+          DATE_FORMAT(t1.date_time, '%Y-%m-%d') AS test_date,
+          DATE_FORMAT(t1.date_time, '%Y-%m-%d %H:%i:%s') AS date_time,
           t1.fat_loss_metabolism_score,
           t1.test_json
         FROM table_test_data t1
         INNER JOIN (
-          SELECT
+          SELECT 
             DATE(date_time) AS only_date,
             MAX(date_time) AS max_date_time
           FROM table_test_data
           WHERE profile_id = ?
-            AND dietitian_id = ?
+            AND UPPER(TRIM(dietitian_id)) = ?
           GROUP BY DATE(date_time)
           ORDER BY only_date DESC
-          LIMIT ?
-        ) t2
+          LIMIT 90
+        ) t2 
           ON DATE(t1.date_time) = t2.only_date
-          AND t1.date_time = t2.max_date_time
+         AND t1.date_time = t2.max_date_time
         WHERE t1.profile_id = ?
-          AND t1.dietitian_id = ?
+          AND UPPER(TRIM(t1.dietitian_id)) = ?
         ORDER BY test_date DESC
       `,
-      [profileId, dieticianId, limitValue, profileId, dieticianId]
+      [profileId, dietitianId, profileId, dietitianId]
     );
 
-    const dates = (rows || []).map((row) => {
-      const score = toFloatOrNull(row.fat_loss_metabolism_score);
-      const finalMacroSummary = getFinalMacroSummary(row.test_json);
+    const dates = rows.map((row) => {
+      const score = toNumberOrNull(row.fat_loss_metabolism_score);
 
       return {
         test_id: row.test_id,
-        date: toIsoDate(row.test_date),
+        date: row.test_date,
         display_date: formatDisplayDate(row.test_date),
         latest_test_datetime: row.date_time,
+
         fat_loss_metabolism_score: score,
         fat_loss_metabolism_score_text:
-          score !== null ? `${Math.round(score)}%` : 'NA',
+          score !== null ? `${Math.round(score)}%` : "NA",
         zone: getZone(score),
-        final_macro_summary: finalMacroSummary,
+
+        final_macro_summary: getFinalMacroSummary(row.test_json),
       };
     });
 
-    if (dates.length === 0) {
+    if (!dates.length) {
       return sendResponse(
         res,
         404,
         false,
-        'No test dates found for this profile and dietitian',
+        "No test dates found for this profile and dietitian",
         {
           profile_id: profileId,
-          dietitian_id: dieticianId,
+          dietitian_id: dietitianId,
           total_test_taken: totalTestTaken,
           total_dates: 0,
           dates: [],
@@ -291,23 +276,25 @@ async function get_profile_details_dates_taken(req, res) {
       res,
       200,
       true,
-      'Test dates with fat loss score and macro summary fetched successfully',
+      "Test dates with fat loss score and macro summary fetched successfully",
       {
         profile_id: profileId,
-        dietitian_id: dieticianId,
+        dietitian_id: dietitianId,
         total_test_taken: totalTestTaken,
         total_dates: dates.length,
         dates,
       }
     );
-  } catch (err) {
-    // Log full error server-side; do NOT leak details to client (HIPAA / VAPT).
-    console.error(
-      '[get_profile_details_dates_taken] error:',
-      err && err.message ? err.message : err
-    );
-    return sendResponse(res, 500, false, 'Internal server error');
-  }
-}
+  } catch (error) {
+    console.error("get_profile_details_dates_taken error:", {
+      message: error.message,
+      stack: process.env.NODE_ENV === "production" ? undefined : error.stack,
+    });
 
-module.exports = { get_profile_details_dates_taken };
+    return sendResponse(res, 500, false, "Internal server error");
+  }
+};
+
+module.exports = {
+  get_profile_details_dates_taken,
+};
