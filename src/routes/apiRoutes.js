@@ -71,6 +71,10 @@ const {
   get_clients_data_total_missed_test,
 } = require('../controllers/dietitian/api/web/get_clients_data_total_missed_test');
 
+const {
+  get_profile_details_dates_taken,
+} = require('../controllers/dietitian/api/web/get_profile_details_dates_taken');
+
 
 /* ===============================
    Middlewares
@@ -200,6 +204,13 @@ router.post(
   },
   authMiddleware,
   get_clients_data_total_missed_test
+);
+
+
+router.post(
+  '/dietitian/api/web/get_profile_details_dates_taken',
+  authMiddleware,
+  get_profile_details_dates_taken
 );
 
 module.exports = router;
