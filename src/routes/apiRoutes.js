@@ -232,9 +232,9 @@ router.post(
 
 
 router.post(
-  "/dietitian/api/web/get-data-points-score-all-ranges-coach",
+  "/dietitian/api/web/get_data_points_score_all_ranges_coach",
   authMiddleware,
- get_data_points_score_all_ranges_coach
+  get_data_points_score_all_ranges_coach
 );
 
 module.exports = router;
