@@ -61,6 +61,18 @@ const cleanString = (value, defaultValue = "NA") => {
   return String(value);
 };
 
+const isPlainObject = (value) => {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+};
+
+const safeObject = (value) => {
+  return isPlainObject(value) ? value : {};
+};
+
+const safeArray = (value) => {
+  return Array.isArray(value) ? value : [];
+};
+
 const isValidDateOnly = (value) => {
   if (typeof value !== "string") return false;
 
@@ -142,7 +154,7 @@ const resolveProfileImage = (profileImage, profileId) => {
       return image;
     }
   } catch (_) {
-    // Not a full URL, fallback below.
+    // Not a full URL. Fallback below.
   }
 
   return `https://humorstech.com/dietitian/api/web/get_profile_image.php?profile_id=${encodeURIComponent(
@@ -160,7 +172,9 @@ const parseFoodType = (foodTypeRaw) => {
     };
   }
 
-  const raw = String(foodTypeRaw).trim();
+  const raw = Buffer.isBuffer(foodTypeRaw)
+    ? foodTypeRaw.toString("utf8").trim()
+    : String(foodTypeRaw).trim();
 
   const result = {
     raw,
@@ -216,6 +230,76 @@ const parseFoodType = (foodTypeRaw) => {
   }
 
   return result;
+};
+
+const parseJsonColumn = (columnValue) => {
+  if (columnValue === null || columnValue === undefined) {
+    return {
+      ok: false,
+      empty: true,
+      data: null,
+    };
+  }
+
+  let jsonText = "";
+
+  if (Buffer.isBuffer(columnValue)) {
+    jsonText = columnValue.toString("utf8");
+  } else if (typeof columnValue === "string") {
+    jsonText = columnValue;
+  } else if (
+    columnValue &&
+    columnValue.type === "Buffer" &&
+    Array.isArray(columnValue.data)
+  ) {
+    jsonText = Buffer.from(columnValue.data).toString("utf8");
+  } else if (isPlainObject(columnValue)) {
+    return {
+      ok: true,
+      empty: false,
+      data: columnValue,
+    };
+  } else {
+    return {
+      ok: false,
+      empty: false,
+      data: null,
+    };
+  }
+
+  jsonText = jsonText.trim();
+
+  if (!jsonText) {
+    return {
+      ok: false,
+      empty: true,
+      data: null,
+    };
+  }
+
+  try {
+    const parsed = JSON.parse(jsonText);
+
+    if (!isPlainObject(parsed)) {
+      return {
+        ok: false,
+        empty: false,
+        data: null,
+      };
+    }
+
+    return {
+      ok: true,
+      empty: false,
+      data: parsed,
+    };
+  } catch (_) {
+    return {
+      ok: false,
+      empty: false,
+      data: null,
+    };
+  }
 };
 
 const buildTrendItem = (decodedJson, key, title) => {
@@ -286,7 +370,12 @@ const get_data_points_score_all_ranges_coach = async (req, res) => {
     }
 
     if (!isValidDateOnly(selectedDate)) {
-      return sendResponse(res, 400, false, "Invalid date format. Use YYYY-MM-DD");
+      return sendResponse(
+        res,
+        400,
+        false,
+        "Invalid date format. Use YYYY-MM-DD"
+      );
     }
 
     /**
@@ -442,22 +531,23 @@ const get_data_points_score_all_ranges_coach = async (req, res) => {
     );
 
     if (!testRows.length) {
-      return sendResponse(res, 404, false, "No data available for selected date");
+      return sendResponse(
+        res,
+        404,
+        false,
+        "No data available for selected date"
+      );
     }
 
     const selectedRow = testRows[0];
-    const jsonString = selectedRow.test_json;
 
-    if (!jsonString) {
+    const parsedJson = parseJsonColumn(selectedRow.test_json);
+
+    if (parsedJson.empty) {
       return sendResponse(res, 404, false, "test_json is empty");
     }
 
-    let decodedJson;
-
-    try {
-      decodedJson =
-        typeof jsonString === "object" ? jsonString : JSON.parse(jsonString);
-    } catch (error) {
+    if (!parsedJson.ok) {
       console.error("Invalid test_json:", {
         profile_id: access.profileId,
         dietitian_id: access.dieticianId,
@@ -467,13 +557,7 @@ const get_data_points_score_all_ranges_coach = async (req, res) => {
       return sendResponse(res, 500, false, "Invalid JSON in test_json column");
     }
 
-    if (
-      decodedJson === null ||
-      typeof decodedJson !== "object" ||
-      Array.isArray(decodedJson)
-    ) {
-      return sendResponse(res, 500, false, "Invalid JSON in test_json column");
-    }
+    const decodedJson = parsedJson.data;
 
     const fatScore = cleanFloat(
       getValue(decodedJson, ["Fat_Use_Pattern_trend", "score"], 0)
@@ -561,9 +645,9 @@ const get_data_points_score_all_ranges_coach = async (req, res) => {
       why_today: cleanString(
         getValue(decodedJson, ["day_focus", "why_today"], "NA")
       ),
-      what_to_do: Array.isArray(whatToDo) ? whatToDo : [],
-      avoid_today: Array.isArray(avoidToday) ? avoidToday : [],
-      signals: Array.isArray(signals) ? signals : [],
+      what_to_do: safeArray(whatToDo),
+      avoid_today: safeArray(avoidToday),
+      signals: safeArray(signals),
     };
 
     const energy = {
@@ -618,10 +702,10 @@ const get_data_points_score_all_ranges_coach = async (req, res) => {
     const metabolismScoreSummary = getValue(
       decodedJson,
       ["Metabolism_Score_Analysis", "metabolism_score_summary"],
-      []
+      {}
     );
 
-    const aiStatus = getValue(decodedJson, ["ai_status"], []);
+    const aiStatus = getValue(decodedJson, ["ai_status"], {});
 
     const responseData = {
       total_test_taken: totalTestTaken,
@@ -676,14 +760,18 @@ const get_data_points_score_all_ranges_coach = async (req, res) => {
       },
       energy,
       breath_markers: breathMarkers,
-      metabolism_score_summary: Array.isArray(metabolismScoreSummary)
-        ? metabolismScoreSummary
-        : [],
-      ai_status: Array.isArray(aiStatus) ? aiStatus : [],
+      metabolism_score_summary: safeObject(metabolismScoreSummary),
+      ai_status: safeObject(aiStatus),
       raw_json: decodedJson,
     };
 
-    return sendResponse(res, 200, true, "Data fetched successfully", responseData);
+    return sendResponse(
+      res,
+      200,
+      true,
+      "Data fetched successfully",
+      responseData
+    );
   } catch (error) {
     console.error("get_data_points_score_all_ranges_coach error:", {
       message: error.message,
