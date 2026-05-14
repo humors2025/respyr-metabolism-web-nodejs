@@ -91,6 +91,11 @@ const {
 } = require("../controllers/dietitian/api/web/get_weekly_food_json_suggestions_weeks");
 
 
+const {
+  get_graph_all_scores_weekly_month_all_fat_trends,
+} = require("../controllers/dietitian/api/web/get_graph_all_scores_weekly_month_all_fat_trends");
+
+
 /* ===============================
    Middlewares
 ================================ */
@@ -247,6 +252,13 @@ router.post(
   "/dietitian/api/web/get_weekly_food_json_suggestions_weeks",
   authMiddleware,
   get_weekly_food_json_suggestions_weeks
+);
+
+
+router.get(
+  "/dietitian/api/web/get_graph_all_scores_weekly_month_all_fat_trends",
+  authMiddleware,
+  get_graph_all_scores_weekly_month_all_fat_trends
 );
 
 module.exports = router;
