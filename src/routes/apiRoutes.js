@@ -92,8 +92,8 @@ const {
 
 
 const {
-  get_graph_all_scores_weekly_month_all_fat_trends,
-} = require("../controllers/dietitian/api/web/get_graph_all_scores_weekly_month_all_fat_trends");
+  get_graph_all_seven_trends_graph,
+} = require("../controllers/dietitian/api/web/get_graph_all_seven_trends_graph");
 
 
 /* ===============================
@@ -256,10 +256,11 @@ router.post(
 
 
 router.get(
-  "/dietitian/api/web/get_graph_all_scores_weekly_month_all_fat_trends",
+  "/dietitian/api/web/get_graph_all_seven_trends_graph",
   authMiddleware,
-  get_graph_all_scores_weekly_month_all_fat_trends
+  get_graph_all_seven_trends_graph
 );
+
 
 module.exports = router;
 
