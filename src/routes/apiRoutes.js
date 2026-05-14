@@ -86,6 +86,11 @@ const {
 } = require("../controllers/dietitian/api/web/get_data_points_score_all_ranges_coach");
 
 
+const {
+  get_weekly_food_json_suggestions_weeks,
+} = require("../controllers/dietitian/api/web/get_weekly_food_json_suggestions_weeks");
+
+
 /* ===============================
    Middlewares
 ================================ */
@@ -235,6 +240,13 @@ router.post(
   "/dietitian/api/web/get_data_points_score_all_ranges_coach",
   authMiddleware,
   get_data_points_score_all_ranges_coach
+);
+
+
+router.post(
+  "/dietitian/api/web/get_weekly_food_json_suggestions_weeks",
+  authMiddleware,
+  get_weekly_food_json_suggestions_weeks
 );
 
 module.exports = router;
