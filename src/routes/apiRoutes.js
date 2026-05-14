@@ -76,6 +76,11 @@ const {
 } = require('../controllers/dietitian/api/web/get_profile_details_dates_taken');
 
 
+const {
+  get_weekly_tab_list,
+} = require("../controllers/dietitian/api/web/get_weekly_tab_list");
+
+
 /* ===============================
    Middlewares
 ================================ */
@@ -211,6 +216,13 @@ router.post(
   '/dietitian/api/web/get_profile_details_dates_taken',
   authMiddleware,
   get_profile_details_dates_taken
+);
+
+
+router.post(
+  "/dietitian/api/web/get-weekly-tab-list",
+  authMiddleware,
+  get_weekly_tab_list
 );
 
 module.exports = router;
