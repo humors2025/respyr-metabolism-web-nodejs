@@ -18,6 +18,7 @@ exports.logout = async (req, res) => {
       .update(refresh_token)
       .digest('hex');
 
+      
     // ❌ Remove refresh token from DB
     await pool.query(
       `UPDATE table_dietician
