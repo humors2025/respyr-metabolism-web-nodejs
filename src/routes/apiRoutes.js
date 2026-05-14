@@ -81,6 +81,11 @@ const {
 } = require("../controllers/dietitian/api/web/get_weekly_tab_list");
 
 
+const {
+  get_data_points_score_all_ranges_coach,
+} = require("../controllers/dietitian/api/web/get_data_points_score_all_ranges_coach");
+
+
 /* ===============================
    Middlewares
 ================================ */
@@ -223,6 +228,13 @@ router.post(
   "/dietitian/api/web/get-weekly-tab-list",
   authMiddleware,
   get_weekly_tab_list
+);
+
+
+router.post(
+  "/dietitian/api/web/get-data-points-score-all-ranges-coach",
+  authMiddleware,
+ get_data_points_score_all_ranges_coach
 );
 
 module.exports = router;
