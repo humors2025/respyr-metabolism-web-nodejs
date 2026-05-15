@@ -114,7 +114,7 @@ const upload = require('../middlewares/upload');
    Routes
 ================================ */
 
-// router.post('/process-data', authMiddleware, processController.processData);
+router.post('/process-data', authMiddleware, processController.processData);
 
 // router.post(
 //   '/dietitian/api/web/get_score_trend1',
