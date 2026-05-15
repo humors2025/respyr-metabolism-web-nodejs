@@ -705,8 +705,6 @@
 
 
 
-
-
 const pool = require('../../../../config/db');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
@@ -810,8 +808,45 @@ function ensureAuthSecretsConfigured() {
   return true;
 }
 
-function buildBaseUrl() {
-  return String(process.env.BASE_URL || '').replace(/\/$/, '');
+/*
+|--------------------------------------------------------------------------
+| Optional Audit Logging
+|--------------------------------------------------------------------------
+*/
+
+async function recordAuthEvent({
+  req,
+  action = 'LOGIN',
+  status,
+  dieticianId = null,
+  failureReason = null,
+}) {
+  try {
+    if (process.env.ENABLE_DB_AUDIT_LOGS !== 'true') return;
+
+    await pool.query(
+      `INSERT INTO api_audit_logs
+         (actor_id, actor_role, action, resource_type, resource_id,
+          ip_address, user_agent, status, failure_reason, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())`,
+      [
+        dieticianId,
+        'dietician',
+        action,
+        'auth_session',
+        dieticianId,
+        getClientIp(req),
+        getUserAgent(req),
+        status,
+        failureReason,
+      ]
+    );
+  } catch (error) {
+    console.warn('[AUTH] audit_log_failed', {
+      message: error?.message || null,
+      code: error?.code || null,
+    });
+  }
 }
 
 /*
@@ -877,14 +912,10 @@ exports.login = async (req, res) => {
       password.length > MAX_PASSWORD_LENGTH ||
       !isValidIdentifier(identifier)
     ) {
-      /*
-       * Burn bcrypt time even for invalid input so attacker cannot easily
-       * distinguish bad format from bad credentials by timing.
-       */
       try {
         await bcrypt.compare(password || 'x', DUMMY_BCRYPT_HASH);
       } catch (_) {
-        // Ignore dummy compare failure.
+        // Ignore dummy compare error.
       }
 
       return sendInvalidCredentials(res);
@@ -905,38 +936,21 @@ exports.login = async (req, res) => {
       });
     }
 
-    const baseUrl = buildBaseUrl();
-
-    if (!baseUrl) {
-      console.error('[AUTH] BASE_URL not configured');
-
-      return res.status(500).json({
-        ok: false,
-        message: 'Server configuration error',
-      });
-    }
-
     /*
     |--------------------------------------------------------------------------
     | Fetch dietician
     |--------------------------------------------------------------------------
+    |
+    | IMPORTANT:
+    | We only fetch what is required for authentication.
+    | We are not returning name/email/phone/location in login response.
+    |
     */
 
     const [rows] = await pool.query(
       `SELECT
          td.dietician_id,
-         td.name,
-         td.email,
-         td.phone_no,
-         td.location,
-         td.password,
-         (
-           SELECT tc.profile_id
-           FROM table_clients tc
-           WHERE tc.dietician_id = td.dietician_id
-           ORDER BY tc.profile_id ASC
-           LIMIT 1
-         ) AS profile_id
+         td.password
        FROM table_dietician td
        WHERE LOWER(td.email) = ?
           OR td.phone_no = ?
@@ -951,13 +965,9 @@ exports.login = async (req, res) => {
     | Password verification
     |--------------------------------------------------------------------------
     |
-    | IMPORTANT:
-    | This supports both:
+    | Supports both:
     | 1. Old DB hash: bcrypt(password)
     | 2. New hardened DB hash: bcrypt(sha256_base64(password))
-    |
-    | Your CloudWatch showed reason: bad_password.
-    | This compatibility check fixes that issue.
     |
     */
 
@@ -969,14 +979,10 @@ exports.login = async (req, res) => {
     let isPasswordValid = false;
 
     try {
-      /*
-       * First try old/raw bcrypt format.
-       */
+      // First try old/raw bcrypt format.
       isPasswordValid = await bcrypt.compare(password, hashToCompare);
 
-      /*
-       * If old/raw check fails, try hardened normalized bcrypt format.
-       */
+      // If old/raw check fails, try hardened normalized bcrypt format.
       if (!isPasswordValid && dietician?.password) {
         isPasswordValid = await bcrypt.compare(
           normalizePasswordForBcrypt(password),
@@ -998,51 +1004,33 @@ exports.login = async (req, res) => {
           : 'bad_password',
       });
 
+      await recordAuthEvent({
+        req,
+        action: 'LOGIN',
+        status: 'failure',
+        dieticianId: dietician ? dietician.dietician_id : null,
+        failureReason: 'auth_failed',
+      });
+
       return sendInvalidCredentials(res);
     }
 
     /*
     |--------------------------------------------------------------------------
-    | Build dietician payload
-    |--------------------------------------------------------------------------
-    |
-    | This keeps your frontend-compatible data inside JWT like your old code.
-    | For stronger HIPAA-aligned design, prefer returning this in response body
-    | instead of storing it inside access_token.
-    |
-    */
-
-    const logoUrl = `${baseUrl}/dietitian/api/web/get_client_image?dietician_id=${encodeURIComponent(
-      dietician.dietician_id
-    )}`;
-
-    const profileUrl = dietician.profile_id
-      ? `${baseUrl}/dietitian/api/web/get_profile_image?profile_id=${encodeURIComponent(
-          dietician.profile_id
-        )}&dietician_id=${encodeURIComponent(dietician.dietician_id)}`
-      : null;
-
-    const dieticianPayload = {
-      dietician_id: dietician.dietician_id,
-      name: dietician.name || '',
-      email: dietician.email || '',
-      phone_no: dietician.phone_no || '',
-      location: dietician.location || '',
-      logo_url: logoUrl,
-      profile_url: profileUrl,
-    };
-
-    /*
-    |--------------------------------------------------------------------------
     | Generate access token
     |--------------------------------------------------------------------------
+    |
+    | IMPORTANT:
+    | No dietician object is added inside JWT.
+    | Decoded token will only show:
+    | sub, role, iat, exp, aud, iss, jti
+    |
     */
 
     const accessToken = jwt.sign(
       {
         sub: String(dietician.dietician_id),
         role: 'dietician',
-        dietician: dieticianPayload,
       },
       process.env.JWT_SECRET,
       {
@@ -1112,6 +1100,20 @@ exports.login = async (req, res) => {
 
     /*
     |--------------------------------------------------------------------------
+    | Audit success
+    |--------------------------------------------------------------------------
+    */
+
+    await recordAuthEvent({
+      req,
+      action: 'LOGIN',
+      status: 'success',
+      dieticianId: dietician.dietician_id,
+      failureReason: null,
+    });
+
+    /*
+    |--------------------------------------------------------------------------
     | Optional refresh token cookie
     |--------------------------------------------------------------------------
     */
@@ -1124,12 +1126,22 @@ exports.login = async (req, res) => {
         maxAge: REFRESH_TOKEN_TTL_DAYS * 24 * 60 * 60 * 1000,
         path: process.env.REFRESH_COOKIE_PATH || '/auth',
       });
+
+      return res.status(200).json({
+        ok: true,
+        token_type: 'Bearer',
+        access_token: accessToken,
+        expires_in: ACCESS_TOKEN_TTL_SECONDS,
+      });
     }
 
     /*
     |--------------------------------------------------------------------------
     | Response
     |--------------------------------------------------------------------------
+    |
+    | No dietician object exposed.
+    |
     */
 
     return res.status(200).json({
@@ -1138,12 +1150,6 @@ exports.login = async (req, res) => {
       access_token: accessToken,
       refresh_token: refreshToken,
       expires_in: ACCESS_TOKEN_TTL_SECONDS,
-
-      /*
-       * Non-breaking addition:
-       * Your frontend can use this directly instead of decoding JWT.
-       */
-      dietician: dieticianPayload,
     });
   } catch (error) {
     console.error('[AUTH] Login error:', {
