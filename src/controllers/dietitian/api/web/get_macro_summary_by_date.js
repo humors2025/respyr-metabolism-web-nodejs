@@ -1,44 +1,79 @@
 const pool = require("../../../../config/db");
 
+/* =====================================================
+   Helpers
+===================================================== */
+
+const isProduction =
+  process.env.NODE_ENV === "production" ||
+  Boolean(process.env.AWS_LAMBDA_FUNCTION_NAME);
+
+function normalizeId(value) {
+  return String(value || "").trim().toUpperCase();
+}
+
 /**
- * GET AUTHENTICATED DIETITIAN ID
- * Supports common authMiddleware payload shapes.
+ * Supports multiple possible authMiddleware payload formats.
+ * This fixes common 403 issue when JWT payload is stored differently.
  */
 function getAuthenticatedDietitianId(req) {
   return (
     req.user?.dietician_id ||
     req.user?.dietitian_id ||
     req.user?.sub ||
+    req.user?.id ||
     req.user?.dietician?.dietician_id ||
+    req.user?.dietician?.dietitian_id ||
+    req.user?.dietitian?.dietician_id ||
+    req.user?.dietitian?.dietitian_id ||
     req.auth?.dietician_id ||
     req.auth?.dietitian_id ||
     req.auth?.sub ||
+    req.authUser?.dietician_id ||
+    req.authUser?.dietitian_id ||
+    req.authUser?.sub ||
+    req.decoded?.dietician_id ||
+    req.decoded?.dietitian_id ||
+    req.decoded?.sub ||
+    req.jwt?.dietician_id ||
+    req.jwt?.dietitian_id ||
+    req.jwt?.sub ||
+    resLocalsUser(req)?.dietician_id ||
+    resLocalsUser(req)?.dietitian_id ||
+    resLocalsUser(req)?.sub ||
     null
   );
 }
 
-/**
- * Strict YYYY-MM-DD validation.
- */
+function resLocalsUser(req) {
+  return req.res?.locals?.user || req.res?.locals?.auth || null;
+}
+
+function isValidProfileId(profileId) {
+  if (typeof profileId !== "string") return false;
+
+  /**
+   * Allows:
+   * profile277
+   * RespyrP001
+   * profile_277
+   * profile-277
+   */
+  return /^[A-Za-z0-9_-]{3,64}$/.test(profileId.trim());
+}
+
 function isValidDateOnly(date) {
   if (typeof date !== "string") return false;
 
+  const cleanDate = date.trim();
   const regex = /^\d{4}-\d{2}-\d{2}$/;
-  if (!regex.test(date)) return false;
 
-  const parsed = new Date(`${date}T00:00:00.000Z`);
+  if (!regex.test(cleanDate)) return false;
+
+  const parsed = new Date(`${cleanDate}T00:00:00.000Z`);
   if (Number.isNaN(parsed.getTime())) return false;
 
-  return parsed.toISOString().slice(0, 10) === date;
-}
-
-/**
- * Prevent unexpected profile_id payloads.
- * Adjust length only if your existing profile IDs are longer.
- */
-function isValidProfileId(profileId) {
-  if (typeof profileId !== "string") return false;
-  return /^[A-Za-z0-9_-]{3,64}$/.test(profileId);
+  return parsed.toISOString().slice(0, 10) === cleanDate;
 }
 
 function toNumber(value) {
@@ -99,21 +134,19 @@ function safeParseTestJson(rawValue) {
   try {
     if (!rawValue) return null;
 
-    let jsonString = rawValue;
-
     if (Buffer.isBuffer(rawValue)) {
-      jsonString = rawValue.toString("utf8");
+      rawValue = rawValue.toString("utf8");
     }
 
-    if (typeof jsonString === "object") {
-      return jsonString;
+    if (typeof rawValue === "object") {
+      return rawValue;
     }
 
-    if (typeof jsonString !== "string") {
+    if (typeof rawValue !== "string") {
       return null;
     }
 
-    return JSON.parse(jsonString);
+    return JSON.parse(rawValue);
   } catch {
     return null;
   }
@@ -149,31 +182,91 @@ function extractMacroSummary(row) {
   };
 }
 
+/* =====================================================
+   Authorization check
+===================================================== */
+
 /**
- * Important VAPT protection:
- * Prevent BOLA / horizontal access.
- * A logged-in dietitian can access only their own client's profile_id.
+ * VAPT/BOLA protection:
+ * Dietitian can access only their own client profile.
+ *
+ * Logic:
+ * 1. First check table_clients.profile_id + dietician_id.
+ * 2. If client row exists and belongs to someone else => deny.
+ * 3. If client row is missing/incomplete, fallback to table_test_data.dietitian_id.
  */
 async function verifyDietitianOwnsProfile(dietitianId, profileId) {
-  const [rows] = await pool.query(
+  const loggedInDietitian = normalizeId(dietitianId);
+
+  if (!loggedInDietitian || !profileId) {
+    return false;
+  }
+
+  /**
+   * Main ownership source.
+   * Your table_clients column is dietician_id.
+   */
+  const [clientRows] = await pool.query(
     `
-      SELECT 1
+      SELECT 
+        profile_id,
+        dietician_id
       FROM table_clients
       WHERE profile_id = ?
-        AND UPPER(dietician_id) = UPPER(?)
       LIMIT 1
     `,
-    [profileId, dietitianId]
+    [profileId]
   );
 
-  return rows.length > 0;
+  if (clientRows.length > 0) {
+    const dbDietitianId = normalizeId(clientRows[0].dietician_id);
+
+    /**
+     * If profile exists in table_clients, use it as source of truth.
+     */
+    if (dbDietitianId) {
+      return dbDietitianId === loggedInDietitian;
+    }
+  }
+
+  /**
+   * Fallback only when table_clients row is missing/incomplete.
+   * table_test_data usually has dietitian_id.
+   */
+  const [testRows] = await pool.query(
+    `
+      SELECT 
+        dietitian_id
+      FROM table_test_data
+      WHERE profile_id = ?
+      ORDER BY date_time DESC
+      LIMIT 1
+    `,
+    [profileId]
+  );
+
+  if (testRows.length === 0) {
+    return false;
+  }
+
+  const testDietitianId = normalizeId(testRows[0].dietitian_id);
+
+  return testDietitianId === loggedInDietitian;
 }
+
+/* =====================================================
+   Controller
+===================================================== */
 
 exports.get_macro_summary_by_date = async (req, res) => {
   try {
     const body = req.body || {};
-    const profileId = typeof body.profile_id === "string" ? body.profile_id.trim() : "";
-    const selectedDate = typeof body.date === "string" ? body.date.trim() : "";
+
+    const profileId =
+      typeof body.profile_id === "string" ? body.profile_id.trim() : "";
+
+    const selectedDate =
+      typeof body.date === "string" ? body.date.trim() : "";
 
     if (!profileId || !selectedDate) {
       return res.status(400).json({
@@ -208,6 +301,17 @@ exports.get_macro_summary_by_date = async (req, res) => {
     const hasAccess = await verifyDietitianOwnsProfile(dietitianId, profileId);
 
     if (!hasAccess) {
+      /**
+       * Do not reveal whether profile_id exists.
+       * This is safer for VAPT.
+       */
+      if (!isProduction) {
+        console.warn("Access denied for macro summary:", {
+          loggedInDietitianId: normalizeId(dietitianId),
+          requestedProfileId: profileId,
+        });
+      }
+
       return res.status(403).json({
         success: false,
         message: "Access denied",
@@ -217,8 +321,7 @@ exports.get_macro_summary_by_date = async (req, res) => {
     const selectedDateStart = `${selectedDate} 00:00:00`;
 
     /**
-     * Avoid DATE(date_time) because it can prevent index usage.
-     * This is better for performance and VAPT/DoS resilience.
+     * Better than DATE(date_time) because this can use index.
      */
     const currentSql = `
       SELECT 
@@ -247,10 +350,13 @@ exports.get_macro_summary_by_date = async (req, res) => {
       LIMIT 1
     `;
 
-    const [[currentRows], [previousRows]] = await Promise.all([
+    const [currentResult, previousResult] = await Promise.all([
       pool.query(currentSql, [profileId, selectedDate, selectedDate]),
       pool.query(previousSql, [profileId, selectedDateStart]),
     ]);
+
+    const currentRows = currentResult[0];
+    const previousRows = previousResult[0];
 
     const currentData = extractMacroSummary(currentRows[0]);
     const previousData = extractMacroSummary(previousRows[0]);
@@ -262,11 +368,20 @@ exports.get_macro_summary_by_date = async (req, res) => {
       const previous = previousData.final_macro_summary;
 
       macroChange = {
-        calories: calculateChangePercentage(current.calories, previous.calories),
+        calories: calculateChangePercentage(
+          current.calories,
+          previous.calories
+        ),
         carbs_g: calculateChangePercentage(current.carbs_g, previous.carbs_g),
         fat_g: calculateChangePercentage(current.fat_g, previous.fat_g),
-        fiber_g: calculateChangePercentage(current.fiber_g, previous.fiber_g),
-        protein_g: calculateChangePercentage(current.protein_g, previous.protein_g),
+        fiber_g: calculateChangePercentage(
+          current.fiber_g,
+          previous.fiber_g
+        ),
+        protein_g: calculateChangePercentage(
+          current.protein_g,
+          previous.protein_g
+        ),
       };
     }
 
@@ -291,11 +406,12 @@ exports.get_macro_summary_by_date = async (req, res) => {
     });
   } catch (error) {
     /**
-     * Do not return DB errors, SQL errors, stack traces, or PHI.
+     * Do not expose SQL error / stack / PHI in API response.
      */
     console.error("get_macro_summary_by_date error:", {
       message: error.message,
       code: error.code,
+      errno: error.errno,
     });
 
     return res.status(500).json({
