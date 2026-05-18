@@ -1,7 +1,7 @@
 const express = require('express');
 const router = express.Router();
 
-const processController = require('../controllers/processController');
+// const processController = require('../controllers/processController');
 // const latestTestsController = require(
 //   '../controllers/dietitian/api/web/get_score_trend1'
 // );
@@ -22,9 +22,9 @@ const changePasswordController = require(
   '../controllers/dietitian/api/web/changePasswordController'
 );
 
-const createUserController = require(
-  '../controllers/dietitian/api/web/createUserController'
-);
+// const createUserController = require(
+//   '../controllers/dietitian/api/web/createUserController'
+// );
 
 
 const refreshTokenController = require(
@@ -119,7 +119,7 @@ const upload = require('../middlewares/upload');
    Routes
 ================================ */
 
-router.post('/process-data', authMiddleware, processController.processData);
+// router.post('/process-data', authMiddleware, processController.processData);
 
 // router.post(
 //   '/dietitian/api/web/get_score_trend1',
@@ -159,11 +159,11 @@ router.post(
 );
 
 // 👤 CREATE USER (with logo upload)
-router.post(
-  '/auth/create-user',
-  upload.single('logo'),
-  createUserController.createUser
-);
+// router.post(
+//   '/auth/create-user',
+//   upload.single('logo'),
+//   createUserController.createUser
+// );
 
 // 🔄 Refresh Token
 router.post('/auth/refresh-token', refreshTokenController.refreshToken);
