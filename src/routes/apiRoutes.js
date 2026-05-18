@@ -96,6 +96,11 @@ const {
 } = require("../controllers/dietitian/api/web/get_graph_all_seven_trends_graph");
 
 
+const {
+  get_macro_summary_by_date,
+} = require("../controllers/dietitian/api/web/get_macro_summary_by_date");
+
+
 /* ===============================
    Middlewares
 ================================ */
@@ -261,6 +266,12 @@ router.get(
   get_graph_all_seven_trends_graph
 );
 
+
+router.post(
+  "/dietitian/api/web/get_macro_summary_by_date",
+  authMiddleware,
+  get_macro_summary_by_date
+);
 
 module.exports = router;
 
