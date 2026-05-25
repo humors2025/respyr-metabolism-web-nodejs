@@ -4,23 +4,22 @@ const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
 
 /**
- * Role-based login controller converted from role-login.php.
+ * Role-based login controller — Node.js port of role-login.php.
  *
- * This version:
- * - Reuses existing /auth/login route
- * - Reuses existing loginRateLimiter.js
- * - Reuses existing refreshTokenController.js table flow
- * - Reuses existing authMiddleware JWT flow
- * - Does not expose user object openly in API response
- * - Does not return dashboard_route
- * - Keeps only required identity/role data inside access_token
+ * Mirrors the PHP flow exactly:
+ *   1. Validate body
+ *   2. Lookup user (table_dietician INNER JOIN app_user_roles)
+ *   3. If user not found -> 401
+ *   4. Account status / role / partner_code / parent_user_id / email_verified_at -> 403
+ *   5. password_verify -> 401
+ *   6. Rehash if needed
+ *   7. Issue JWT (Node equivalent of PHP $_SESSION)
+ *   8. Return user + dashboard_route
  */
-
-const DUMMY_BCRYPT_HASH =
-  '$2b$10$CwTycUXWue0Thq9StjUM0uJ8.LJ3pP0NRmI8r1mB6q1RZ5lOq8eqW';
 
 const MAX_EMAIL_LENGTH = 254;
 const MAX_PASSWORD_LENGTH = 128;
+const FAILURE_DELAY_MS = 400;
 
 const ACCESS_TOKEN_TTL_SECONDS = Number(
   process.env.ACCESS_TOKEN_TTL_SECONDS || 15 * 60
@@ -311,11 +310,38 @@ function maybeSetRefreshCookie(res, refreshToken) {
   });
 }
 
-function sendInvalidCredentials(res) {
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function sendInvalidCredentials(res) {
+  /**
+   * Mirrors PHP usleep(400000) — adds timing delay on auth failures.
+   */
+  await sleep(FAILURE_DELAY_MS);
+
   return res.status(401).json({
     ok: false,
     message: 'Invalid email or password',
   });
+}
+
+function buildDashboardRoute(role) {
+  /**
+   * Mirrors PHP buildDashboardRoute().
+   * Frontend should still decode access_token for fine-grained routing,
+   * but this preserves API parity with the PHP response.
+   */
+  switch (String(role || '').trim().toLowerCase()) {
+    case 'super_admin':
+      return '/super_admin/dashboard';
+    case 'admin':
+      return '/admin/dashboard';
+    case 'trainer':
+      return '/trainer/dashboard';
+    default:
+      return '/dashboard';
+  }
 }
 
 exports.login = async (req, res) => {
@@ -354,7 +380,6 @@ exports.login = async (req, res) => {
     }
 
     if (password.length > MAX_PASSWORD_LENGTH) {
-      await bcrypt.compare('x', DUMMY_BCRYPT_HASH);
       return sendInvalidCredentials(res);
     }
 
@@ -396,23 +421,15 @@ exports.login = async (req, res) => {
     const user = rows[0] || null;
 
     /**
-     * Always run bcrypt compare.
-     * If user does not exist, compare with dummy hash.
-     * This reduces timing difference between valid and invalid emails.
+     * Step 1 — user existence.
+     * Mirrors PHP: if no row, log + 401 with timing delay.
      */
-    const hashToCompare = user?.password || DUMMY_BCRYPT_HASH;
-
-    const isPasswordValid = await safePasswordCompare(
-      password,
-      hashToCompare
-    );
-
-    if (!user || !user.password || !isPasswordValid) {
+    if (!user) {
       await safeWriteAuthLog(req, {
         event_type: 'login_failed',
-        user_id: user ? normalizeEmail(user.email) : null,
-        role: user?.role || null,
-        partner_code: user?.partner_code || null,
+        user_id: null,
+        role: null,
+        partner_code: null,
         attempted_identifier: identifier,
         success: false,
         failure_reason: 'Invalid email or password',
@@ -422,40 +439,19 @@ exports.login = async (req, res) => {
     }
 
     /**
-     * Important VAPT fix:
-     * Password is checked before account status/role checks.
-     * This avoids exposing whether an email exists, is inactive, or unverified.
+     * Step 2 — account status / role configuration checks.
+     * PHP performs these BEFORE password_verify.
      */
-    const role = String(user.role || '').trim().toLowerCase();
-
-    if (String(user.status || '').trim().toLowerCase() !== 'active') {
-      await safeWriteAuthLog(req, {
-        event_type: 'login_blocked',
-        user_id: normalizeEmail(user.email),
-        role,
-        partner_code: user.partner_code || null,
-        attempted_identifier: identifier,
-        success: false,
-        failure_reason: 'Account is not active',
-      });
-
+    if (String(user.status || '') !== 'active') {
       return res.status(403).json({
         ok: false,
         message: 'Account is not active',
       });
     }
 
-    if (!ALLOWED_ROLES.has(role)) {
-      await safeWriteAuthLog(req, {
-        event_type: 'login_blocked',
-        user_id: normalizeEmail(user.email),
-        role,
-        partner_code: user.partner_code || null,
-        attempted_identifier: identifier,
-        success: false,
-        failure_reason: 'Invalid role configuration',
-      });
+    const role = String(user.role || '');
 
+    if (!ALLOWED_ROLES.has(role)) {
       return res.status(403).json({
         ok: false,
         message: 'Invalid role configuration',
@@ -484,30 +480,57 @@ exports.login = async (req, res) => {
     }
 
     /**
-     * Upgrade old PHP bcrypt hash if needed.
+     * Step 3 — password verification.
      */
-    if (passwordNeedsRehash(user.password)) {
-      const newHash = await bcrypt.hash(
-        password,
-        Number(process.env.BCRYPT_ROUNDS || 12)
-      );
+    const isPasswordValid = await safePasswordCompare(
+      password,
+      user.password || ''
+    );
 
-      await pool.query(
-        `
-          UPDATE table_dietician
-          SET password = ?
-          WHERE id = ?
-          LIMIT 1
-        `,
-        [newHash, Number(user.id)]
-      );
+    if (!user.password || !isPasswordValid) {
+      await safeWriteAuthLog(req, {
+        event_type: 'login_failed',
+        user_id: normalizeEmail(user.email),
+        role: user.role || null,
+        partner_code: user.partner_code || null,
+        attempted_identifier: identifier,
+        success: false,
+        failure_reason: 'Invalid email or password',
+      });
+
+      return sendInvalidCredentials(res);
     }
 
-    const accessToken = createAccessToken({
-      ...user,
-      role,
-    });
+    /**
+     * Step 4 — upgrade old PHP $2y$ bcrypt hash if needed.
+     */
+    if (passwordNeedsRehash(user.password)) {
+      try {
+        const newHash = await bcrypt.hash(
+          password,
+          Number(process.env.BCRYPT_ROUNDS || 12)
+        );
 
+        await pool.query(
+          `
+            UPDATE table_dietician
+            SET password = ?
+            WHERE id = ?
+            LIMIT 1
+          `,
+          [newHash, Number(user.id)]
+        );
+      } catch (rehashError) {
+        console.warn('[AUTH] Password rehash failed (non-fatal)', {
+          message: rehashError?.message,
+        });
+      }
+    }
+
+    /**
+     * Step 5 — issue tokens (Node equivalent of PHP $_SESSION['auth']).
+     */
+    const accessToken = createAccessToken({ ...user, role });
     const refreshToken = createRefreshToken(user);
 
     await storeRefreshToken(req, user.dietician_id, refreshToken);
@@ -525,15 +548,27 @@ exports.login = async (req, res) => {
     });
 
     /**
-     * Final response:
-     * No open user object.
-     * No dashboard_route.
-     * Frontend should decode access_token for role-based routing.
+     * Step 6 — final response matches PHP shape:
+     *   ok, message, session, dashboard_route, user
+     * Plus JWT fields, which PHP did not return (it used sessions).
      */
     return res.status(200).json({
       ok: true,
       message: 'Login successful',
       session: true,
+      dashboard_route: buildDashboardRoute(role),
+      user: {
+        user_id: normalizeEmail(user.email),
+        dietician_id: String(user.dietician_id),
+        name: String(user.name || ''),
+        email: normalizeEmail(user.email),
+        phone_no: String(user.phone_no || ''),
+        location: String(user.location || ''),
+        role,
+        partner_code: user.partner_code || null,
+        parent_user_id: user.parent_user_id || null,
+        is_reset_password: Number(user.is_reset_password || 0),
+      },
       token_type: 'Bearer',
       access_token: accessToken,
       refresh_token: refreshToken,
@@ -556,10 +591,18 @@ exports.login = async (req, res) => {
           : undefined,
     });
 
-    return res.status(500).json({
+    const response = {
       ok: false,
-      message: 'Login failed. Please try again later.',
-    });
+      message: 'Internal server error',
+    };
+
+    if (process.env.APP_DEBUG === 'true') {
+      response.debug_error = error?.message || null;
+      response.debug_code = error?.code || null;
+      response.debug_sql = error?.sqlMessage || null;
+    }
+
+    return res.status(500).json(response);
   }
 };
 
