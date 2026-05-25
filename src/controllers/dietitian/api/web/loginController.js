@@ -1,369 +1,69 @@
-const pool = require('../../../../config/db');
+// controllers/dietitian/api/web/loginController.js
+
+'use strict';
+
+const { getRounds, compare, hash } = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const bcrypt = require('bcryptjs');
-const crypto = require('crypto');
+const pool = require('../../../../config/db');
+
+// ─── Helpers ────────────────────────────────────────────────────────────────
+
+const normalizeEmail = (email) =>
+  typeof email === 'string' ? email.trim().toLowerCase() : '';
+
+const buildDashboardRoute = (role) => {
+  switch (role) {
+    case 'super_admin': return '/super-admin/dashboard';
+    case 'admin':       return '/admin/dashboard';
+    case 'trainer':     return '/trainer/dashboard';
+    default:            return '/dashboard';
+  }
+};
 
 /**
- * Role-based login controller — Node.js port of role-login.php.
- *
- * Mirrors the PHP flow exactly:
- *   1. Validate body
- *   2. Lookup user (table_dietician INNER JOIN app_user_roles)
- *   3. If user not found -> 401
- *   4. Account status / role / partner_code / parent_user_id / email_verified_at -> 403
- *   5. password_verify -> 401
- *   6. Rehash if needed
- *   7. Issue JWT (Node equivalent of PHP $_SESSION)
- *   8. Return user + dashboard_route
+ * Writes an audit log entry to app_auth_logs.
+ * Silently swallows errors — audit failure must never break login.
+ * Never logs passwords, tokens, or session IDs.
  */
-
-const MAX_EMAIL_LENGTH = 254;
-const MAX_PASSWORD_LENGTH = 128;
-const FAILURE_DELAY_MS = 400;
-
-const ACCESS_TOKEN_TTL_SECONDS = Number(
-  process.env.ACCESS_TOKEN_TTL_SECONDS || 15 * 60
-);
-
-const REFRESH_TOKEN_TTL_DAYS = Number(
-  process.env.REFRESH_TOKEN_TTL_DAYS || 7
-);
-
-const JWT_ALGORITHM = process.env.JWT_ALGORITHM || 'HS256';
-
-const ALLOWED_ROLES = new Set(['super_admin', 'admin', 'trainer']);
-
-function parseBodyIfNeeded(req) {
-  if (typeof req.body === 'string') {
-    try {
-      req.body = JSON.parse(req.body);
-    } catch {
-      return {
-        ok: false,
-        error: 'Invalid JSON body',
-      };
-    }
-  }
-
-  return {
-    ok: true,
-    body: req.body || {},
-  };
-}
-
-function normalizeEmail(value) {
-  return String(value || '').trim().toLowerCase();
-}
-
-function isValidEmail(email) {
-  if (!email || email.length > MAX_EMAIL_LENGTH) return false;
-
-  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
-}
-
-function normalizePhpBcryptHash(hash) {
-  const value = String(hash || '');
-
-  /**
-   * PHP password_hash() with bcrypt may create $2y$ hashes.
-   * bcryptjs expects $2a$ or $2b$.
-   */
-  if (value.startsWith('$2y$')) {
-    return `$2b$${value.slice(4)}`;
-  }
-
-  return value;
-}
-
-async function safePasswordCompare(password, storedHash) {
+const safeWriteAuthLog = async (conn, {
+  event,
+  userEmail = null,
+  role = null,
+  partnerCode = null,
+  attemptedIdentifier = null,
+  success = false,
+  failReason = null,
+}) => {
   try {
-    return await bcrypt.compare(password, normalizePhpBcryptHash(storedHash));
-  } catch {
-    return false;
-  }
-}
-
-function passwordNeedsRehash(storedHash) {
-  const hash = String(storedHash || '');
-
-  if (!hash) return false;
-
-  if (hash.startsWith('$2y$')) {
-    return true;
-  }
-
-  try {
-    const existingRounds = bcrypt.getRounds(normalizePhpBcryptHash(hash));
-    const requiredRounds = Number(process.env.BCRYPT_ROUNDS || 12);
-
-    return existingRounds < requiredRounds;
-  } catch {
-    return false;
-  }
-}
-
-function getClientIp(req) {
-  const forwardedFor = req.headers?.['x-forwarded-for'];
-
-  if (typeof forwardedFor === 'string' && forwardedFor.trim()) {
-    return forwardedFor.split(',')[0].trim().substring(0, 45);
-  }
-
-  const ip =
-    req.ip ||
-    req.connection?.remoteAddress ||
-    req.socket?.remoteAddress ||
-    null;
-
-  return ip ? String(ip).substring(0, 45) : null;
-}
-
-function getUserAgent(req) {
-  const userAgent =
-    typeof req.get === 'function'
-      ? req.get('user-agent')
-      : req.headers?.['user-agent'];
-
-  return userAgent ? String(userAgent).substring(0, 255) : null;
-}
-
-function hashForAudit(value) {
-  if (!value) return null;
-
-  const secret =
-    process.env.AUDIT_HASH_SECRET ||
-    process.env.JWT_SECRET ||
-    'fallback-audit-secret';
-
-  return crypto
-    .createHmac('sha256', secret)
-    .update(String(value).trim().toLowerCase())
-    .digest('hex');
-}
-
-async function safeWriteAuthLog(req, payload) {
-  /**
-   * Optional DB audit logging.
-   *
-   * Keep ENABLE_DB_AUDIT_LOGS=false unless auth_audit_logs table exists.
-   */
-  if (process.env.ENABLE_DB_AUDIT_LOGS !== 'true') return;
-
-  try {
-    await pool.query(
-      `
-        INSERT INTO auth_audit_logs
-          (
-            event_type,
-            user_id,
-            role,
-            partner_code,
-            attempted_identifier_hash,
-            success,
-            failure_reason,
-            ip_hash,
-            user_agent_hash,
-            created_at
-          )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())
-      `,
-      [
-        payload.event_type,
-        payload.user_id || null,
-        payload.role || null,
-        payload.partner_code || null,
-        hashForAudit(payload.attempted_identifier),
-        payload.success ? 1 : 0,
-        payload.failure_reason || null,
-        hashForAudit(getClientIp(req)),
-        hashForAudit(getUserAgent(req)),
-      ]
+    await conn.execute(
+      `INSERT INTO app_auth_logs
+         (event, user_email, role, partner_code, attempted_identifier, success, fail_reason, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, NOW())`,
+      [event, userEmail, role, partnerCode, attemptedIdentifier, success ? 1 : 0, failReason]
     );
-  } catch (error) {
-    console.warn('[AUTH] Audit log failed', {
-      event_type: payload.event_type,
-      message: error.message,
-    });
-
-    if (process.env.AUTH_AUDIT_FAIL_CLOSED === 'true') {
-      throw error;
-    }
+  } catch (err) {
+    // Never propagate — audit errors must not surface to clients
+    console.error('AUTH_LOG_WRITE_ERROR:', err.message);
   }
-}
+};
 
-function createAccessToken(user) {
-  /**
-   * Keep token payload minimal.
-   *
-   * Do not put phone_no/location/profile data inside token.
-   * JWT is signed, not encrypted, so frontend/users can decode it.
-   */
-  return jwt.sign(
-    {
-      sub: String(user.dietician_id),
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-      user_id: normalizeEmail(user.email),
-      dietician_id: String(user.dietician_id),
-      role: String(user.role),
-      partner_code: user.partner_code || null,
-      parent_user_id: user.parent_user_id || null,
-      email: normalizeEmail(user.email),
-      is_reset_password: Number(user.is_reset_password || 0),
-    },
-    process.env.JWT_SECRET,
-    {
-      expiresIn: ACCESS_TOKEN_TTL_SECONDS,
-      algorithm: JWT_ALGORITHM,
-      issuer: process.env.JWT_ISSUER || 'dietician-api',
-      audience: process.env.JWT_AUDIENCE || 'dietician-app',
-      jwtid: crypto.randomBytes(16).toString('hex'),
-    }
-  );
-}
-
-function createRefreshToken(user) {
-  /**
-   * Keep refresh token compatible with existing refreshTokenController.js.
-   * Existing refresh controller usually depends on sub = dietician_id.
-   */
-  return jwt.sign(
-    {
-      sub: String(user.dietician_id),
-      role: 'dietician',
-      token_use: 'refresh',
-    },
-    process.env.JWT_REFRESH_SECRET,
-    {
-      expiresIn: `${REFRESH_TOKEN_TTL_DAYS}d`,
-      algorithm: JWT_ALGORITHM,
-      issuer: process.env.JWT_ISSUER || 'dietician-api',
-      audience: process.env.JWT_AUDIENCE || 'dietician-app',
-      jwtid: crypto.randomBytes(16).toString('hex'),
-    }
-  );
-}
-
-async function storeRefreshToken(req, dieticianId, refreshToken) {
-  const hashedRefreshToken = crypto
-    .createHash('sha256')
-    .update(refreshToken)
-    .digest('hex');
-
-  const expiresAt = new Date();
-  expiresAt.setDate(expiresAt.getDate() + REFRESH_TOKEN_TTL_DAYS);
-
-  /**
-   * Cleanup expired refresh tokens for this user.
-   */
-  await pool.query(
-    `
-      DELETE FROM dietician_refresh_tokens
-      WHERE dietician_id = ?
-        AND expires_at < NOW()
-    `,
-    [dieticianId]
-  );
-
-  /**
-   * This must match your existing refreshTokenController.js table structure.
-   */
-  await pool.query(
-    `
-      INSERT INTO dietician_refresh_tokens
-        (
-          dietician_id,
-          token_hash,
-          expires_at,
-          ip_address,
-          user_agent
-        )
-      VALUES (?, ?, ?, ?, ?)
-    `,
-    [
-      dieticianId,
-      hashedRefreshToken,
-      expiresAt,
-      getClientIp(req),
-      getUserAgent(req),
-    ]
-  );
-}
-
-function maybeSetRefreshCookie(res, refreshToken) {
-  /**
-   * By default, refresh token is returned in JSON because your existing
-   * frontend/API flow may already expect it.
-   *
-   * If later you want cookie-based refresh flow, set:
-   * USE_REFRESH_COOKIE=true
-   */
-  if (process.env.USE_REFRESH_COOKIE !== 'true') return;
-
-  res.cookie('refresh_token', refreshToken, {
-    httpOnly: true,
-    secure:
-      process.env.NODE_ENV === 'production' ||
-      Boolean(process.env.AWS_LAMBDA_FUNCTION_NAME),
-    sameSite: 'strict',
-    maxAge: REFRESH_TOKEN_TTL_DAYS * 24 * 60 * 60 * 1000,
-    path: '/',
-  });
-}
-
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-async function sendInvalidCredentials(res) {
-  /**
-   * Mirrors PHP usleep(400000) — adds timing delay on auth failures.
-   */
-  await sleep(FAILURE_DELAY_MS);
-
-  return res.status(401).json({
-    ok: false,
-    message: 'Invalid email or password',
-  });
-}
-
-function buildDashboardRoute(role) {
-  /**
-   * Mirrors PHP buildDashboardRoute().
-   * Frontend should still decode access_token for fine-grained routing,
-   * but this preserves API parity with the PHP response.
-   */
-  switch (String(role || '').trim().toLowerCase()) {
-    case 'super_admin':
-      return '/super_admin/dashboard';
-    case 'admin':
-      return '/admin/dashboard';
-    case 'trainer':
-      return '/trainer/dashboard';
-    default:
-      return '/dashboard';
-  }
-}
+// ─── Controller ─────────────────────────────────────────────────────────────
 
 exports.login = async (req, res) => {
+  let conn;
+
   try {
-    const parsed = parseBodyIfNeeded(req);
+    // ── 1. Parse & validate input ──────────────────────────────────────────
 
-    if (!parsed.ok) {
-      return res.status(400).json({
-        ok: false,
-        message: parsed.error,
-      });
-    }
-
-    const body = parsed.body;
-
-    let identifier = normalizeEmail(body.identifier);
-
-    if (!identifier && body.email) {
-      identifier = normalizeEmail(body.email);
-    }
-
-    const password = typeof body.password === 'string' ? body.password : '';
+    // Support both `identifier` and `email` for backward compat with PHP API
+    let identifier = normalizeEmail(
+      req.body?.identifier || req.body?.email || ''
+    );
+    const password = typeof req.body?.password === 'string'
+      ? req.body.password
+      : '';
 
     if (!identifier || !password) {
       return res.status(400).json({
@@ -372,246 +72,229 @@ exports.login = async (req, res) => {
       });
     }
 
-    if (!isValidEmail(identifier)) {
+    // Basic format gate — avoids hitting DB with obviously invalid input
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(identifier)) {
       return res.status(400).json({
         ok: false,
         message: 'Invalid email format',
       });
     }
 
-    if (password.length > MAX_PASSWORD_LENGTH) {
-      return sendInvalidCredentials(res);
-    }
+    conn = await pool.getConnection();
 
-    if (!process.env.JWT_SECRET || !process.env.JWT_REFRESH_SECRET) {
-      console.error('[AUTH] JWT secrets missing in environment');
+    // ── 2. Look up user ────────────────────────────────────────────────────
+    // JOIN ensures only users with a valid role entry can log in.
+    // LOWER() on both sides prevents case-sensitivity bypasses.
 
-      return res.status(500).json({
-        ok: false,
-        message: 'Server configuration error',
-      });
-    }
-
-    const [rows] = await pool.query(
-      `
-        SELECT
-          td.id,
-          td.dietician_id,
-          td.name,
-          td.phone_no,
-          td.email,
-          td.location,
-          td.password,
-          td.is_reset_password,
-
-          aur.role,
-          aur.partner_code,
-          aur.parent_user_id,
-          aur.status,
-          aur.email_verified_at
-        FROM table_dietician td
-        INNER JOIN app_user_roles aur
-          ON LOWER(aur.user_id) = LOWER(td.email)
-        WHERE LOWER(td.email) = LOWER(?)
-        LIMIT 1
-      `,
+    const [rows] = await conn.execute(
+      `SELECT
+         td.id,
+         td.dietitian_id,
+         td.name,
+         td.phone_no,
+         td.email,
+         td.location,
+         td.password,
+         td.is_reset_password,
+         aur.role,
+         aur.partner_code,
+         aur.parent_user_id,
+         aur.status,
+         aur.email_verified_at
+       FROM table_dietician td
+       INNER JOIN app_user_roles aur
+         ON LOWER(aur.user_id) = LOWER(td.email)
+       WHERE LOWER(td.email) = LOWER(?)
+       LIMIT 1`,
       [identifier]
     );
 
     const user = rows[0] || null;
 
-    /**
-     * Step 1 — user existence.
-     * Mirrors PHP: if no row, log + 401 with timing delay.
-     */
+    // ── 3. User not found — generic message (no email enumeration) ─────────
+
     if (!user) {
-      await safeWriteAuthLog(req, {
-        event_type: 'login_failed',
-        user_id: null,
-        role: null,
-        partner_code: null,
-        attempted_identifier: identifier,
+      await safeWriteAuthLog(conn, {
+        event: 'login_failed',
+        attemptedIdentifier: identifier,
         success: false,
-        failure_reason: 'Invalid email or password',
+        failReason: 'User not found',
       });
 
-      return sendInvalidCredentials(res);
+      await sleep(400); // Constant-time response to prevent timing attacks
+      return res.status(401).json({
+        ok: false,
+        message: 'Invalid email or password',
+      });
     }
 
-    /**
-     * Step 2 — account status / role configuration checks.
-     * PHP performs these BEFORE password_verify.
-     */
-    if (String(user.status || '') !== 'active') {
+    // ── 4. Account status & role gates ────────────────────────────────────
+
+    if (user.status !== 'active') {
       return res.status(403).json({
         ok: false,
         message: 'Account is not active',
       });
     }
 
-    const role = String(user.role || '');
+    const role = String(user.role);
+    const VALID_ROLES = ['super_admin', 'admin', 'trainer'];
 
-    if (!ALLOWED_ROLES.has(role)) {
+    if (!VALID_ROLES.includes(role)) {
       return res.status(403).json({
         ok: false,
         message: 'Invalid role configuration',
       });
     }
 
-    if ((role === 'admin' || role === 'trainer') && !user.partner_code) {
-      return res.status(403).json({
-        ok: false,
-        message: 'Partner code missing for this account',
-      });
-    }
-
-    if ((role === 'admin' || role === 'trainer') && !user.parent_user_id) {
-      return res.status(403).json({
-        ok: false,
-        message: 'Parent user missing for this account',
-      });
-    }
-
-    if ((role === 'admin' || role === 'trainer') && !user.email_verified_at) {
-      return res.status(403).json({
-        ok: false,
-        message: 'Email is not verified',
-      });
-    }
-
-    /**
-     * Step 3 — password verification.
-     */
-    const isPasswordValid = await safePasswordCompare(
-      password,
-      user.password || ''
-    );
-
-    if (!user.password || !isPasswordValid) {
-      await safeWriteAuthLog(req, {
-        event_type: 'login_failed',
-        user_id: normalizeEmail(user.email),
-        role: user.role || null,
-        partner_code: user.partner_code || null,
-        attempted_identifier: identifier,
-        success: false,
-        failure_reason: 'Invalid email or password',
-      });
-
-      return sendInvalidCredentials(res);
-    }
-
-    /**
-     * Step 4 — upgrade old PHP $2y$ bcrypt hash if needed.
-     */
-    if (passwordNeedsRehash(user.password)) {
-      try {
-        const newHash = await bcrypt.hash(
-          password,
-          Number(process.env.BCRYPT_ROUNDS || 12)
-        );
-
-        await pool.query(
-          `
-            UPDATE table_dietician
-            SET password = ?
-            WHERE id = ?
-            LIMIT 1
-          `,
-          [newHash, Number(user.id)]
-        );
-      } catch (rehashError) {
-        console.warn('[AUTH] Password rehash failed (non-fatal)', {
-          message: rehashError?.message,
+    if (['admin', 'trainer'].includes(role)) {
+      if (!user.partner_code) {
+        return res.status(403).json({
+          ok: false,
+          message: 'Partner code missing for this account',
+        });
+      }
+      if (!user.parent_user_id) {
+        return res.status(403).json({
+          ok: false,
+          message: 'Parent user missing for this account',
+        });
+      }
+      if (!user.email_verified_at) {
+        return res.status(403).json({
+          ok: false,
+          message: 'Email is not verified',
         });
       }
     }
 
-    /**
-     * Step 5 — issue tokens (Node equivalent of PHP $_SESSION['auth']).
-     */
-    const accessToken = createAccessToken({ ...user, role });
-    const refreshToken = createRefreshToken(user);
+    // ── 5. Password verification ───────────────────────────────────────────
 
-    await storeRefreshToken(req, user.dietician_id, refreshToken);
+    const passwordMatch = await compare(password, String(user.password));
 
-    maybeSetRefreshCookie(res, refreshToken);
+    if (!passwordMatch) {
+      await safeWriteAuthLog(conn, {
+        event: 'login_failed',
+        userEmail: normalizeEmail(user.email),
+        role: user.role,
+        partnerCode: user.partner_code || null,
+        attemptedIdentifier: identifier,
+        success: false,
+        failReason: 'Invalid password',
+      });
 
-    await safeWriteAuthLog(req, {
-      event_type: 'login_success',
-      user_id: normalizeEmail(user.email),
-      role,
-      partner_code: user.partner_code || null,
-      attempted_identifier: normalizeEmail(user.email),
-      success: true,
-      failure_reason: null,
-    });
-
-    /**
-     * Step 6 — final response matches PHP shape:
-     *   ok, message, session, dashboard_route, user
-     * Plus JWT fields, which PHP did not return (it used sessions).
-     */
-    return res.status(200).json({
-      ok: true,
-      message: 'Login successful',
-      session: true,
-      dashboard_route: buildDashboardRoute(role),
-      user: {
-        user_id: normalizeEmail(user.email),
-        dietician_id: String(user.dietician_id),
-        name: String(user.name || ''),
-        email: normalizeEmail(user.email),
-        phone_no: String(user.phone_no || ''),
-        location: String(user.location || ''),
-        role,
-        partner_code: user.partner_code || null,
-        parent_user_id: user.parent_user_id || null,
-        is_reset_password: Number(user.is_reset_password || 0),
-      },
-      token_type: 'Bearer',
-      access_token: accessToken,
-      refresh_token: refreshToken,
-      expires_in: ACCESS_TOKEN_TTL_SECONDS,
-    });
-  } catch (error) {
-    console.error('[AUTH] Role login error:', {
-      message: error?.message || null,
-      name: error?.name || null,
-      code: error?.code || null,
-      errno: error?.errno || null,
-      sqlState: error?.sqlState || null,
-      sqlMessage:
-        process.env.NODE_ENV !== 'production'
-          ? error?.sqlMessage
-          : undefined,
-      stack:
-        process.env.NODE_ENV !== 'production'
-          ? error?.stack
-          : undefined,
-    });
-
-    const response = {
-      ok: false,
-      message: 'Internal server error',
-    };
-
-    if (process.env.APP_DEBUG === 'true') {
-      response.debug_error = error?.message || null;
-      response.debug_code = error?.code || null;
-      response.debug_sql = error?.sqlMessage || null;
+      await sleep(400);
+      return res.status(401).json({
+        ok: false,
+        message: 'Invalid email or password',
+      });
     }
 
-    return res.status(500).json(response);
+    // ── 6. Rehash if bcrypt cost factor is outdated ────────────────────────
+    // Keeps stored hashes current without forcing a password reset.
+
+    const BCRYPT_ROUNDS = parseInt(process.env.BCRYPT_ROUNDS, 10) || 12;
+
+    try {
+      const currentRounds = getRounds(String(user.password));
+      if (currentRounds < BCRYPT_ROUNDS) {
+        const newHash = await hash(password, BCRYPT_ROUNDS);
+        await conn.execute(
+          'UPDATE table_dietician SET password = ? WHERE id = ? LIMIT 1',
+          [newHash, user.id]
+        );
+      }
+    } catch (rehashErr) {
+      // Non-fatal — log and continue, do not fail login
+      console.error('REHASH_ERROR:', rehashErr.message);
+    }
+
+    // ── 7. Issue JWT ───────────────────────────────────────────────────────
+    // PHP used sessions; Node.js uses stateless JWT to match your existing
+    // authMiddleware and refreshTokenController patterns.
+
+    const userEmail = normalizeEmail(user.email);
+
+    const tokenPayload = {
+      user_id:        userEmail,
+      dietitian_id:   String(user.dietitian_id),  // canonical spelling
+      dietician_id:   String(user.dietitian_id),  // backward-compat alias
+      name:           String(user.name),
+      email:          userEmail,
+      role,
+      partner_code:   user.partner_code   || null,
+      parent_user_id: user.parent_user_id || null,
+    };
+
+    const accessToken = jwt.sign(
+      tokenPayload,
+      process.env.JWT_SECRET,
+      {
+        expiresIn: process.env.JWT_EXPIRES_IN || '15m',
+        issuer:    'api.respyr.ai',
+        audience:  'respyr-dietitian-app',
+      }
+    );
+
+    const refreshToken = jwt.sign(
+      { user_id: userEmail, type: 'refresh' },
+      process.env.JWT_REFRESH_SECRET || process.env.JWT_SECRET,
+      {
+        expiresIn: process.env.JWT_REFRESH_EXPIRES_IN || '7d',
+        issuer:    'api.respyr.ai',
+        audience:  'respyr-dietitian-app',
+      }
+    );
+
+    // ── 8. Audit log — success ─────────────────────────────────────────────
+
+    await safeWriteAuthLog(conn, {
+      event:               'login_success',
+      userEmail,
+      role,
+      partnerCode:         user.partner_code || null,
+      attemptedIdentifier: userEmail,
+      success:             true,
+    });
+
+    // ── 9. Respond ─────────────────────────────────────────────────────────
+
+    return res.status(200).json({
+      ok:              true,
+      message:         'Login successful',
+      access_token:    accessToken,
+      refresh_token:   refreshToken,
+      dashboard_route: buildDashboardRoute(role),
+      user: {
+        user_id:           userEmail,
+        dietitian_id:      String(user.dietitian_id),
+        name:              String(user.name),
+        email:             userEmail,
+        phone_no:          String(user.phone_no  || ''),
+        location:          String(user.location  || ''),
+        role,
+        partner_code:      user.partner_code     || null,
+        parent_user_id:    user.parent_user_id   || null,
+        is_reset_password: Number(user.is_reset_password),
+      },
+    });
+
+  } catch (err) {
+    console.error('LOGIN_ERROR:', err.message);
+
+    return res.status(500).json({
+      ok:      false,
+      message: 'Internal server error',
+      ...(process.env.NODE_ENV !== 'production' && {
+        debug_error: err.message,
+      }),
+    });
+
+  } finally {
+    if (conn) conn.release();
   }
 };
-
-
-
-
-
-
-
 
 
 
