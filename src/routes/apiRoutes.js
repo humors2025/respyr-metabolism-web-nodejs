@@ -132,10 +132,6 @@ const {
   loginRateLimiter,
   loginIpRateLimiter,
 } = require('../middlewares/loginRateLimiter');
-const loginLockout = require('../middlewares/loginLockout');
-
-// Tiny helper: routes that should accept a password_reset-scoped JWT.
-const allowResetScope = (req, _res, next) => { req.allowResetScope = true; next(); };
 
 const upload = require('../middlewares/upload');
 
@@ -172,15 +168,12 @@ router.post(
   '/auth/login',
   loginIpRateLimiter,
   loginRateLimiter,
-  loginLockout,
   loginController.login
 );
 
-// 🔐 Protected — also accepts password_reset-scoped JWT so users who must
-// reset can hit this endpoint (and only this one) before being fully signed in.
+// 🔐 Protected
 router.post(
   '/auth/change-password',
-  allowResetScope,
   authMiddleware,
   changePasswordController.changePassword
 );
