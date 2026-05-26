@@ -218,8 +218,8 @@ exports.login = async (req, res) => {
 
     const tokenPayload = {
       user_id:        userEmail,
-      dietitian_id:   String(user.dietitian_id),  // canonical spelling
-      dietician_id:   String(user.dietitian_id),  // backward-compat alias
+      dietician_id:   String(user.dietician_id),  // canonical spelling
+      dietician_id:   String(user.dietician_id),  // backward-compat alias
       name:           String(user.name),
       email:          userEmail,
       role,
@@ -268,7 +268,7 @@ exports.login = async (req, res) => {
       dashboard_route: buildDashboardRoute(role),
       user: {
         user_id:           userEmail,
-        dietitian_id:      String(user.dietitian_id),
+        dietician_id:      String(user.dietician_id),
         name:              String(user.name),
         email:             userEmail,
         phone_no:          String(user.phone_no  || ''),
