@@ -90,7 +90,7 @@ exports.login = async (req, res) => {
     const [rows] = await conn.execute(
       `SELECT
          td.id,
-         td.dietitian_id,
+         td.dietician_id,
          td.name,
          td.phone_no,
          td.email,
