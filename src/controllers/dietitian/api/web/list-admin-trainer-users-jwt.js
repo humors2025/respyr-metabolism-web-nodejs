@@ -177,11 +177,11 @@ async function writeAuthLogSafe(req, {
 async function resolveActorFromToken(req) {
   const payload = req.user || {};
 
-  // VAPT/HIPAA: tokens no longer carry email/user_id. Resolve the actor by
-  // their internal dietician_id (the JWT 'sub'), then pull email from DB.
-  const dieticianId = String(payload.sub || payload.dietician_id || "").trim();
+  const rawUserId = payload.user_id || payload.email || payload.sub || "";
+  const userId = String(rawUserId).trim().toLowerCase();
 
-  if (!dieticianId || dieticianId.length > 64) {
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  if (!userId || !emailRegex.test(userId)) {
     return {
       error: {
         status: 401,
@@ -209,10 +209,10 @@ async function resolveActorFromToken(req) {
       FROM table_dietician td
       INNER JOIN app_user_roles aur
         ON LOWER(aur.user_id) = LOWER(td.email)
-      WHERE td.dietician_id = ?
+      WHERE LOWER(td.email) = LOWER(?)
       LIMIT 1
     `,
-    [dieticianId]
+    [userId]
   );
 
   const actor = rows[0];
@@ -244,9 +244,7 @@ async function resolveActorFromToken(req) {
     };
   }
 
-  // actorEmail now comes from the DB row, not the JWT (which no longer
-  // carries it). Downstream callers expect a normalized lowercased email.
-  return { actor, actorEmail: String(actor.email || "").trim().toLowerCase() };
+  return { actor, actorEmail: userId };
 }
 
 // ─── Pending invite housekeeping ─────────────────────────────────────────────
