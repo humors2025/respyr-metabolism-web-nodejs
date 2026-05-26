@@ -27,17 +27,76 @@ jobs:
 
       - name: Create Lambda zip
         run: |
+          rm -f lambda.zip
           zip -r lambda.zip . \
-          -x ".git/*" ".github/*" "node_modules/.cache/*" "*.log"
+          -x ".git/*" ".github/*" "node_modules/.cache/*" "*.log" "lambda.zip"
 
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@v6.1.1
         with:
           role-to-assume: arn:aws:iam::852567286882:role/github-lambda-deploy-role
-          aws-region: us-west-2   # ✅ match your Lambda region
+          aws-region: us-west-2
+
+      - name: Verify AWS identity
+        run: aws sts get-caller-identity
 
       - name: Deploy to Lambda
         run: |
           aws lambda update-function-code \
             --function-name respyr-metabolism-web \
             --zip-file fileb://lambda.zip
+
+
+
+
+
+
+
+
+
+
+
+
+# name: Deploy Node.js Lambda
+
+# on:
+#   push:
+#     branches:
+#       - main
+
+# permissions:
+#   id-token: write
+#   contents: read
+
+# jobs:
+#   deploy:
+#     runs-on: ubuntu-latest
+
+#     steps:
+#       - name: Checkout code
+#         uses: actions/checkout@v4
+
+#       - name: Setup Node.js
+#         uses: actions/setup-node@v4
+#         with:
+#           node-version: 20
+
+#       - name: Install production dependencies
+#         run: npm ci --omit=dev
+
+#       - name: Create Lambda zip
+#         run: |
+#           zip -r lambda.zip . \
+#           -x ".git/*" ".github/*" "node_modules/.cache/*" "*.log"
+
+#       - name: Configure AWS credentials
+#         uses: aws-actions/configure-aws-credentials@v4
+#         with:
+#           role-to-assume: arn:aws:iam::852567286882:role/github-lambda-deploy-role
+#           aws-region: us-west-2   # ✅ match your Lambda region
+
+#       - name: Deploy to Lambda
+#         run: |
+#           aws lambda update-function-code \
+#             --function-name respyr-metabolism-web \
+#             --zip-file fileb://lambda.zip
