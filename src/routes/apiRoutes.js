@@ -100,6 +100,26 @@ const {
   get_macro_summary_by_date,
 } = require("../controllers/dietitian/api/web/get_macro_summary_by_date");
 
+const {
+  habitsTrackingUsersChoice,
+} = require("../controllers/dietitian/api/web/habits-tracking-users-choice1");
+
+const {
+  getClientSelectedHabitDetail,
+} = require("../controllers/dietitian/api/web/get-client-selected-habit-detail");
+
+const {
+  listAdminTrainerUsersJwt,
+} = require("../controllers/dietitian/api/web/list-admin-trainer-users-jwt");
+
+const {
+  superAdminInviteAdmin,
+} = require("../controllers/dietitian/api/web/super-admin-invite-admin");
+
+const {
+  listTrainerClientInvites,
+} = require("../controllers/dietitian/api/web/list-trainer-client-invites");
+
 
 /* ===============================
    Middlewares
@@ -271,6 +291,41 @@ router.post(
   "/dietitian/api/web/get_macro_summary_by_date",
   authMiddleware,
   get_macro_summary_by_date
+);
+
+
+router.post(
+  "/dietitian/api/web/habits-tracking-users-choice1",
+  authMiddleware,
+  habitsTrackingUsersChoice
+);
+
+
+router.post(
+  "/dietitian/api/web/get-client-selected-habit-detail",
+  authMiddleware,
+  getClientSelectedHabitDetail
+);
+
+
+router.post(
+  "/dietitian/api/web/list-admin-trainer-users-jwt",
+  authMiddleware,
+  listAdminTrainerUsersJwt
+);
+
+
+router.post(
+  "/dietitian/api/web/super-admin-invite-admin",
+  authMiddleware,
+  superAdminInviteAdmin
+);
+
+
+router.post(
+  "/dietitian/api/web/list-trainer-client-invites",
+  authMiddleware,
+  listTrainerClientInvites
 );
 
 module.exports = router;
