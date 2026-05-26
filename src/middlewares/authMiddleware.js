@@ -1,8 +1,6 @@
 const jwt = require("jsonwebtoken");
 
 const JWT_ALGORITHM = process.env.JWT_ALGORITHM || "HS256";
-const JWT_ISS = process.env.JWT_ISS || "api.respyr.ai";
-const JWT_AUD = process.env.JWT_AUD || "respyr-dietitian-app";
 
 module.exports = (req, res, next) => {
   if (req.method === "OPTIONS") {
@@ -54,23 +52,8 @@ module.exports = (req, res, next) => {
 
     const decoded = jwt.verify(token, jwtSecret, {
       algorithms: [JWT_ALGORITHM],
-      issuer: JWT_ISS,
-      audience: JWT_AUD,
       clockTolerance: 5,
     });
-
-    // Scope gate: tokens issued with scope="password_reset" can ONLY be used
-    // on routes that opt in by setting `req.allowResetScope = true` upstream.
-    // Tokens with scope="full" or no scope claim pass through.
-    const scope = decoded && decoded.scope;
-    if (scope === "password_reset" && !req.allowResetScope) {
-      return res.status(403).json({
-        status: false,
-        ok: false,
-        message: "Password reset required",
-        must_reset_password: true,
-      });
-    }
 
     req.user = decoded;
 
