@@ -84,6 +84,11 @@ const crypto = require('crypto');
 const ACCESS_TOKEN_TTL_SECONDS = 15 * 60;   // 15 min
 const REFRESH_TOKEN_TTL_DAYS = 7;
 
+// Use the SAME env var names + defaults as loginController + authMiddleware
+// so tokens issued here verify cleanly on protected routes.
+const JWT_ISS = process.env.JWT_ISS || 'api.respyr.ai';
+const JWT_AUD = process.env.JWT_AUD || 'respyr-dietitian-app';
+
 exports.refreshToken = async (req, res) => {
   // Connection used for the rotation transaction
   let conn;
@@ -121,8 +126,8 @@ exports.refreshToken = async (req, res) => {
     try {
       decoded = jwt.verify(refreshToken, process.env.JWT_REFRESH_SECRET, {
         algorithms: ['HS256'],
-        issuer: process.env.JWT_ISSUER || 'dietician-api',
-        audience: process.env.JWT_AUDIENCE || 'dietician-app',
+        issuer: JWT_ISS,
+        audience: JWT_AUD,
       });
     } catch {
       // Signature/expiry/claim failure — genuinely an invalid token
@@ -195,39 +200,28 @@ exports.refreshToken = async (req, res) => {
     }
 
     const baseUrl = process.env.BASE_URL;
-    if (!baseUrl) {
-      await conn.rollback();
-      console.error('[AUTH] BASE_URL not configured');
-      return res.status(500).json({ ok: false, message: 'Server configuration error' });
-    }
-
-    const logoUrl =
-      `${baseUrl}/dietitian/api/web/get_client_image?dietician_id=${dietician.dietician_id}`;
-    const profileUrl = dietician.profile_id
+    const logoUrl = baseUrl
+      ? `${baseUrl}/dietitian/api/web/get_client_image?dietician_id=${dietician.dietician_id}`
+      : null;
+    const profileUrl = baseUrl && dietician.profile_id
       ? `${baseUrl}/dietitian/api/web/get_profile_image?profile_id=${dietician.profile_id}&dietician_id=${dietician.dietician_id}`
       : null;
 
-    // New access token — identical shape to the login controller's token
+    // New access token — minimal claims only. PII (name/phone/email/location)
+    // is NOT embedded in the JWT; it's returned in the response body so the
+    // client can populate UI. This matches the hardened loginController.
     const accessToken = jwt.sign(
       {
         sub: String(dietician.dietician_id),
         role: 'dietician',
-        dietician: {
-          dietician_id: dietician.dietician_id,
-          name: dietician.name,
-          email: dietician.email,
-          phone_no: dietician.phone_no,
-          location: dietician.location,
-          logo_url: logoUrl,
-          profile_url: profileUrl,
-        },
+        scope: 'full',
       },
       process.env.JWT_SECRET,
       {
         expiresIn: ACCESS_TOKEN_TTL_SECONDS,
         algorithm: 'HS256',
-        issuer: process.env.JWT_ISSUER || 'dietician-api',
-        audience: process.env.JWT_AUDIENCE || 'dietician-app',
+        issuer: JWT_ISS,
+        audience: JWT_AUD,
         jwtid: crypto.randomBytes(16).toString('hex'),
       }
     );
@@ -243,8 +237,8 @@ exports.refreshToken = async (req, res) => {
       {
         expiresIn: `${REFRESH_TOKEN_TTL_DAYS}d`,
         algorithm: 'HS256',
-        issuer: process.env.JWT_ISSUER || 'dietician-api',
-        audience: process.env.JWT_AUDIENCE || 'dietician-app',
+        issuer: JWT_ISS,
+        audience: JWT_AUD,
         jwtid: crypto.randomBytes(16).toString('hex'),
       }
     );

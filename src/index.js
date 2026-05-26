@@ -1,6 +1,9 @@
 const express = require("express");
 require("dotenv").config();
 
+// Fail fast in production if security-critical env vars are missing/weak.
+require("./config/validateEnv")();
+
 const helmet = require("helmet");
 const rateLimit = require("express-rate-limit");
 
