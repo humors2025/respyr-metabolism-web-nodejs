@@ -465,8 +465,22 @@ exports.login = async (req, res) => {
 
     /*
     |--------------------------------------------------------------------------
-    | Issue JWT
+    | Issue JWT  (VAPT / HIPAA: minimum-necessary claims only)
     |--------------------------------------------------------------------------
+    | A JWS payload is base64-decodable by anyone holding the token, so we
+    | MUST NOT put PHI / PII in it.
+    |
+    | Kept (operational identifiers, non-PHI):
+    |   iss, aud, iat, nbf, exp  — JWT framework claims
+    |   sub                      — internal dietician_id (opaque)
+    |   dietician_id             — duplicate of sub for back-compat consumers
+    |   role                     — RBAC
+    |   partner_code             — tenant scope
+    |
+    | Removed (PHI / PII — must be re-fetched from DB when needed):
+    |   email, user_id           — email address
+    |   parent_user_id           — email of parent admin
+    |   name, phone_no, location — never were in the token, listed for clarity
     */
     const now = Math.floor(Date.now() / 1000);
 
@@ -479,16 +493,12 @@ exports.login = async (req, res) => {
 
       sub: String(user.dietician_id),
 
-      user_id: String(user.email).toLowerCase(),
       dietician_id: String(user.dietician_id),
       role: role,
-      partner_code: user.partner_code !== null && user.partner_code !== undefined
-        ? String(user.partner_code)
-        : null,
-      parent_user_id: user.parent_user_id !== null && user.parent_user_id !== undefined
-        ? String(user.parent_user_id).toLowerCase()
-        : null,
-      email: String(user.email).toLowerCase(),
+      partner_code:
+        user.partner_code !== null && user.partner_code !== undefined
+          ? String(user.partner_code)
+          : null,
     };
 
     const token = makeJwt(payload);
