@@ -121,6 +121,11 @@ const {
 } = require("../controllers/dietitian/api/web/list-trainer-client-invites");
 
 
+const {
+  get_search_clients_details,
+} = require("../controllers/dietitian/api/web/get-search-clients-details");
+
+
 /* ===============================
    Middlewares
 ================================ */
@@ -249,12 +254,22 @@ router.get(
 router.post(
   "/dietitian/api/web/get_clients_data_total_missed_test",
   (req, res, next) => {
-    console.log("ROUTE HIT: get_clients_data_total_missed_test v3");
     res.setHeader("X-Route-Version", "missed-test-route-v3");
     next();
   },
   authMiddleware,
   get_clients_data_total_missed_test
+);
+
+
+router.post(
+  "/dietitian/api/web/get-search-clients-details",
+  (req, res, next) => {
+    res.setHeader("X-Route-Version", "search-clients-details-v1");
+    next();
+  },
+  authMiddleware,
+  get_search_clients_details
 );
 
 
