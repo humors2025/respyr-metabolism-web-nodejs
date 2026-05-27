@@ -1,26 +1,4 @@
 // controllers/dietitian/api/web/loginController.js
-//
-// Node.js port of role-login-jwt.php (table_dietician + app_user_roles).
-// Hardened login flow:
-//   - No PHI/PII in audit logs (HMAC-hashed identifiers/IP/UA)
-//   - Generic error messages (no user enumeration)
-//   - Constant-time password verification + fixed delay on failure
-//   - Strict input validation (type + length caps)
-//   - Fail-fast on missing/weak JWT secret
-//   - Explicit JWT algorithm (HS256) with manual iat/nbf/exp
-//   - Connection always released
-//
-// IMPORTANT:
-// This version stores role, partner_code, parent_user_id,
-// dashboard_route, and full dietician object inside access_token.
-//
-// JWT payload is base64-decodable, so do not treat JWT payload as private.
-//
-// POST JSON:
-// {
-//   "identifier": "john@demo.com",
-//   "password": "PlainTextPassword"
-// }
 
 'use strict';
 
@@ -36,20 +14,21 @@ const pool = require('../../../../config/db');
 */
 
 const JWT_SECRET = process.env.JWT_SECRET;
-const JWT_ISS = process.env.JWT_ISS || 'api.respyr.ai';
-const JWT_AUD = process.env.JWT_AUD || 'respyr-dietitian-app';
-const JWT_TTL = parseInt(process.env.JWT_TTL, 10) || 900; // seconds
+const JWT_ISS = process.env.JWT_ISS || process.env.JWT_ISSUER || 'api.respyr.ai';
+const JWT_AUD = process.env.JWT_AUD || process.env.JWT_AUDIENCE || 'respyr-dietitian-app';
+const JWT_TTL = parseInt(process.env.JWT_TTL, 10) || 900; // 15 minutes
 
-// HMAC pepper for audit-log hashing — separate from JWT_SECRET when possible.
+const JWT_REFRESH_TTL_DAYS =
+  parseInt(process.env.JWT_REFRESH_TTL_DAYS, 10) || 30;
+
+const JWT_REFRESH_TTL_SECONDS = JWT_REFRESH_TTL_DAYS * 24 * 60 * 60;
+
 const SECURITY_PEPPER = process.env.SECURITY_PEPPER || JWT_SECRET;
 
-// Hard caps to prevent oversized-payload DoS.
 const MAX_IDENTIFIER_LEN = 254;
 const MAX_PASSWORD_LEN = 256;
 const FAIL_DELAY_MS = 400;
 
-// Fail-fast warning during boot logs.
-// Runtime check below will block login if secret is weak/missing.
 if (!JWT_SECRET || JWT_SECRET.length < 32) {
   console.error('FATAL_CONFIG: JWT_SECRET is missing or too short. Need >= 32 chars.');
 }
@@ -77,17 +56,30 @@ function bestPasswordAlgo() {
 function makeJwt(payload) {
   return jwt.sign(payload, JWT_SECRET, {
     algorithm: 'HS256',
-    noTimestamp: true,
   });
 }
 
+function createRefreshToken() {
+  return crypto.randomBytes(64).toString('hex');
+}
+
+function hashRefreshToken(refreshToken) {
+  return crypto.createHash('sha256').update(refreshToken).digest('hex');
+}
+
+function getRefreshExpiresAt() {
+  const expiresAt = new Date();
+  expiresAt.setDate(expiresAt.getDate() + JWT_REFRESH_TTL_DAYS);
+  return expiresAt;
+}
+
 function getClientIp(req) {
-  return String(req.ip || req.socket?.remoteAddress || '0.0.0.0');
+  return String(req.ip || req.socket?.remoteAddress || '0.0.0.0').substring(0, 45);
 }
 
 function getUserAgent(req) {
   const ua = req.headers?.['user-agent'] || '';
-  return String(ua).substring(0, 500);
+  return String(ua).substring(0, 255);
 }
 
 function authLogHash(value) {
@@ -104,14 +96,17 @@ function send500(res) {
   });
 }
 
-/*
-|--------------------------------------------------------------------------
-| Safe auth logging
-|--------------------------------------------------------------------------
-| If app_auth_logs table/insert fails, login should still work.
-| Identifying fields are HMAC-hashed before insert.
-|--------------------------------------------------------------------------
-*/
+function setRefreshCookieIfEnabled(res, refreshToken) {
+  if (process.env.USE_REFRESH_COOKIE !== 'true') return;
+
+  res.cookie('refresh_token', refreshToken, {
+    httpOnly: true,
+    secure: true,
+    sameSite: 'strict',
+    maxAge: JWT_REFRESH_TTL_SECONDS * 1000,
+    path: process.env.REFRESH_COOKIE_PATH || '/v1/auth/refresh-token',
+  });
+}
 
 async function writeAuthLogSafe(
   conn,
@@ -140,9 +135,6 @@ async function writeAuthLogSafe(
         ? String(failureReason).substring(0, 255)
         : null;
 
-    const sessionHash = null;
-    const successInt = success ? 1 : 0;
-
     await conn.execute(
       `INSERT INTO app_auth_logs (
          event_type,
@@ -165,8 +157,8 @@ async function writeAuthLogSafe(
         identifierHash,
         ipHash,
         userAgentHash,
-        sessionHash,
-        successInt,
+        null,
+        success ? 1 : 0,
         safeFailureReason,
       ]
     );
@@ -175,18 +167,18 @@ async function writeAuthLogSafe(
   }
 }
 
-/*
-|--------------------------------------------------------------------------
-| Dashboard route
-|--------------------------------------------------------------------------
-*/
-
 function buildDashboardRoute(role) {
   if (role === 'super_admin') return '/super-admin/overview';
   if (role === 'admin') return '/trainer-admin/overview';
   if (role === 'trainer') return '/trainer/clients';
-
   return '/login';
+}
+
+function buildLogoUrl(dieticianId) {
+  return (
+    'https://humorstech.com/humors_app/app_final/dieticianapp/api/get_dietician_logo.php?dietician_id=' +
+    encodeURIComponent(dieticianId)
+  );
 }
 
 /*
@@ -196,12 +188,6 @@ function buildDashboardRoute(role) {
 */
 
 exports.login = async (req, res) => {
-  /*
-  |--------------------------------------------------------------------------
-  | Method gate
-  |--------------------------------------------------------------------------
-  */
-
   if (req.method !== 'POST') {
     return res.status(405).json({
       ok: false,
@@ -209,21 +195,9 @@ exports.login = async (req, res) => {
     });
   }
 
-  /*
-  |--------------------------------------------------------------------------
-  | JWT secret validation
-  |--------------------------------------------------------------------------
-  */
-
   if (!JWT_SECRET || JWT_SECRET.length < 32) {
     return send500(res);
   }
-
-  /*
-  |--------------------------------------------------------------------------
-  | Lambda/API Gateway raw-body fallback
-  |--------------------------------------------------------------------------
-  */
 
   if (typeof req.body === 'string') {
     try {
@@ -237,12 +211,6 @@ exports.login = async (req, res) => {
   }
 
   const inBody = req.body && typeof req.body === 'object' ? req.body : {};
-
-  /*
-  |--------------------------------------------------------------------------
-  | Strict input validation
-  |--------------------------------------------------------------------------
-  */
 
   const rawIdentifier = inBody.identifier;
   const rawPassword = inBody.password;
@@ -273,14 +241,6 @@ exports.login = async (req, res) => {
 
   try {
     conn = await pool.getConnection();
-
-    /*
-    |--------------------------------------------------------------------------
-    | Lookup user from table_dietician + app_user_roles
-    |--------------------------------------------------------------------------
-    | table_dietician.email = app_user_roles.user_id
-    |--------------------------------------------------------------------------
-    */
 
     let rows;
 
@@ -345,12 +305,6 @@ exports.login = async (req, res) => {
 
     const user = rows && rows.length ? rows[0] : null;
 
-    /*
-    |--------------------------------------------------------------------------
-    | User not found
-    |--------------------------------------------------------------------------
-    */
-
     if (!user) {
       await writeAuthLogSafe(
         conn,
@@ -371,12 +325,6 @@ exports.login = async (req, res) => {
         error: 'Invalid credentials',
       });
     }
-
-    /*
-    |--------------------------------------------------------------------------
-    | Validate role/status
-    |--------------------------------------------------------------------------
-    */
 
     const role = String(user.role);
 
@@ -417,14 +365,6 @@ exports.login = async (req, res) => {
         error: 'Invalid role configuration',
       });
     }
-
-    /*
-    |--------------------------------------------------------------------------
-    | Admin/trainer validation
-    |--------------------------------------------------------------------------
-    | super_admin can have partner_code = NULL and parent_user_id = NULL.
-    |--------------------------------------------------------------------------
-    */
 
     if (
       (role === 'admin' || role === 'trainer') &&
@@ -489,12 +429,6 @@ exports.login = async (req, res) => {
       });
     }
 
-    /*
-    |--------------------------------------------------------------------------
-    | Verify password
-    |--------------------------------------------------------------------------
-    */
-
     const hash = String(user.password || '');
 
     let passwordOk = false;
@@ -527,12 +461,6 @@ exports.login = async (req, res) => {
       });
     }
 
-    /*
-    |--------------------------------------------------------------------------
-    | Optional password rehash
-    |--------------------------------------------------------------------------
-    */
-
     try {
       const { rounds } = bestPasswordAlgo();
       const currentRounds = bcrypt.getRounds(hash);
@@ -548,15 +476,8 @@ exports.login = async (req, res) => {
         );
       }
     } catch (error) {
-      // Non-fatal.
       console.error('REHASH_ERROR: ' + error.message);
     }
-
-    /*
-    |--------------------------------------------------------------------------
-    | Build token payload
-    |--------------------------------------------------------------------------
-    */
 
     const partnerCode =
       user.partner_code !== null && user.partner_code !== undefined
@@ -569,10 +490,7 @@ exports.login = async (req, res) => {
         : null;
 
     const dashboardRoute = buildDashboardRoute(role);
-
-    const logoUrl =
-      'https://humorstech.com/humors_app/app_final/dieticianapp/api/get_dietician_logo.php?dietician_id=' +
-      encodeURIComponent(user.dietician_id);
+    const logoUrl = buildLogoUrl(user.dietician_id);
 
     const dieticianPayload = {
       dietician_id: String(user.dietician_id),
@@ -583,54 +501,58 @@ exports.login = async (req, res) => {
       logo: logoUrl,
       is_reset_password: parseInt(user.is_reset_password, 10) || 0,
 
-      role: role,
+      role,
       partner_code: partnerCode,
       parent_user_id: parentUserId,
     };
 
-    /*
-    |--------------------------------------------------------------------------
-    | Issue JWT
-    |--------------------------------------------------------------------------
-    | These fields are now inside access_token:
-    | - role
-    | - partner_code
-    | - parent_user_id
-    | - dashboard_route
-    | - dietician
-    |--------------------------------------------------------------------------
-    */
-
     const now = Math.floor(Date.now() / 1000);
 
-    const payload = {
+    const accessPayload = {
       iss: JWT_ISS,
       aud: JWT_AUD,
       iat: now,
       nbf: now,
       exp: now + JWT_TTL,
 
-      // Auth middleware/backward-compatible claims.
       sub: String(user.dietician_id),
       dietician_id: String(user.dietician_id),
 
-      // Required role payload inside access_token.
-      role: role,
+      role,
       partner_code: partnerCode,
       parent_user_id: parentUserId,
       dashboard_route: dashboardRoute,
 
-      // Full dietician object inside access_token.
       dietician: dieticianPayload,
     };
 
-    const token = makeJwt(payload);
+    const accessToken = makeJwt(accessPayload);
 
     /*
     |--------------------------------------------------------------------------
-    | Audit log: login_success
+    | Create refresh token
+    |--------------------------------------------------------------------------
+    | Refresh token is opaque/random.
+    | DB stores only SHA-256 hash, never plain token.
     |--------------------------------------------------------------------------
     */
+
+    const refreshToken = createRefreshToken();
+    const refreshTokenHash = hashRefreshToken(refreshToken);
+    const refreshExpiresAt = getRefreshExpiresAt();
+
+    await conn.execute(
+      `INSERT INTO dietician_refresh_tokens
+         (dietician_id, token_hash, expires_at, ip_address, user_agent)
+       VALUES (?, ?, ?, ?, ?)`,
+      [
+        String(user.dietician_id),
+        refreshTokenHash,
+        refreshExpiresAt,
+        getClientIp(req),
+        getUserAgent(req),
+      ]
+    );
 
     await writeAuthLogSafe(
       conn,
@@ -644,23 +566,24 @@ exports.login = async (req, res) => {
       null
     );
 
-    /*
-    |--------------------------------------------------------------------------
-    | Success response
-    |--------------------------------------------------------------------------
-    | role, partner_code, parent_user_id, dashboard_route and dietician
-    | are NOT returned outside now. They are inside access_token.
-    |--------------------------------------------------------------------------
-    */
+    setRefreshCookieIfEnabled(res, refreshToken);
 
     return res.status(200).json({
       ok: true,
       token_type: 'Bearer',
-      access_token: token,
+      access_token: accessToken,
       expires_in: JWT_TTL,
+      refresh_token: refreshToken,
+      refresh_expires_in: JWT_REFRESH_TTL_SECONDS,
     });
   } catch (error) {
-    console.error('LOGIN_ERROR:', error.message);
+    console.error('LOGIN_ERROR:', {
+      message: error?.message || null,
+      code: error?.code || null,
+      sqlState: error?.sqlState || null,
+      sqlMessage: process.env.NODE_ENV !== 'production' ? error?.sqlMessage : undefined,
+    });
+
     return send500(res);
   } finally {
     if (conn) {

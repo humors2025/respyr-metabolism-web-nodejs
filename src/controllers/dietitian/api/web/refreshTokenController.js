@@ -1,107 +1,159 @@
-// const pool = require('../../../../config/db');
-// const jwt = require('jsonwebtoken');
-// const crypto = require('crypto');
+// controllers/dietitian/api/web/refreshTokenController.js
 
-// exports.refreshToken = async (req, res) => {
-//   try {
-//     const { refresh_token } = req.body;
+'use strict';
 
-//     if (!refresh_token) {
-//       return res.status(400).json({
-//         ok: false,
-//         message: 'refresh_token is required',
-//       });
-//     }
-
-//     // 🔍 Verify refresh token
-//     jwt.verify(refresh_token, process.env.JWT_REFRESH_SECRET);
-
-//     // 🔒 Hash refresh token
-//     const hashedToken = crypto
-//       .createHash('sha256')
-//       .update(refresh_token)
-//       .digest('hex');
-
-//     // 🔍 Check token in DB
-//     const [rows] = await pool.query(
-//       `SELECT dietician_id, name, email, phone_no, location
-//        FROM table_dietician
-//        WHERE refresh_token_hash = ?
-//        AND refresh_token_expires_at > NOW()`,
-//       [hashedToken]
-//     );
-
-//     if (rows.length === 0) {
-//       return res.status(401).json({
-//         ok: false,
-//         message: 'Invalid or expired refresh token',
-//       });
-//     }
-
-//     const dietician = rows[0];
-
-//     // 🔑 New access token
-//     const accessToken = jwt.sign(
-//       {
-//         sub: dietician.dietician_id,
-//         role: 'dietician',
-//         dietician: {
-//           dietician_id: dietician.dietician_id,
-//           name: dietician.name,
-//           email: dietician.email,
-//           phone_no: dietician.phone_no,
-//           location: dietician.location,
-//         },
-//       },
-//       process.env.JWT_SECRET,
-//       { expiresIn: '15m' }
-//     );
-
-//     return res.json({
-//       ok: true,
-//       token_type: 'Bearer',
-//       access_token: accessToken,
-//       expires_in: 900,
-//     });
-
-//   } catch (error) {
-//     console.error('Refresh Token Error:', error);
-//     return res.status(401).json({
-//       ok: false,
-//       message: 'Invalid or expired refresh token',
-//     });
-//   }
-// };
-
-
-
-
-
-const pool = require('../../../../config/db');
-const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
+const jwt = require('jsonwebtoken');
+const pool = require('../../../../config/db');
 
-const ACCESS_TOKEN_TTL_SECONDS = 15 * 60;   // 15 min
-const REFRESH_TOKEN_TTL_DAYS = 7;
+/*
+|--------------------------------------------------------------------------
+| Config
+|--------------------------------------------------------------------------
+*/
+
+const JWT_SECRET = process.env.JWT_SECRET;
+const JWT_ISS = process.env.JWT_ISS || process.env.JWT_ISSUER || 'api.respyr.ai';
+const JWT_AUD = process.env.JWT_AUD || process.env.JWT_AUDIENCE || 'respyr-dietitian-app';
+
+const JWT_TTL = parseInt(process.env.JWT_TTL, 10) || 900;
+
+const JWT_REFRESH_TTL_DAYS =
+  parseInt(process.env.JWT_REFRESH_TTL_DAYS, 10) || 30;
+
+const JWT_REFRESH_TTL_SECONDS = JWT_REFRESH_TTL_DAYS * 24 * 60 * 60;
+
+/*
+|--------------------------------------------------------------------------
+| Helpers
+|--------------------------------------------------------------------------
+*/
+
+function makeJwt(payload) {
+  return jwt.sign(payload, JWT_SECRET, {
+    algorithm: 'HS256',
+  });
+}
+
+function createRefreshToken() {
+  return crypto.randomBytes(64).toString('hex');
+}
+
+function hashRefreshToken(refreshToken) {
+  return crypto.createHash('sha256').update(refreshToken).digest('hex');
+}
+
+function getRefreshExpiresAt() {
+  const expiresAt = new Date();
+  expiresAt.setDate(expiresAt.getDate() + JWT_REFRESH_TTL_DAYS);
+  return expiresAt;
+}
+
+function getClientIp(req) {
+  return String(req.ip || req.socket?.remoteAddress || '0.0.0.0').substring(0, 45);
+}
+
+function getUserAgent(req) {
+  const ua = req.headers?.['user-agent'] || '';
+  return String(ua).substring(0, 255);
+}
+
+function getCookieValue(req, cookieName) {
+  const cookieHeader = req.headers?.cookie;
+
+  if (!cookieHeader || typeof cookieHeader !== 'string') return null;
+
+  const cookies = cookieHeader.split(';').map((item) => item.trim());
+
+  for (const cookie of cookies) {
+    const index = cookie.indexOf('=');
+    if (index === -1) continue;
+
+    const name = cookie.substring(0, index);
+    const value = cookie.substring(index + 1);
+
+    if (name === cookieName) {
+      return decodeURIComponent(value);
+    }
+  }
+
+  return null;
+}
+
+function setRefreshCookieIfEnabled(res, refreshToken) {
+  if (process.env.USE_REFRESH_COOKIE !== 'true') return;
+
+  res.cookie('refresh_token', refreshToken, {
+    httpOnly: true,
+    secure: true,
+    sameSite: 'strict',
+    maxAge: JWT_REFRESH_TTL_SECONDS * 1000,
+    path: process.env.REFRESH_COOKIE_PATH || '/v1/auth/refresh-token',
+  });
+}
+
+function buildDashboardRoute(role) {
+  if (role === 'super_admin') return '/super-admin/overview';
+  if (role === 'admin') return '/trainer-admin/overview';
+  if (role === 'trainer') return '/trainer/clients';
+  return '/login';
+}
+
+function buildLogoUrl(dieticianId) {
+  return (
+    'https://humorstech.com/humors_app/app_final/dieticianapp/api/get_dietician_logo.php?dietician_id=' +
+    encodeURIComponent(dieticianId)
+  );
+}
+
+function sendInvalidRefreshToken(res) {
+  return res.status(401).json({
+    ok: false,
+    message: 'Invalid or expired refresh token',
+  });
+}
+
+/*
+|--------------------------------------------------------------------------
+| Controller
+|--------------------------------------------------------------------------
+*/
 
 exports.refreshToken = async (req, res) => {
-  // Connection used for the rotation transaction
+  if (req.method !== 'POST') {
+    return res.status(405).json({
+      ok: false,
+      message: 'Method not allowed',
+    });
+  }
+
+  if (!JWT_SECRET || JWT_SECRET.length < 32) {
+    console.error('[AUTH] JWT_SECRET missing or too short');
+    return res.status(500).json({
+      ok: false,
+      message: 'Server configuration error',
+    });
+  }
+
   let conn;
+
   try {
-    // Lambda/API Gateway raw body handling (consistent with login controller)
     if (typeof req.body === 'string') {
       try {
         req.body = JSON.parse(req.body);
       } catch {
-        return res.status(400).json({ ok: false, message: 'Invalid JSON body' });
+        return res.status(400).json({
+          ok: false,
+          message: 'Invalid JSON body',
+        });
       }
     }
 
-    // Accept refresh token from body or httpOnly cookie (login can set either)
+    const inBody = req.body && typeof req.body === 'object' ? req.body : {};
+
     const refreshToken =
-      (typeof req.body?.refresh_token === 'string' && req.body.refresh_token) ||
-      req.cookies?.refresh_token ||
-      null;
+      (typeof inBody.refresh_token === 'string' && inBody.refresh_token.trim()) ||
+      getCookieValue(req, 'refresh_token');
 
     if (!refreshToken) {
       return res.status(400).json({
@@ -110,211 +162,224 @@ exports.refreshToken = async (req, res) => {
       });
     }
 
-    // Server config check before any work
-    if (!process.env.JWT_SECRET || !process.env.JWT_REFRESH_SECRET) {
-      console.error('[AUTH] JWT secrets missing in environment');
-      return res.status(500).json({ ok: false, message: 'Server configuration error' });
-    }
+    const incomingRefreshTokenHash = hashRefreshToken(refreshToken);
 
-    // Verify signature, expiry, issuer and audience — must match how login signed it
-    let decoded;
-    try {
-      decoded = jwt.verify(refreshToken, process.env.JWT_REFRESH_SECRET, {
-        algorithms: ['HS256'],
-        issuer: process.env.JWT_ISSUER || 'dietician-api',
-        audience: process.env.JWT_AUDIENCE || 'dietician-app',
-      });
-    } catch {
-      // Signature/expiry/claim failure — genuinely an invalid token
-      return res.status(401).json({
-        ok: false,
-        message: 'Invalid or expired refresh token',
-      });
-    }
-
-    const hashedToken = crypto
-      .createHash('sha256')
-      .update(refreshToken)
-      .digest('hex');
-
-    // Transaction: look up the stored token, then rotate it atomically
     conn = await pool.getConnection();
     await conn.beginTransaction();
 
-    // Join to table_dietician to fetch profile data in one query.
-    // FOR UPDATE locks the row so a concurrent refresh can't reuse it.
+    /*
+    |--------------------------------------------------------------------------
+    | Find active refresh token
+    |--------------------------------------------------------------------------
+    | We do not store plain refresh token.
+    | We compare SHA-256 hash and rotate token one-time-use.
+    |--------------------------------------------------------------------------
+    */
+
     const [rows] = await conn.query(
       `SELECT
-         rt.id            AS token_id,
-         rt.dietician_id  AS dietician_id,
+         rt.id AS token_id,
+         rt.dietician_id AS refresh_dietician_id,
+         rt.expires_at,
+
+         td.id,
+         td.dietician_id,
+         td.is_reset_password,
          td.name,
-         td.email,
          td.phone_no,
+         td.email,
          td.location,
-         (
-           SELECT tc.profile_id
-           FROM table_clients tc
-           WHERE tc.dietician_id = td.dietician_id
-           ORDER BY tc.profile_id ASC
-           LIMIT 1
-         ) AS profile_id
+
+         aur.role,
+         aur.partner_code,
+         aur.parent_user_id,
+         aur.status,
+         aur.email_verified_at
        FROM dietician_refresh_tokens rt
-       JOIN table_dietician td ON td.dietician_id = rt.dietician_id
-       WHERE rt.token_hash = ? AND rt.expires_at > NOW()
+       INNER JOIN table_dietician td
+         ON td.dietician_id = rt.dietician_id
+       INNER JOIN app_user_roles aur
+         ON LOWER(aur.user_id) = LOWER(td.email)
+       WHERE rt.token_hash = ?
+         AND rt.expires_at > NOW()
        LIMIT 1
        FOR UPDATE`,
-      [hashedToken]
+      [incomingRefreshTokenHash]
     );
 
-    if (rows.length === 0) {
+    if (!rows || rows.length === 0) {
       await conn.rollback();
-      // Token not in DB or expired. If it passed jwt.verify() but isn't in the
-      // DB, it may have already been rotated/revoked — possible token reuse.
-      console.warn('[AUTH] Refresh token not found or expired', {
-        sub: decoded?.sub || null,
-      });
-      return res.status(401).json({
+      return sendInvalidRefreshToken(res);
+    }
+
+    const user = rows[0];
+    const role = String(user.role);
+
+    if (String(user.status) !== 'active') {
+      await conn.rollback();
+      return res.status(403).json({
         ok: false,
-        message: 'Invalid or expired refresh token',
+        message: 'Account is not active',
       });
     }
 
-    const dietician = rows[0];
-
-    // Cross-check: token's `sub` claim must match the DB row's owner
-    if (String(decoded.sub) !== String(dietician.dietician_id)) {
+    if (role !== 'super_admin' && role !== 'admin' && role !== 'trainer') {
       await conn.rollback();
-      console.warn('[AUTH] Refresh token sub mismatch', {
-        token_sub: decoded.sub,
-        row_owner: dietician.dietician_id,
-      });
-      return res.status(401).json({
+      return res.status(403).json({
         ok: false,
-        message: 'Invalid or expired refresh token',
+        message: 'Invalid role configuration',
       });
     }
 
-    const baseUrl = process.env.BASE_URL;
-    if (!baseUrl) {
+    if (
+      (role === 'admin' || role === 'trainer') &&
+      String(user.partner_code == null ? '' : user.partner_code).trim() === ''
+    ) {
       await conn.rollback();
-      console.error('[AUTH] BASE_URL not configured');
-      return res.status(500).json({ ok: false, message: 'Server configuration error' });
+      return res.status(403).json({
+        ok: false,
+        message: 'Partner code missing for this account',
+      });
     }
 
-    const logoUrl =
-      `${baseUrl}/dietitian/api/web/get_client_image?dietician_id=${dietician.dietician_id}`;
-    const profileUrl = dietician.profile_id
-      ? `${baseUrl}/dietitian/api/web/get_profile_image?profile_id=${dietician.profile_id}&dietician_id=${dietician.dietician_id}`
-      : null;
+    if (
+      (role === 'admin' || role === 'trainer') &&
+      String(user.parent_user_id == null ? '' : user.parent_user_id).trim() === ''
+    ) {
+      await conn.rollback();
+      return res.status(403).json({
+        ok: false,
+        message: 'Parent user missing for this account',
+      });
+    }
 
-    // New access token — identical shape to the login controller's token
-    const accessToken = jwt.sign(
-      {
-        sub: String(dietician.dietician_id),
-        role: 'dietician',
-        dietician: {
-          dietician_id: dietician.dietician_id,
-          name: dietician.name,
-          email: dietician.email,
-          phone_no: dietician.phone_no,
-          location: dietician.location,
-          logo_url: logoUrl,
-          profile_url: profileUrl,
-        },
-      },
-      process.env.JWT_SECRET,
-      {
-        expiresIn: ACCESS_TOKEN_TTL_SECONDS,
-        algorithm: 'HS256',
-        issuer: process.env.JWT_ISSUER || 'dietician-api',
-        audience: process.env.JWT_AUDIENCE || 'dietician-app',
-        jwtid: crypto.randomBytes(16).toString('hex'),
-      }
-    );
+    if ((role === 'admin' || role === 'trainer') && !user.email_verified_at) {
+      await conn.rollback();
+      return res.status(403).json({
+        ok: false,
+        message: 'Email is not verified',
+      });
+    }
 
-    // --- Refresh token rotation ---
-    // Issue a brand-new refresh token and delete the old one so it can't be reused.
-    const newRefreshToken = jwt.sign(
-      {
-        sub: String(dietician.dietician_id),
-        role: 'dietician',
-      },
-      process.env.JWT_REFRESH_SECRET,
-      {
-        expiresIn: `${REFRESH_TOKEN_TTL_DAYS}d`,
-        algorithm: 'HS256',
-        issuer: process.env.JWT_ISSUER || 'dietician-api',
-        audience: process.env.JWT_AUDIENCE || 'dietician-app',
-        jwtid: crypto.randomBytes(16).toString('hex'),
-      }
-    );
+    const partnerCode =
+      user.partner_code !== null && user.partner_code !== undefined
+        ? String(user.partner_code)
+        : null;
 
-    const newHashedRefreshToken = crypto
-      .createHash('sha256')
-      .update(newRefreshToken)
-      .digest('hex');
+    const parentUserId =
+      user.parent_user_id !== null && user.parent_user_id !== undefined
+        ? String(user.parent_user_id).toLowerCase()
+        : null;
 
-    const newExpiresAt = new Date();
-    newExpiresAt.setDate(newExpiresAt.getDate() + REFRESH_TOKEN_TTL_DAYS);
+    const dashboardRoute = buildDashboardRoute(role);
+    const logoUrl = buildLogoUrl(user.dietician_id);
 
-    // Delete the consumed token (one-time use)
+    const dieticianPayload = {
+      dietician_id: String(user.dietician_id),
+      name: user.name,
+      email: String(user.email).toLowerCase(),
+      phone_no: user.phone_no,
+      location: user.location,
+      logo: logoUrl,
+      is_reset_password: parseInt(user.is_reset_password, 10) || 0,
+
+      role,
+      partner_code: partnerCode,
+      parent_user_id: parentUserId,
+    };
+
+    const now = Math.floor(Date.now() / 1000);
+
+    const accessPayload = {
+      iss: JWT_ISS,
+      aud: JWT_AUD,
+      iat: now,
+      nbf: now,
+      exp: now + JWT_TTL,
+
+      sub: String(user.dietician_id),
+      dietician_id: String(user.dietician_id),
+
+      role,
+      partner_code: partnerCode,
+      parent_user_id: parentUserId,
+      dashboard_route: dashboardRoute,
+
+      dietician: dieticianPayload,
+    };
+
+    const newAccessToken = makeJwt(accessPayload);
+
+    /*
+    |--------------------------------------------------------------------------
+    | Rotate refresh token
+    |--------------------------------------------------------------------------
+    | Delete old refresh token and create a new one.
+    |--------------------------------------------------------------------------
+    */
+
+    const newRefreshToken = createRefreshToken();
+    const newRefreshTokenHash = hashRefreshToken(newRefreshToken);
+    const newRefreshExpiresAt = getRefreshExpiresAt();
+
     await conn.query(
-      `DELETE FROM dietician_refresh_tokens WHERE id = ?`,
-      [dietician.token_id]
+      `DELETE FROM dietician_refresh_tokens
+       WHERE id = ?`,
+      [user.token_id]
     );
 
-    // Insert the replacement
     await conn.query(
       `INSERT INTO dietician_refresh_tokens
          (dietician_id, token_hash, expires_at, ip_address, user_agent)
        VALUES (?, ?, ?, ?, ?)`,
       [
-        dietician.dietician_id,
-        newHashedRefreshToken,
-        newExpiresAt,
-        (req.ip || req.socket?.remoteAddress || null)?.toString().substring(0, 45) || null,
-        (typeof req.get === 'function' ? req.get('user-agent') : null)?.toString().substring(0, 255) || null,
+        String(user.dietician_id),
+        newRefreshTokenHash,
+        newRefreshExpiresAt,
+        getClientIp(req),
+        getUserAgent(req),
       ]
     );
 
     await conn.commit();
 
-    // Match the login controller's cookie behaviour
-    if (process.env.USE_REFRESH_COOKIE === 'true') {
-      res.cookie('refresh_token', newRefreshToken, {
-        httpOnly: true,
-        secure: true,
-        sameSite: 'strict',
-        maxAge: REFRESH_TOKEN_TTL_DAYS * 24 * 60 * 60 * 1000,
-        path: '/dietitian/api/web/auth',
-      });
-    }
+    setRefreshCookieIfEnabled(res, newRefreshToken);
 
     return res.status(200).json({
       ok: true,
       token_type: 'Bearer',
-      access_token: accessToken,
-      refresh_token: newRefreshToken,   // rotated — old one is now invalid
-      expires_in: ACCESS_TOKEN_TTL_SECONDS,
+      access_token: newAccessToken,
+      expires_in: JWT_TTL,
+      refresh_token: newRefreshToken,
+      refresh_expires_in: JWT_REFRESH_TTL_SECONDS,
     });
   } catch (error) {
     if (conn) {
-      try { await conn.rollback(); } catch { /* ignore rollback failure */ }
+      try {
+        await conn.rollback();
+      } catch (_) {
+        // noop
+      }
     }
+
     console.error('[AUTH] Refresh token error:', {
       message: error?.message || null,
-      name: error?.name || null,
       code: error?.code || null,
       sqlState: error?.sqlState || null,
       sqlMessage: process.env.NODE_ENV !== 'production' ? error?.sqlMessage : undefined,
-      stack: process.env.NODE_ENV !== 'production' ? error?.stack : undefined,
     });
-    // Real server/DB error — 500, not a misleading 401
+
     return res.status(500).json({
       ok: false,
       message: 'Token refresh failed. Please try again later.',
     });
   } finally {
-    if (conn) conn.release();
+    if (conn) {
+      try {
+        conn.release();
+      } catch (_) {
+        // noop
+      }
+    }
   }
 };
