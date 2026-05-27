@@ -1,12 +1,25 @@
 // controllers/dietitian/api/web/loginController.js
 //
-// Direct Node.js port of the PHP role-based login API.
-// Preserves exact logic: SQL, validation order, response shapes, audit logging.
+// Node.js port of role-login-jwt.php (table_dietician + app_user_roles).
+// Hardened login flow:
+//   - No PHI/PII in audit logs (HMAC-hashed identifiers/IP/UA)
+//   - Generic error messages (no user enumeration)
+//   - Constant-time password verification + fixed delay on failure
+//   - Strict input validation (type + length caps)
+//   - Fail-fast on missing/weak JWT secret
+//   - Explicit JWT algorithm (HS256) with manual iat/nbf/exp
+//   - Connection always released
+//
+// IMPORTANT:
+// This version stores role, partner_code, parent_user_id,
+// dashboard_route, and full dietician object inside access_token.
+//
+// JWT payload is base64-decodable, so do not treat JWT payload as private.
 //
 // POST JSON:
 // {
-//   "identifier": "john@demo.com",   // email OR phone_no
-//   "password":   "PlainTextPassword"
+//   "identifier": "john@demo.com",
+//   "password": "PlainTextPassword"
 // }
 
 'use strict';
@@ -18,44 +31,50 @@ const pool = require('../../../../config/db');
 
 /*
 |--------------------------------------------------------------------------
-| Config (mapped from PHP config.php)
+| Config
 |--------------------------------------------------------------------------
 */
-const JWT_SECRET = process.env.JWT_SECRET;
-const JWT_ISS    = process.env.JWT_ISS  || 'api.respyr.ai';
-const JWT_AUD    = process.env.JWT_AUD  || 'respyr-dietitian-app';
-const JWT_TTL    = parseInt(process.env.JWT_TTL, 10) || 900; // seconds
 
-/*
-|--------------------------------------------------------------------------
-| Security pepper for audit-log hashing
-|--------------------------------------------------------------------------
-| Better: define SECURITY_PEPPER in .env.
-| For now, this fallback uses JWT_SECRET if SECURITY_PEPPER is not defined.
-*/
+const JWT_SECRET = process.env.JWT_SECRET;
+const JWT_ISS = process.env.JWT_ISS || 'api.respyr.ai';
+const JWT_AUD = process.env.JWT_AUD || 'respyr-dietitian-app';
+const JWT_TTL = parseInt(process.env.JWT_TTL, 10) || 900; // seconds
+
+// HMAC pepper for audit-log hashing — separate from JWT_SECRET when possible.
 const SECURITY_PEPPER = process.env.SECURITY_PEPPER || JWT_SECRET;
 
+// Hard caps to prevent oversized-payload DoS.
+const MAX_IDENTIFIER_LEN = 254;
+const MAX_PASSWORD_LEN = 256;
+const FAIL_DELAY_MS = 400;
+
+// Fail-fast warning during boot logs.
+// Runtime check below will block login if secret is weak/missing.
+if (!JWT_SECRET || JWT_SECRET.length < 32) {
+  console.error('FATAL_CONFIG: JWT_SECRET is missing or too short. Need >= 32 chars.');
+}
+
 /*
 |--------------------------------------------------------------------------
-| Helpers (mapped from PHP helpers.php)
+| Helpers
 |--------------------------------------------------------------------------
 */
 
-function isValidEmail(s) {
-  return typeof s === 'string' && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(s);
+function isValidEmail(value) {
+  return typeof value === 'string' && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value);
 }
 
 function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function bestPasswordAlgo() {
-  return { rounds: parseInt(process.env.BCRYPT_ROUNDS, 10) || 12 };
+  return {
+    rounds: parseInt(process.env.BCRYPT_ROUNDS, 10) || 12,
+  };
 }
 
 function makeJwt(payload) {
-  // PHP code manually sets iat/nbf/exp/iss/aud/sub inside the payload,
-  // so noTimestamp:true prevents jsonwebtoken from re-adding iat.
   return jwt.sign(payload, JWT_SECRET, {
     algorithm: 'HS256',
     noTimestamp: true,
@@ -78,10 +97,22 @@ function authLogHash(value) {
     .digest('hex');
 }
 
+function send500(res) {
+  return res.status(500).json({
+    ok: false,
+    error: 'Internal server error',
+  });
+}
+
 /*
- * Safe logging:
- * If app_auth_logs table/insert fails, login still works.
- */
+|--------------------------------------------------------------------------
+| Safe auth logging
+|--------------------------------------------------------------------------
+| If app_auth_logs table/insert fails, login should still work.
+| Identifying fields are HMAC-hashed before insert.
+|--------------------------------------------------------------------------
+*/
+
 async function writeAuthLogSafe(
   conn,
   req,
@@ -96,19 +127,20 @@ async function writeAuthLogSafe(
   try {
     const ipHash = authLogHash(getClientIp(req));
     const userAgentHash = authLogHash(getUserAgent(req));
+
     const identifierHash =
       identifier !== null && identifier !== undefined
         ? authLogHash(identifier)
         : null;
 
-    const ev = String(eventType).substring(0, 60);
-    const fr =
+    const safeEventType = String(eventType).substring(0, 60);
+
+    const safeFailureReason =
       failureReason !== null && failureReason !== undefined
         ? String(failureReason).substring(0, 255)
         : null;
 
     const sessionHash = null;
-
     const successInt = success ? 1 : 0;
 
     await conn.execute(
@@ -126,7 +158,7 @@ async function writeAuthLogSafe(
        )
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
-        ev,
+        safeEventType,
         userId,
         role,
         partnerCode,
@@ -135,11 +167,11 @@ async function writeAuthLogSafe(
         userAgentHash,
         sessionHash,
         successInt,
-        fr,
+        safeFailureReason,
       ]
     );
-  } catch (e) {
-    console.error('AUTH_LOG_WRITE_FAILED: ' + e.message);
+  } catch (error) {
+    console.error('AUTH_LOG_WRITE_FAILED: ' + error.message);
   }
 }
 
@@ -148,16 +180,12 @@ async function writeAuthLogSafe(
 | Dashboard route
 |--------------------------------------------------------------------------
 */
+
 function buildDashboardRoute(role) {
-  if (role === 'super_admin') {
-    return '/super-admin/overview';
-  }
-  if (role === 'admin') {
-    return '/trainer-admin/overview';
-  }
-  if (role === 'trainer') {
-    return '/trainer/clients';
-  }
+  if (role === 'super_admin') return '/super-admin/overview';
+  if (role === 'admin') return '/trainer-admin/overview';
+  if (role === 'trainer') return '/trainer/clients';
+
   return '/login';
 }
 
@@ -166,8 +194,14 @@ function buildDashboardRoute(role) {
 | Controller
 |--------------------------------------------------------------------------
 */
+
 exports.login = async (req, res) => {
-  // Method gate (Express normally routes only POST here, but kept for parity)
+  /*
+  |--------------------------------------------------------------------------
+  | Method gate
+  |--------------------------------------------------------------------------
+  */
+
   if (req.method !== 'POST') {
     return res.status(405).json({
       ok: false,
@@ -175,21 +209,60 @@ exports.login = async (req, res) => {
     });
   }
 
-  // Lambda/API Gateway raw body handling
+  /*
+  |--------------------------------------------------------------------------
+  | JWT secret validation
+  |--------------------------------------------------------------------------
+  */
+
+  if (!JWT_SECRET || JWT_SECRET.length < 32) {
+    return send500(res);
+  }
+
+  /*
+  |--------------------------------------------------------------------------
+  | Lambda/API Gateway raw-body fallback
+  |--------------------------------------------------------------------------
+  */
+
   if (typeof req.body === 'string') {
     try {
       req.body = JSON.parse(req.body);
     } catch {
-      return res.status(400).json({ ok: false, error: 'Invalid JSON body' });
+      return res.status(400).json({
+        ok: false,
+        error: 'Invalid JSON body',
+      });
     }
   }
 
-  const inBody = req.body || {};
+  const inBody = req.body && typeof req.body === 'object' ? req.body : {};
 
-  const identifier = String(inBody.identifier != null ? inBody.identifier : '').trim();
-  const password   = String(inBody.password   != null ? inBody.password   : '');
+  /*
+  |--------------------------------------------------------------------------
+  | Strict input validation
+  |--------------------------------------------------------------------------
+  */
 
-  if (identifier === '' || password === '') {
+  const rawIdentifier = inBody.identifier;
+  const rawPassword = inBody.password;
+
+  if (typeof rawIdentifier !== 'string' || typeof rawPassword !== 'string') {
+    return res.status(422).json({
+      ok: false,
+      error: 'identifier and password are required',
+    });
+  }
+
+  const identifier = rawIdentifier.trim();
+  const password = rawPassword;
+
+  if (
+    identifier === '' ||
+    password === '' ||
+    identifier.length > MAX_IDENTIFIER_LEN ||
+    password.length > MAX_PASSWORD_LEN
+  ) {
     return res.status(422).json({
       ok: false,
       error: 'identifier and password are required',
@@ -203,14 +276,17 @@ exports.login = async (req, res) => {
 
     /*
     |--------------------------------------------------------------------------
-    | Lookup from table_dietician + app_user_roles
+    | Lookup user from table_dietician + app_user_roles
     |--------------------------------------------------------------------------
     | table_dietician.email = app_user_roles.user_id
+    |--------------------------------------------------------------------------
     */
+
     let rows;
+
     try {
       if (isValidEmail(identifier)) {
-        const [r] = await conn.execute(
+        const [result] = await conn.execute(
           `SELECT
              td.id,
              td.dietician_id,
@@ -233,9 +309,10 @@ exports.login = async (req, res) => {
            LIMIT 1`,
           [identifier]
         );
-        rows = r;
+
+        rows = result;
       } else {
-        const [r] = await conn.execute(
+        const [result] = await conn.execute(
           `SELECT
              td.id,
              td.dietician_id,
@@ -258,14 +335,12 @@ exports.login = async (req, res) => {
            LIMIT 1`,
           [identifier]
         );
-        rows = r;
+
+        rows = result;
       }
-    } catch (e) {
-      console.error('ROLE_LOGIN_LOOKUP_ERROR: ' + e.message);
-      return res.status(500).json({
-        ok: false,
-        error: 'Internal server error',
-      });
+    } catch (error) {
+      console.error('ROLE_LOGIN_LOOKUP_ERROR: ' + error.message);
+      return send500(res);
     }
 
     const user = rows && rows.length ? rows[0] : null;
@@ -275,6 +350,7 @@ exports.login = async (req, res) => {
     | User not found
     |--------------------------------------------------------------------------
     */
+
     if (!user) {
       await writeAuthLogSafe(
         conn,
@@ -288,7 +364,7 @@ exports.login = async (req, res) => {
         'Invalid credentials'
       );
 
-      await sleep(400);
+      await sleep(FAIL_DELAY_MS);
 
       return res.status(401).json({
         ok: false,
@@ -301,6 +377,7 @@ exports.login = async (req, res) => {
     | Validate role/status
     |--------------------------------------------------------------------------
     */
+
     const role = String(user.role);
 
     if (String(user.status) !== 'active') {
@@ -345,8 +422,10 @@ exports.login = async (req, res) => {
     |--------------------------------------------------------------------------
     | Admin/trainer validation
     |--------------------------------------------------------------------------
-    | Super admin can have partner_code = NULL and parent_user_id = NULL.
+    | super_admin can have partner_code = NULL and parent_user_id = NULL.
+    |--------------------------------------------------------------------------
     */
+
     if (
       (role === 'admin' || role === 'trainer') &&
       String(user.partner_code == null ? '' : user.partner_code).trim() === ''
@@ -391,10 +470,7 @@ exports.login = async (req, res) => {
       });
     }
 
-    if (
-      (role === 'admin' || role === 'trainer') &&
-      !user.email_verified_at
-    ) {
+    if ((role === 'admin' || role === 'trainer') && !user.email_verified_at) {
       await writeAuthLogSafe(
         conn,
         req,
@@ -418,11 +494,19 @@ exports.login = async (req, res) => {
     | Verify password
     |--------------------------------------------------------------------------
     */
-    const hash = String(user.password);
 
-    const ok = await bcrypt.compare(password, hash);
+    const hash = String(user.password || '');
 
-    if (!ok) {
+    let passwordOk = false;
+
+    try {
+      passwordOk = hash !== '' && (await bcrypt.compare(password, hash));
+    } catch (error) {
+      console.error('BCRYPT_COMPARE_ERROR: ' + error.message);
+      passwordOk = false;
+    }
+
+    if (!passwordOk) {
       await writeAuthLogSafe(
         conn,
         req,
@@ -435,7 +519,7 @@ exports.login = async (req, res) => {
         'Invalid credentials'
       );
 
-      await sleep(400);
+      await sleep(FAIL_DELAY_MS);
 
       return res.status(401).json({
         ok: false,
@@ -448,40 +532,75 @@ exports.login = async (req, res) => {
     | Optional password rehash
     |--------------------------------------------------------------------------
     */
+
     try {
       const { rounds } = bestPasswordAlgo();
       const currentRounds = bcrypt.getRounds(hash);
+
       if (currentRounds < rounds) {
         const newHash = await bcrypt.hash(password, rounds);
+
         await conn.execute(
-          'UPDATE table_dietician SET password = ? WHERE id = ?',
+          `UPDATE table_dietician
+           SET password = ?
+           WHERE id = ?`,
           [newHash, user.id]
         );
       }
-    } catch (rehashErr) {
-      // Non-fatal — silently ignore (parity with PHP best-effort rehash)
-      console.error('REHASH_ERROR: ' + rehashErr.message);
+    } catch (error) {
+      // Non-fatal.
+      console.error('REHASH_ERROR: ' + error.message);
     }
 
     /*
     |--------------------------------------------------------------------------
-    | Issue JWT  (VAPT / HIPAA: minimum-necessary claims only)
+    | Build token payload
     |--------------------------------------------------------------------------
-    | A JWS payload is base64-decodable by anyone holding the token, so we
-    | MUST NOT put PHI / PII in it.
-    |
-    | Kept (operational identifiers, non-PHI):
-    |   iss, aud, iat, nbf, exp  — JWT framework claims
-    |   sub                      — internal dietician_id (opaque)
-    |   dietician_id             — duplicate of sub for back-compat consumers
-    |   role                     — RBAC
-    |   partner_code             — tenant scope
-    |
-    | Removed (PHI / PII — must be re-fetched from DB when needed):
-    |   email, user_id           — email address
-    |   parent_user_id           — email of parent admin
-    |   name, phone_no, location — never were in the token, listed for clarity
     */
+
+    const partnerCode =
+      user.partner_code !== null && user.partner_code !== undefined
+        ? String(user.partner_code)
+        : null;
+
+    const parentUserId =
+      user.parent_user_id !== null && user.parent_user_id !== undefined
+        ? String(user.parent_user_id).toLowerCase()
+        : null;
+
+    const dashboardRoute = buildDashboardRoute(role);
+
+    const logoUrl =
+      'https://humorstech.com/humors_app/app_final/dieticianapp/api/get_dietician_logo.php?dietician_id=' +
+      encodeURIComponent(user.dietician_id);
+
+    const dieticianPayload = {
+      dietician_id: String(user.dietician_id),
+      name: user.name,
+      email: String(user.email).toLowerCase(),
+      phone_no: user.phone_no,
+      location: user.location,
+      logo: logoUrl,
+      is_reset_password: parseInt(user.is_reset_password, 10) || 0,
+
+      role: role,
+      partner_code: partnerCode,
+      parent_user_id: parentUserId,
+    };
+
+    /*
+    |--------------------------------------------------------------------------
+    | Issue JWT
+    |--------------------------------------------------------------------------
+    | These fields are now inside access_token:
+    | - role
+    | - partner_code
+    | - parent_user_id
+    | - dashboard_route
+    | - dietician
+    |--------------------------------------------------------------------------
+    */
+
     const now = Math.floor(Date.now() / 1000);
 
     const payload = {
@@ -491,32 +610,28 @@ exports.login = async (req, res) => {
       nbf: now,
       exp: now + JWT_TTL,
 
+      // Auth middleware/backward-compatible claims.
       sub: String(user.dietician_id),
-
       dietician_id: String(user.dietician_id),
+
+      // Required role payload inside access_token.
       role: role,
-      partner_code:
-        user.partner_code !== null && user.partner_code !== undefined
-          ? String(user.partner_code)
-          : null,
+      partner_code: partnerCode,
+      parent_user_id: parentUserId,
+      dashboard_route: dashboardRoute,
+
+      // Full dietician object inside access_token.
+      dietician: dieticianPayload,
     };
 
     const token = makeJwt(payload);
 
     /*
     |--------------------------------------------------------------------------
-    | Logo URL
-    |--------------------------------------------------------------------------
-    */
-    const logo_url =
-      'https://humorstech.com/humors_app/app_final/dieticianapp/api/get_dietician_logo.php?dietician_id=' +
-      encodeURIComponent(user.dietician_id);
-
-    /*
-    |--------------------------------------------------------------------------
     | Audit log: login_success
     |--------------------------------------------------------------------------
     */
+
     await writeAuthLogSafe(
       conn,
       req,
@@ -531,58 +646,29 @@ exports.login = async (req, res) => {
 
     /*
     |--------------------------------------------------------------------------
-    | Dashboard route
-    |--------------------------------------------------------------------------
-    */
-    const dashboard_route = buildDashboardRoute(role);
-
-    /*
-    |--------------------------------------------------------------------------
     | Success response
     |--------------------------------------------------------------------------
-    | Same as old response + role fields added.
+    | role, partner_code, parent_user_id, dashboard_route and dietician
+    | are NOT returned outside now. They are inside access_token.
+    |--------------------------------------------------------------------------
     */
+
     return res.status(200).json({
       ok: true,
       token_type: 'Bearer',
       access_token: token,
       expires_in: JWT_TTL,
-
-      role: role,
-      partner_code: user.partner_code !== null && user.partner_code !== undefined
-        ? String(user.partner_code)
-        : null,
-      parent_user_id: user.parent_user_id !== null && user.parent_user_id !== undefined
-        ? String(user.parent_user_id).toLowerCase()
-        : null,
-      dashboard_route: dashboard_route,
-
-      dietician: {
-        dietician_id: user.dietician_id,
-        name: user.name,
-        email: String(user.email).toLowerCase(),
-        phone_no: user.phone_no,
-        location: user.location,
-        logo: logo_url,
-        is_reset_password: parseInt(user.is_reset_password, 10) || 0,
-
-        role: role,
-        partner_code: user.partner_code !== null && user.partner_code !== undefined
-          ? String(user.partner_code)
-          : null,
-        parent_user_id: user.parent_user_id !== null && user.parent_user_id !== undefined
-          ? String(user.parent_user_id).toLowerCase()
-          : null,
-      },
     });
-  } catch (err) {
-    console.error('LOGIN_ERROR:', err.message);
-
-    return res.status(500).json({
-      ok: false,
-      error: 'Internal server error',
-    });
+  } catch (error) {
+    console.error('LOGIN_ERROR:', error.message);
+    return send500(res);
   } finally {
-    if (conn) conn.release();
+    if (conn) {
+      try {
+        conn.release();
+      } catch (_) {
+        // noop
+      }
+    }
   }
 };
