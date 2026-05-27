@@ -11,7 +11,7 @@ const router = express.Router();
 
 const {
   get_dietician_logo,
-} = require('../controllers/dietitian/api/web/get_client_image');
+} = require('../controllers/dietitian/api/web/get_dietician_logo');
 
 
 const loginController = require(
@@ -211,6 +211,12 @@ router.get(
   '/dietitian/api/web/get_client_image',
     authMiddleware,
   getClientImageController.get_client_image
+);
+
+router.get(
+  '/dietitian/api/web/get_dietician_logo',
+  authMiddleware,
+  get_dietician_logo
 );
 
 // router.post('/dietitian/api/web/weekly_analysis_complete1', authMiddleware,weeklyAnalysis.weekly_analysis_complete1);
