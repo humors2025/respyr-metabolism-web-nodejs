@@ -10,15 +10,16 @@
 //   - Explicit JWT algorithm (HS256) with manual iat/nbf/exp
 //   - Connection always released
 //
-// NOTE:
-// As requested, this version stores role, partner_code, parent_user_id,
+// IMPORTANT:
+// This version stores role, partner_code, parent_user_id,
 // dashboard_route, and full dietician object inside access_token.
+//
 // JWT payload is base64-decodable, so do not treat JWT payload as private.
 //
 // POST JSON:
 // {
 //   "identifier": "john@demo.com",
-//   "password":   "PlainTextPassword"
+//   "password": "PlainTextPassword"
 // }
 
 'use strict';
@@ -33,6 +34,7 @@ const pool = require('../../../../config/db');
 | Config
 |--------------------------------------------------------------------------
 */
+
 const JWT_SECRET = process.env.JWT_SECRET;
 const JWT_ISS = process.env.JWT_ISS || 'api.respyr.ai';
 const JWT_AUD = process.env.JWT_AUD || 'respyr-dietitian-app';
@@ -41,16 +43,16 @@ const JWT_TTL = parseInt(process.env.JWT_TTL, 10) || 900; // seconds
 // HMAC pepper for audit-log hashing — separate from JWT_SECRET when possible.
 const SECURITY_PEPPER = process.env.SECURITY_PEPPER || JWT_SECRET;
 
-// Fail-fast: a weak/missing JWT secret is a critical misconfig.
-// Length 32+ ensures HS256 has ≥256 bits of entropy.
-if (!JWT_SECRET || JWT_SECRET.length < 32) {
-  console.error('FATAL_CONFIG: JWT_SECRET is missing or too short (need >= 32 chars).');
-}
-
 // Hard caps to prevent oversized-payload DoS.
 const MAX_IDENTIFIER_LEN = 254;
 const MAX_PASSWORD_LEN = 256;
 const FAIL_DELAY_MS = 400;
+
+// Fail-fast warning during boot logs.
+// Runtime check below will block login if secret is weak/missing.
+if (!JWT_SECRET || JWT_SECRET.length < 32) {
+  console.error('FATAL_CONFIG: JWT_SECRET is missing or too short. Need >= 32 chars.');
+}
 
 /*
 |--------------------------------------------------------------------------
@@ -58,8 +60,8 @@ const FAIL_DELAY_MS = 400;
 |--------------------------------------------------------------------------
 */
 
-function isValidEmail(s) {
-  return typeof s === 'string' && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(s);
+function isValidEmail(value) {
+  return typeof value === 'string' && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value);
 }
 
 function sleep(ms) {
@@ -73,8 +75,6 @@ function bestPasswordAlgo() {
 }
 
 function makeJwt(payload) {
-  // iat/nbf/exp/iss/aud/sub are manually added in payload.
-  // noTimestamp:true prevents jsonwebtoken from adding another iat.
   return jwt.sign(payload, JWT_SECRET, {
     algorithm: 'HS256',
     noTimestamp: true,
@@ -92,12 +92,11 @@ function getUserAgent(req) {
 
 function authLogHash(value) {
   return crypto
-    .createHmac('sha256', SECURITY_PEPPER || '')
+    .createHmac('sha256', SECURITY_PEPPER)
     .update(String(value == null ? '' : value).trim().toLowerCase())
     .digest('hex');
 }
 
-// Generic 500 — never leak err.message to the client.
 function send500(res) {
   return res.status(500).json({
     ok: false,
@@ -106,9 +105,14 @@ function send500(res) {
 }
 
 /*
- * Safe logging — if app_auth_logs insert fails, login still succeeds.
- * Identifying fields are HMAC-hashed before insert.
- */
+|--------------------------------------------------------------------------
+| Safe auth logging
+|--------------------------------------------------------------------------
+| If app_auth_logs table/insert fails, login should still work.
+| Identifying fields are HMAC-hashed before insert.
+|--------------------------------------------------------------------------
+*/
+
 async function writeAuthLogSafe(
   conn,
   req,
@@ -123,13 +127,15 @@ async function writeAuthLogSafe(
   try {
     const ipHash = authLogHash(getClientIp(req));
     const userAgentHash = authLogHash(getUserAgent(req));
+
     const identifierHash =
       identifier !== null && identifier !== undefined
         ? authLogHash(identifier)
         : null;
 
-    const ev = String(eventType).substring(0, 60);
-    const fr =
+    const safeEventType = String(eventType).substring(0, 60);
+
+    const safeFailureReason =
       failureReason !== null && failureReason !== undefined
         ? String(failureReason).substring(0, 255)
         : null;
@@ -152,7 +158,7 @@ async function writeAuthLogSafe(
        )
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
-        ev,
+        safeEventType,
         userId,
         role,
         partnerCode,
@@ -161,11 +167,11 @@ async function writeAuthLogSafe(
         userAgentHash,
         sessionHash,
         successInt,
-        fr,
+        safeFailureReason,
       ]
     );
-  } catch (e) {
-    console.error('AUTH_LOG_WRITE_FAILED: ' + e.message);
+  } catch (error) {
+    console.error('AUTH_LOG_WRITE_FAILED: ' + error.message);
   }
 }
 
@@ -174,10 +180,12 @@ async function writeAuthLogSafe(
 | Dashboard route
 |--------------------------------------------------------------------------
 */
+
 function buildDashboardRoute(role) {
   if (role === 'super_admin') return '/super-admin/overview';
   if (role === 'admin') return '/trainer-admin/overview';
   if (role === 'trainer') return '/trainer/clients';
+
   return '/login';
 }
 
@@ -186,8 +194,14 @@ function buildDashboardRoute(role) {
 | Controller
 |--------------------------------------------------------------------------
 */
+
 exports.login = async (req, res) => {
-  // Method gate
+  /*
+  |--------------------------------------------------------------------------
+  | Method gate
+  |--------------------------------------------------------------------------
+  */
+
   if (req.method !== 'POST') {
     return res.status(405).json({
       ok: false,
@@ -195,12 +209,22 @@ exports.login = async (req, res) => {
     });
   }
 
-  // Refuse early if JWT secret is misconfigured.
+  /*
+  |--------------------------------------------------------------------------
+  | JWT secret validation
+  |--------------------------------------------------------------------------
+  */
+
   if (!JWT_SECRET || JWT_SECRET.length < 32) {
     return send500(res);
   }
 
-  // Lambda/API Gateway raw-body fallback
+  /*
+  |--------------------------------------------------------------------------
+  | Lambda/API Gateway raw-body fallback
+  |--------------------------------------------------------------------------
+  */
+
   if (typeof req.body === 'string') {
     try {
       req.body = JSON.parse(req.body);
@@ -214,7 +238,12 @@ exports.login = async (req, res) => {
 
   const inBody = req.body && typeof req.body === 'object' ? req.body : {};
 
-  // Strict type + length validation
+  /*
+  |--------------------------------------------------------------------------
+  | Strict input validation
+  |--------------------------------------------------------------------------
+  */
+
   const rawIdentifier = inBody.identifier;
   const rawPassword = inBody.password;
 
@@ -247,15 +276,17 @@ exports.login = async (req, res) => {
 
     /*
     |--------------------------------------------------------------------------
-    | Lookup from table_dietician + app_user_roles
+    | Lookup user from table_dietician + app_user_roles
     |--------------------------------------------------------------------------
     | table_dietician.email = app_user_roles.user_id
+    |--------------------------------------------------------------------------
     */
+
     let rows;
 
     try {
       if (isValidEmail(identifier)) {
-        const [r] = await conn.execute(
+        const [result] = await conn.execute(
           `SELECT
              td.id,
              td.dietician_id,
@@ -279,9 +310,9 @@ exports.login = async (req, res) => {
           [identifier]
         );
 
-        rows = r;
+        rows = result;
       } else {
-        const [r] = await conn.execute(
+        const [result] = await conn.execute(
           `SELECT
              td.id,
              td.dietician_id,
@@ -305,10 +336,10 @@ exports.login = async (req, res) => {
           [identifier]
         );
 
-        rows = r;
+        rows = result;
       }
-    } catch (e) {
-      console.error('ROLE_LOGIN_LOOKUP_ERROR: ' + e.message);
+    } catch (error) {
+      console.error('ROLE_LOGIN_LOOKUP_ERROR: ' + error.message);
       return send500(res);
     }
 
@@ -316,9 +347,10 @@ exports.login = async (req, res) => {
 
     /*
     |--------------------------------------------------------------------------
-    | User not found — same response shape + delay as bad password
+    | User not found
     |--------------------------------------------------------------------------
     */
+
     if (!user) {
       await writeAuthLogSafe(
         conn,
@@ -345,6 +377,7 @@ exports.login = async (req, res) => {
     | Validate role/status
     |--------------------------------------------------------------------------
     */
+
     const role = String(user.role);
 
     if (String(user.status) !== 'active') {
@@ -387,10 +420,12 @@ exports.login = async (req, res) => {
 
     /*
     |--------------------------------------------------------------------------
-    | Admin / trainer validation
+    | Admin/trainer validation
     |--------------------------------------------------------------------------
-    | super_admin may have partner_code = NULL and parent_user_id = NULL.
+    | super_admin can have partner_code = NULL and parent_user_id = NULL.
+    |--------------------------------------------------------------------------
     */
+
     if (
       (role === 'admin' || role === 'trainer') &&
       String(user.partner_code == null ? '' : user.partner_code).trim() === ''
@@ -459,14 +494,15 @@ exports.login = async (req, res) => {
     | Verify password
     |--------------------------------------------------------------------------
     */
+
     const hash = String(user.password || '');
 
     let passwordOk = false;
 
     try {
       passwordOk = hash !== '' && (await bcrypt.compare(password, hash));
-    } catch (cmpErr) {
-      console.error('BCRYPT_COMPARE_ERROR: ' + cmpErr.message);
+    } catch (error) {
+      console.error('BCRYPT_COMPARE_ERROR: ' + error.message);
       passwordOk = false;
     }
 
@@ -496,6 +532,7 @@ exports.login = async (req, res) => {
     | Optional password rehash
     |--------------------------------------------------------------------------
     */
+
     try {
       const { rounds } = bestPasswordAlgo();
       const currentRounds = bcrypt.getRounds(hash);
@@ -504,19 +541,23 @@ exports.login = async (req, res) => {
         const newHash = await bcrypt.hash(password, rounds);
 
         await conn.execute(
-          'UPDATE table_dietician SET password = ? WHERE id = ?',
+          `UPDATE table_dietician
+           SET password = ?
+           WHERE id = ?`,
           [newHash, user.id]
         );
       }
-    } catch (rehashErr) {
-      console.error('REHASH_ERROR: ' + rehashErr.message);
+    } catch (error) {
+      // Non-fatal.
+      console.error('REHASH_ERROR: ' + error.message);
     }
 
     /*
     |--------------------------------------------------------------------------
-    | Build response/user payload
+    | Build token payload
     |--------------------------------------------------------------------------
     */
+
     const partnerCode =
       user.partner_code !== null && user.partner_code !== undefined
         ? String(user.partner_code)
@@ -551,8 +592,15 @@ exports.login = async (req, res) => {
     |--------------------------------------------------------------------------
     | Issue JWT
     |--------------------------------------------------------------------------
-    | As requested, full login payload is included inside access_token.
+    | These fields are now inside access_token:
+    | - role
+    | - partner_code
+    | - parent_user_id
+    | - dashboard_route
+    | - dietician
+    |--------------------------------------------------------------------------
     */
+
     const now = Math.floor(Date.now() / 1000);
 
     const payload = {
@@ -562,15 +610,17 @@ exports.login = async (req, res) => {
       nbf: now,
       exp: now + JWT_TTL,
 
-      // Keep these top-level claims for authMiddleware/backward compatibility.
+      // Auth middleware/backward-compatible claims.
       sub: String(user.dietician_id),
       dietician_id: String(user.dietician_id),
+
+      // Required role payload inside access_token.
       role: role,
       partner_code: partnerCode,
       parent_user_id: parentUserId,
       dashboard_route: dashboardRoute,
 
-      // Full object inside access_token as requested.
+      // Full dietician object inside access_token.
       dietician: dieticianPayload,
     };
 
@@ -581,6 +631,7 @@ exports.login = async (req, res) => {
     | Audit log: login_success
     |--------------------------------------------------------------------------
     */
+
     await writeAuthLogSafe(
       conn,
       req,
@@ -597,22 +648,19 @@ exports.login = async (req, res) => {
     |--------------------------------------------------------------------------
     | Success response
     |--------------------------------------------------------------------------
+    | role, partner_code, parent_user_id, dashboard_route and dietician
+    | are NOT returned outside now. They are inside access_token.
+    |--------------------------------------------------------------------------
     */
+
     return res.status(200).json({
       ok: true,
       token_type: 'Bearer',
       access_token: token,
       expires_in: JWT_TTL,
-
-      role: role,
-      partner_code: partnerCode,
-      parent_user_id: parentUserId,
-      dashboard_route: dashboardRoute,
-
-      dietician: dieticianPayload,
     });
-  } catch (err) {
-    console.error('LOGIN_ERROR:', err.message);
+  } catch (error) {
+    console.error('LOGIN_ERROR:', error.message);
     return send500(res);
   } finally {
     if (conn) {
