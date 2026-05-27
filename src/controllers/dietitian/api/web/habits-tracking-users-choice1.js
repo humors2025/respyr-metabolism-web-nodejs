@@ -109,6 +109,16 @@ const habitsTrackingUsersChoice = async (req, res) => {
   res.setHeader("Cache-Control", "no-store");
   res.setHeader("Pragma", "no-cache");
 
+  // ── Body shape validation ─────────────────────────────────────────────────
+  if (!req.body || typeof req.body !== "object" || Array.isArray(req.body)) {
+    return res.status(400).json({
+      status:  false,
+      message: "Invalid request body",
+      data:    null,
+      error:   { code: "INVALID_BODY" },
+    });
+  }
+
   // ── 1. Authorization: token-bound ownership check (BOLA/IDOR prevention) ──
   //    Accepts both "dietitian_id" and "dietician_id" spellings from body.
   const rawDietitianId =
@@ -174,20 +184,30 @@ const habitsTrackingUsersChoice = async (req, res) => {
     );
 
     if (!clientRows.length) {
-      return res.status(404).json({
+      // Should be unreachable — requireProfileAccess already verified this row.
+      // If reached, treat as a transient inconsistency, not a client error.
+      console.error("habits_tracking: row vanished after access check", {
+        dietitian_id: dieticianId,
+        profile_id:   profileId,
+      });
+      return res.status(500).json({
         status:  false,
-        message: "Client not found",
+        message: "Server error",
         data:    null,
-        error:   { code: "CLIENT_NOT_FOUND" },
+        error:   { code: "SERVER_ERROR" },
       });
     }
 
     const levelType        = parseInt(clientRows[0].level_type, 10) || 0;
     const profileCreatedAt = clientRows[0].dttm;
 
-    const profileCreatedDate = new Date(profileCreatedAt)
-      .toISOString()
-      .slice(0, 10);
+    let profileCreatedDate;
+    const parsedCreated = profileCreatedAt ? new Date(profileCreatedAt) : null;
+    if (parsedCreated && !isNaN(parsedCreated.getTime())) {
+      profileCreatedDate = parsedCreated.toISOString().slice(0, 10);
+    } else {
+      profileCreatedDate = today; // fallback — treat as registered today
+    }
 
     const msPerDay = 86400 * 1000;
     let daysTracked =
@@ -251,7 +271,7 @@ const habitsTrackingUsersChoice = async (req, res) => {
       [weekStart, weekEnd, profileId]
     );
 
-    // ── 3c. Per-habit tracking detail ────────────────────────────────────────
+    // ── 3c. Per-habit tracking detail — single batched query ─────────────────
     const habits = [];
 
     let totalTrackedThisWeek   = 0;
@@ -260,6 +280,31 @@ const habitsTrackingUsersChoice = async (req, res) => {
 
     const dailyCompletedMap = buildDailyMap(weekStart);
     const dailyPossibleMap  = buildDailyMap(weekStart);
+
+    // Prefetch all tracking rows in ONE query instead of N (DoS mitigation)
+    const trackingByHabit = {};
+    if (selectedHabits.length > 0) {
+      const habitIds = selectedHabits.map((h) => parseInt(h.selected_habit_id, 10));
+      const placeholders = habitIds.map(() => "?").join(",");
+
+      const [allTrackingRows] = await pool.execute(
+        `
+          SELECT selected_habit_id, tracking_date, target_count, completed_count, is_completed
+          FROM client_habit_tracking
+          WHERE profile_id = ?
+            AND selected_habit_id IN (${placeholders})
+            AND tracking_date BETWEEN ? AND ?
+          ORDER BY tracking_date ASC
+        `,
+        [profileId, ...habitIds, weekStart, weekEnd]
+      );
+
+      for (const row of allTrackingRows) {
+        const sid = parseInt(row.selected_habit_id, 10);
+        if (!trackingByHabit[sid]) trackingByHabit[sid] = [];
+        trackingByHabit[sid].push(row);
+      }
+    }
 
     for (const habit of selectedHabits) {
       const selectedHabitId = parseInt(habit.selected_habit_id, 10);
@@ -270,18 +315,8 @@ const habitsTrackingUsersChoice = async (req, res) => {
 
       const expectedCount = frequencyType === "weekly" ? targetCount : 7;
 
-      const [trackingRows] = await pool.execute(
-        `
-          SELECT tracking_date, target_count, completed_count, is_completed
-          FROM client_habit_tracking
-          WHERE profile_id        = ?
-            AND selected_habit_id = ?
-            AND habit_id          = ?
-            AND tracking_date BETWEEN ? AND ?
-          ORDER BY tracking_date ASC
-        `,
-        [profileId, selectedHabitId, habitId, weekStart, weekEnd]
-      );
+      // Use prefetched rows instead of an extra per-habit query
+      const trackingRows = trackingByHabit[selectedHabitId] || [];
 
       const trackingMap = {};
       let trackedCount   = 0;
@@ -404,6 +439,16 @@ const habitsTrackingUsersChoice = async (req, res) => {
         totalPerfectDays++;
       }
     }
+
+    // ── 3e. HIPAA §164.312(b) audit log — successful PHI access ──────────────
+    console.info("habits_tracking: access granted", {
+      dietitian_id:    dieticianId,
+      profile_id:      profileId,
+      habits_returned: habits.length,
+      ip:              req.ip,
+      user_agent:      req.get("user-agent"),
+      ts:              new Date().toISOString(),
+    });
 
     // ── 4. Success response ───────────────────────────────────────────────────
     return res.status(200).json({
