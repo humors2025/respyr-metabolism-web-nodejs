@@ -127,6 +127,11 @@ const {
 
 
 const {
+  listAdminTrainerUsers,
+} = require("../controllers/dietitian/api/web/list-admin-trainer-users");
+
+
+const {
   get_search_clients_details,
 } = require("../controllers/dietitian/api/web/get-search-clients-details");
 
@@ -359,6 +364,13 @@ router.post(
   "/dietitian/api/web/super-admin-overview",
   authMiddleware,
   superAdminOverview
+);
+
+
+router.post(
+  "/dietitian/api/web/list-admin-trainer-users",
+  authMiddleware,
+  listAdminTrainerUsers
 );
 
 module.exports = router;
