@@ -161,6 +161,11 @@ const {
 } = require("../controllers/dietitian/api/web/trainer-clients-overview-for-super-admin");
 
 
+const {
+  getClientsDataTotalMissedTestMasked,
+} = require("../controllers/dietitian/api/web/get-clients-data-total-missed-test-masked");
+
+
 /* ===============================
    Middlewares
 ================================ */
@@ -431,6 +436,13 @@ router.post(
   "/dietitian/api/web/trainer-clients-overview-for-super-admin",
   authMiddleware,
   trainerClientsOverviewForSuperAdmin
+);
+
+
+router.post(
+  "/dietitian/api/web/get-clients-data-total-missed-test-masked",
+  authMiddleware,
+  getClientsDataTotalMissedTestMasked
 );
 
 module.exports = router;
