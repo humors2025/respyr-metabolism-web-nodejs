@@ -637,7 +637,9 @@ function parseInputs(req) {
   // the cross-check in the controller. The JWT remains the source of truth.
   const actorUserId = normalizeEmail(src.actor_user_id);
 
-  const dieticianId = normalizeCode(src.dietician_id);
+  // Canonical key is `dietitian_id` (with a "t"); `dietician_id` (with a "c")
+  // is still accepted for back-compat with the original PHP payload.
+  const dieticianId = normalizeCode(src.dietitian_id ?? src.dietician_id);
 
   let type = typeof src.type === "string" ? src.type.trim().toLowerCase() : "all";
   if (!ALLOWED_TYPES.has(type)) type = "all";
@@ -696,7 +698,7 @@ const getClientsDataTotalMissedTestMasked = async (req, res) => {
 
   // Mirror the PHP's explicit input validation.
   if (dieticianId === "") {
-    return res.status(400).json({ status: false, ok: false, message: "dietician_id is required" });
+    return res.status(400).json({ status: false, ok: false, message: "dietitian_id is required" });
   }
 
   // If a date was supplied but malformed, reject it (PHP returned 400). A blank
