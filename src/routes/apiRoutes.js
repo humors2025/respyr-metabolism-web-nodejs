@@ -171,6 +171,11 @@ const {
 } = require("../controllers/dietitian/api/web/get-data-points-score-all-ranges-coach-masking");
 
 
+const {
+  resendUserInvite,
+} = require("../controllers/dietitian/api/web/resend-user-invite");
+
+
 /* ===============================
    Middlewares
 ================================ */
@@ -455,6 +460,13 @@ router.post(
   "/dietitian/api/web/get-data-points-score-all-ranges-coach-masking",
   authMiddleware,
   getDataPointsScoreAllRangesCoachMasking
+);
+
+
+router.post(
+  "/dietitian/api/web/resend-user-invite",
+  authMiddleware,
+  resendUserInvite
 );
 
 module.exports = router;
