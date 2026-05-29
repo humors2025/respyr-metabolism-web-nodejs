@@ -166,6 +166,11 @@ const {
 } = require("../controllers/dietitian/api/web/get-clients-data-total-missed-test-masked");
 
 
+const {
+  getDataPointsScoreAllRangesCoachMasking,
+} = require("../controllers/dietitian/api/web/get-data-points-score-all-ranges-coach-masking");
+
+
 /* ===============================
    Middlewares
 ================================ */
@@ -443,6 +448,13 @@ router.post(
   "/dietitian/api/web/get-clients-data-total-missed-test-masked",
   authMiddleware,
   getClientsDataTotalMissedTestMasked
+);
+
+
+router.post(
+  "/dietitian/api/web/get-data-points-score-all-ranges-coach-masking",
+  authMiddleware,
+  getDataPointsScoreAllRangesCoachMasking
 );
 
 module.exports = router;
