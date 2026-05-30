@@ -181,6 +181,11 @@ const {
 } = require("../controllers/dietitian/api/web/admin-invite-trainer");
 
 
+const {
+  revokeUserInvite,
+} = require("../controllers/dietitian/api/web/revoke-user-invite");
+
+
 /* ===============================
    Middlewares
 ================================ */
@@ -479,6 +484,13 @@ router.post(
   "/dietitian/api/web/admin-invite-trainer",
   authMiddleware,
   adminInviteTrainer
+);
+
+
+router.post(
+  "/dietitian/api/web/revoke-user-invite",
+  authMiddleware,
+  revokeUserInvite
 );
 
 module.exports = router;
