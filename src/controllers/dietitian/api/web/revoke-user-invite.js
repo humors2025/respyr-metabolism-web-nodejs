@@ -1,65 +1,65 @@
 "use strict";
 
 /**
- * resend-user-invite.js
+ * revoke-user-invite.js
  *
- * Converted from: resend-user-invite.php (+ user-invite-action-common.php helpers)
+ * Converted from: revoke-user-invite.php (+ user-invite-action-common.php helpers)
  * Platform      : Respyr Dietitian API (api.respyr.ai)
  * Security      : VAPT-hardened, HIPAA-aligned
  *
- * Endpoint   : POST /dietitian/api/web/resend-user-invite
+ * Endpoint   : POST /dietitian/api/web/revoke-user-invite
  * Auth       : Bearer JWT (authMiddleware must run before this handler)
- * Authorized : admin | super_admin (a trainer can never resend)
+ * Authorized : admin | super_admin (a trainer can never revoke)
  *
  * Behaviour parity with the PHP:
  *  - Looks up the invitation by invite_id (row-locked inside a transaction),
  *    validates the actor may manage it, then:
+ *      • 422 if invite_id is missing / not a positive integer,
  *      • 404 if the invite does not exist,
  *      • 403 if the actor is not allowed to manage it,
- *      • 409 if it is already accepted (status='accepted' or accepted_at set),
- *      • 409 if it is revoked (must create a new invite instead).
- *  - Generates a FRESH raw token (the old raw token is never stored), emails the
- *    invite via Resend, then updates the row: token_hash, status='pending', new
- *    expires_at, sent_at/updated_at = UTC now — guarded by
- *    `status <> 'accepted' AND accepted_at IS NULL` so a concurrent accept wins.
- *  - On email failure: audit `user_invite_resend_failed` and return 502 (the row
- *    is left untouched — nothing is updated until the email succeeds).
+ *      • 409 if it is already accepted (status='accepted' or accepted_at set)
+ *            → "Accepted invitation cannot be revoked",
+ *      • 409 if it is already revoked → "Invitation is already revoked".
+ *  - Otherwise sets status='revoked', updated_at=UTC now, commits, audits
+ *    `user_invite_revoked`, and returns the formatted invite.
  *  - Response shape matches the PHP: { ok, message, data }.
  *
  * VAPT hardening (beyond the PHP):
  *  - Token-bound identity. The actor is taken from the verified JWT and
  *    re-fetched from the DB on every call — NOT from body.actor_user_id as the
- *    PHP did. role + status are re-checked server-side. body.actor_user_id is
- *    still accepted for frontend/back-compat, but it is only cross-checked
- *    against the token email (mismatch → 403); it can never select another user.
+ *    PHP did (that was an IDOR hole). role + status are re-checked server-side.
+ *    body.actor_user_id is still accepted for frontend/back-compat, but it is
+ *    only cross-checked against the token email (mismatch → 403); it can never
+ *    select another user.
  *  - Fully parameterized queries; the invite is read FOR UPDATE in a transaction
- *    and the resend UPDATE is guarded against the accepted state.
- *  - Fresh token is crypto.randomBytes(32); only its SECURITY_PEPPER-keyed
- *    HMAC-SHA256 is stored. A DB dump cannot be used to accept an invite.
- *  - Internal error / email-provider details are suppressed in production
- *    (gated behind APP_DEBUG). The PHP echoed raw errors — an info-disclosure
- *    finding that is closed here.
+ *    and the revoke UPDATE is guarded against the accepted state so a concurrent
+ *    accept always wins (affectedRows === 0 → 409 rather than a false success).
+ *  - Internal error details are suppressed in production (gated behind
+ *    APP_DEBUG). The PHP echoed raw errors — an info-disclosure finding closed
+ *    here.
  *  - Cache-Control: no-store, Pragma: no-cache on every response.
  *
  * HIPAA controls:
  *  - Minimum-necessary columns; PHI in audit logs (identifier, IP, UA) is
  *    HMAC-SHA256 hashed with SECURITY_PEPPER — never stored in clear text.
- *  - Every resend (success, denial, failure, error) is recorded in app_auth_logs.
+ *  - Every revoke (success, denial, error) is recorded in app_auth_logs, with
+ *    the caller-supplied `reason` carried into failure_reason for traceability.
  *
- * ASSUMPTION (documented): the original ui_actor_can_manage_invite() lived in
- * user-invite-action-common.php (not provided). It is reimplemented here using
- * the SAME network model as the rest of this codebase: an actor may manage an
- * invite they created (invited_by_user_id) or that is parented to them
- * (parent_user_id); a super_admin may additionally manage invites parented to one
- * of its own active admins (one level — no extra recursion). Tighten/loosen this
- * if your common file differed.
+ * ASSUMPTION (documented): the original ui_actor_can_manage_invite() and
+ * ui_format_invite_response() lived in user-invite-action-common.php (not
+ * provided). They are reimplemented here identically to the already-shipped
+ * resend-user-invite.js sibling, using this codebase's network model: an actor
+ * may manage an invite they created (invited_by_user_id) or that is parented to
+ * them (parent_user_id); a super_admin may additionally manage invites parented
+ * to one of its own active admins (one level — no extra recursion). The revoke
+ * response intentionally omits the `email_sent` flag the resend formatter adds,
+ * since revoking sends no email.
  *
  * NOTE: No DB tables are added or removed vs. the PHP — same table_dietician,
  * app_user_roles, app_user_invitations, app_auth_logs.
  */
 
 const crypto = require("crypto");
-const axios = require("axios");
 const pool = require("../../../../config/db");
 
 // ─── Constants ───────────────────────────────────────────────────────────────
@@ -69,22 +69,7 @@ const SECURITY_PEPPER =
 
 const APP_DEBUG = process.env.NODE_ENV !== "production";
 
-const INVITE_EXPIRY_HOURS = Math.max(
-  1,
-  parseInt(process.env.INVITE_EXPIRY_HOURS, 10) || 24
-);
-
-const FRONTEND_ACCEPT_INVITE_URL =
-  process.env.FRONTEND_ACCEPT_INVITE_URL ||
-  "https://app.respyr.ai/accept-invite";
-
-const RESEND_API_KEY = process.env.RESEND_API_KEY || "";
-const RESEND_INVITE_TEMPLATE_ID = process.env.RESEND_INVITE_TEMPLATE_ID || "";
-const RESEND_FROM_EMAIL =
-  process.env.RESEND_FROM_EMAIL || "Respyr <no-reply@respyr.ai>";
-
-const RETURN_INVITE_LINK_FOR_TESTING =
-  String(process.env.RETURN_INVITE_LINK_FOR_TESTING || "").toLowerCase() === "true";
+const DEFAULT_REVOKE_REASON = "Invite revoked";
 
 const ALLOWED_ACTOR_ROLES = new Set(["super_admin", "admin", "trainer"]);
 
@@ -119,12 +104,7 @@ function authLogHash(value) {
     .digest("hex");
 }
 
-/** SHA-256 HMAC keyed by SECURITY_PEPPER — used to hash the invite token. */
-function secureHash(value) {
-  return crypto.createHmac("sha256", SECURITY_PEPPER).update(String(value)).digest("hex");
-}
-
-/** Format a Date (UTC) as "YYYY-MM-DD HH:MM:SS" — matches PHP gmdate(). */
+/** Format a mysql2 DATETIME value as a UTC "YYYY-MM-DD HH:MM:SS" string. */
 function toUtcMysqlDateTime(date) {
   const pad = (n) => String(n).padStart(2, "0");
   return (
@@ -133,7 +113,6 @@ function toUtcMysqlDateTime(date) {
   );
 }
 
-/** Format a mysql2 DATETIME value as a UTC "YYYY-MM-DD HH:MM:SS" string. */
 function formatDbDateTime(val) {
   if (val === null || val === undefined) return null;
   if (val instanceof Date) {
@@ -144,12 +123,18 @@ function formatDbDateTime(val) {
 }
 
 function getActorEffectivePartnerCode(actor) {
-  if (actor.partner_code !== null && actor.partner_code !== undefined &&
-      String(actor.partner_code).trim() !== "") {
+  if (
+    actor.partner_code !== null &&
+    actor.partner_code !== undefined &&
+    String(actor.partner_code).trim() !== ""
+  ) {
     return String(actor.partner_code);
   }
-  if (actor.dietician_id !== null && actor.dietician_id !== undefined &&
-      String(actor.dietician_id).trim() !== "") {
+  if (
+    actor.dietician_id !== null &&
+    actor.dietician_id !== undefined &&
+    String(actor.dietician_id).trim() !== ""
+  ) {
     return String(actor.dietician_id);
   }
   return null;
@@ -162,10 +147,11 @@ function invitedFullName(invite) {
   return name !== "" ? name : normalizeEmail(invite.invited_email);
 }
 
-function buildInviteLink(rawToken) {
-  return `${FRONTEND_ACCEPT_INVITE_URL}?token=${encodeURIComponent(rawToken)}`;
-}
-
+/**
+ * Mirrors ui_format_invite_response() from the PHP common file (same shape as
+ * resend-user-invite.js). The `email_sent` flag is intentionally omitted — this
+ * action sends no email.
+ */
 function formatInviteResponse(invite) {
   return {
     invitation_id: Number(invite.id),
@@ -183,7 +169,6 @@ function formatInviteResponse(invite) {
     sent_at: formatDbDateTime(invite.sent_at),
     created_at: formatDbDateTime(invite.created_at),
     updated_at: formatDbDateTime(invite.updated_at),
-    email_sent: true,
   };
 }
 
@@ -233,7 +218,7 @@ async function writeAuthLogSafe(req, {
       ]
     );
   } catch (err) {
-    console.error("RESEND_USER_INVITE_AUDIT_FAILED:", err?.code || err?.message);
+    console.error("REVOKE_USER_INVITE_AUDIT_FAILED:", err?.code || err?.message);
   }
 }
 
@@ -242,11 +227,17 @@ async function writeAuthLogSafe(req, {
 /**
  * Resolve the authenticated actor from the JWT and re-check role/status against
  * the DB. Returns { actor, actorEmail } or { error: { status, message } }.
+ *
+ * JWT shape: dietician_id in sub/dietician_id; email nested under
+ * dietician.email — there is NO top-level email/user_id claim. Resolve by
+ * dietician_id first, fall back to email, derive actorEmail from the DB row.
  */
 async function resolveActorFromToken(req) {
   const payload = req.user || {};
   const dieticianId = String(payload.sub || payload.dietician_id || "").trim();
-  const tokenEmail = normalizeEmail(payload.email || payload.user_id || "");
+  const tokenEmail = normalizeEmail(
+    payload.email || payload.user_id || payload.dietician?.email || ""
+  );
 
   if ((!dieticianId || dieticianId.length > 64) && tokenEmail === "") {
     return { error: { status: 401, message: "Invalid token user" } };
@@ -367,98 +358,20 @@ async function actorCanManageInvite(conn, actor, actorEmail, invite) {
   return false;
 }
 
-// ─── Email via Resend ────────────────────────────────────────────────────────
-
-function escapeHtml(s) {
-  return String(s)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;");
-}
-
-function renderInviteHtml(vars) {
-  const safe = {};
-  for (const [k, v] of Object.entries(vars)) safe[k] = escapeHtml(v ?? "");
-
-  return `<!doctype html>
-<html>
-  <body style="font-family: Arial, sans-serif; color:#222; line-height:1.5;">
-    <p>Hi ${safe.INVITED_NAME},</p>
-    <p>${safe.INVITER_EMAIL} has invited you to Respyr as a <strong>${safe.INVITED_ROLE}</strong>.</p>
-    <p>Your partner code: <strong>${safe.PARTNER_CODE}</strong></p>
-    <p>
-      <a href="${safe.INVITE_LINK}"
-         style="display:inline-block;padding:10px 18px;background:#0a7d3b;color:#fff;text-decoration:none;border-radius:6px;">
-        Accept your invitation
-      </a>
-    </p>
-    <p>This invitation expires in ${safe.EXPIRES_IN}.</p>
-    <p style="font-size:12px;color:#666;">If you did not expect this email, you can ignore it.</p>
-  </body>
-</html>`;
-}
-
-/**
- * Sends the invite email via Resend. Returns { ok, status?, error?, id? }.
- * templateId is logged for parity/traceability; rendering is done inline (Resend
- * has no first-class server-side variable templates).
- */
-async function sendResendTemplateEmail(toEmail, subject, templateId, vars) {
-  if (!RESEND_API_KEY) {
-    return { ok: false, status: 0, error: "RESEND_API_KEY not configured" };
-  }
-
-  try {
-    const html = renderInviteHtml(vars);
-
-    const response = await axios.post(
-      "https://api.resend.com/emails",
-      {
-        from: RESEND_FROM_EMAIL,
-        to: [toEmail],
-        subject,
-        html,
-        headers: { "X-Entity-Ref-ID": `invite-${vars.PARTNER_CODE}` },
-        tags: [
-          { name: "kind", value: "invite_resend" },
-          { name: "invited_role", value: String(vars.INVITED_ROLE || "") },
-          { name: "template_id", value: String(templateId || "inline") },
-        ],
-      },
-      {
-        timeout: 10_000,
-        headers: {
-          Authorization: `Bearer ${RESEND_API_KEY}`,
-          "Content-Type": "application/json",
-        },
-        validateStatus: () => true,
-      }
-    );
-
-    if (response.status >= 200 && response.status < 300) {
-      return { ok: true, status: response.status, id: response.data?.id ?? null };
-    }
-    return { ok: false, status: response.status, error: response.data ?? "Resend non-2xx response" };
-  } catch (err) {
-    return { ok: false, status: 0, error: err?.code || err?.message || "Resend request failed" };
-  }
-}
-
 // ─── Controller ──────────────────────────────────────────────────────────────
 
 /**
- * POST /dietitian/api/web/resend-user-invite
+ * POST /dietitian/api/web/revoke-user-invite
  *
  * Headers: Authorization: Bearer <JWT>
  * Body:
  *   {
  *     "invite_id": 1,                 // required, positive integer
+ *     "reason": "Wrong email",        // optional; defaults to "Invite revoked"
  *     "actor_user_id": ""             // optional; if set, must match token email
  *   }
  */
-const resendUserInvite = async (req, res) => {
+const revokeUserInvite = async (req, res) => {
   // HIPAA: never let intermediaries cache invite responses.
   res.setHeader("Cache-Control", "no-store");
   res.setHeader("Pragma", "no-cache");
@@ -468,12 +381,17 @@ const resendUserInvite = async (req, res) => {
     return res.status(405).json({ ok: false, message: "Method not allowed" });
   }
 
-  const body = req.body && typeof req.body === "object" && !Array.isArray(req.body)
-    ? req.body
-    : {};
+  const body =
+    req.body && typeof req.body === "object" && !Array.isArray(req.body)
+      ? req.body
+      : {};
 
   const actorUserId = normalizeEmail(body.actor_user_id);
   const inviteId = Number.parseInt(body.invite_id, 10);
+
+  let reason = String(body.reason ?? "").trim();
+  if (reason === "") reason = DEFAULT_REVOKE_REASON;
+  reason = reason.slice(0, 255);
 
   if (!Number.isInteger(inviteId) || inviteId <= 0) {
     return res.status(422).json({ ok: false, message: "Valid invite_id is required" });
@@ -490,7 +408,7 @@ const resendUserInvite = async (req, res) => {
 
     if (resolved.error) {
       await writeAuthLogSafe(req, {
-        eventType: "user_invite_resend_denied",
+        eventType: "user_invite_revoke_denied",
         userId: actorUserId || null,
         role: null,
         partnerCode: null,
@@ -498,7 +416,9 @@ const resendUserInvite = async (req, res) => {
         success: false,
         failureReason: resolved.error.message || "actor resolution failed",
       });
-      return res.status(resolved.error.status).json({ ok: false, message: resolved.error.message });
+      return res
+        .status(resolved.error.status)
+        .json({ ok: false, message: resolved.error.message });
     }
 
     const { actor } = resolved;
@@ -509,7 +429,7 @@ const resendUserInvite = async (req, res) => {
     // ── 1b. Cross-check optional actor_user_id against the token identity ────
     if (actorUserId !== "" && actorUserId !== actorEmail) {
       await writeAuthLogSafe(req, {
-        eventType: "user_invite_resend_denied",
+        eventType: "user_invite_revoke_denied",
         userId: actorEmail,
         role: actorRole,
         partnerCode: actorCode,
@@ -534,7 +454,7 @@ const resendUserInvite = async (req, res) => {
       conn.release();
       conn = null;
       await writeAuthLogSafe(req, {
-        eventType: "user_invite_resend_denied",
+        eventType: "user_invite_revoke_denied",
         userId: actorEmail,
         role: actorRole,
         partnerCode: actorCode,
@@ -552,15 +472,17 @@ const resendUserInvite = async (req, res) => {
       conn.release();
       conn = null;
       await writeAuthLogSafe(req, {
-        eventType: "user_invite_resend_denied",
+        eventType: "user_invite_revoke_denied",
         userId: actorEmail,
         role: actorRole,
         partnerCode: actorCode,
         identifier: normalizeEmail(invite.invited_email),
         success: false,
-        failureReason: "Actor not allowed to resend this invitation",
+        failureReason: "Actor not allowed to revoke this invitation",
       });
-      return res.status(403).json({ ok: false, message: "You are not allowed to resend this invitation" });
+      return res
+        .status(403)
+        .json({ ok: false, message: "You are not allowed to revoke this invitation" });
     }
 
     const status = String(invite.status || "");
@@ -569,137 +491,81 @@ const resendUserInvite = async (req, res) => {
       await conn.rollback();
       conn.release();
       conn = null;
-      return res.status(409).json({ ok: false, message: "Accepted invitation cannot be resent" });
+      return res
+        .status(409)
+        .json({ ok: false, message: "Accepted invitation cannot be revoked" });
     }
 
     if (status === "revoked") {
       await conn.rollback();
       conn.release();
       conn = null;
-      return res.status(409).json({
-        ok: false,
-        message: "Revoked invitation cannot be resent. Create a new invitation.",
-      });
+      return res
+        .status(409)
+        .json({ ok: false, message: "Invitation is already revoked" });
     }
 
-    // Release the lock before the (slow) network email call — same ordering as
-    // the PHP. The guarded UPDATE below is the real concurrency protection.
-    await conn.commit();
-    conn.release();
-    conn = null;
-
-    // ── 3. Fresh token + link + expiry (raw token never stored) ─────────────
-    const rawToken = crypto.randomBytes(32).toString("hex");
-    const tokenHash = secureHash(rawToken);
-    const inviteLink = buildInviteLink(rawToken);
-    const expiresAt = toUtcMysqlDateTime(
-      new Date(Date.now() + INVITE_EXPIRY_HOURS * 60 * 60 * 1000)
-    );
-
-    const invitedEmail = normalizeEmail(invite.invited_email);
-    const invitedRole = String(invite.invited_role || "");
-    const fullName = invitedFullName(invite);
-
-    // ── 4. Send the email (nothing is updated until this succeeds) ──────────
-    const emailResult = await sendResendTemplateEmail(
-      invitedEmail,
-      "You have been invited to Respyr",
-      RESEND_INVITE_TEMPLATE_ID,
-      {
-        INVITED_NAME: fullName,
-        INVITER_EMAIL: actorEmail,
-        INVITED_EMAIL: invitedEmail,
-        INVITED_ROLE: invitedRole,
-        PARTNER_CODE: invite.partner_code,
-        EXPIRES_IN: `${INVITE_EXPIRY_HOURS} hours`,
-        INVITE_LINK: inviteLink,
-      }
-    );
-
-    if (!emailResult.ok) {
-      console.error("RESEND_USER_INVITE_EMAIL_FAILED:", {
-        invitation_id: inviteId,
-        status: emailResult.status,
-        error: APP_DEBUG ? emailResult.error : undefined,
-      });
-      await writeAuthLogSafe(req, {
-        eventType: "user_invite_resend_failed",
-        userId: actorEmail,
-        role: actorRole,
-        partnerCode: actor.partner_code ?? null,
-        identifier: invitedEmail,
-        success: false,
-        failureReason: "Invitation email resend failed",
-      });
-      return res.status(502).json({
-        ok: false,
-        message: "Invitation email could not be resent",
-        ...(APP_DEBUG && { debug_resend_error: emailResult }),
-      });
-    }
-
-    // ── 5. Persist the resend — guarded against a concurrent accept ─────────
-    const [updateResult] = await pool.execute(
+    // ── 3. Revoke — guarded against a concurrent accept ─────────────────────
+    const [updateResult] = await conn.execute(
       `
         UPDATE app_user_invitations
-        SET token_hash = ?,
-            status     = 'pending',
-            expires_at = ?,
-            sent_at    = UTC_TIMESTAMP(),
+        SET status     = 'revoked',
             updated_at = UTC_TIMESTAMP()
         WHERE id = ?
           AND status <> 'accepted'
           AND accepted_at IS NULL
         LIMIT 1
       `,
-      [tokenHash, expiresAt, inviteId]
+      [inviteId]
     );
 
     if (updateResult.affectedRows === 0) {
       // The invite was accepted between our read and this write — do not claim
       // success. (Belt-and-braces beyond the PHP.)
+      await conn.rollback();
+      conn.release();
+      conn = null;
       await writeAuthLogSafe(req, {
-        eventType: "user_invite_resend_failed",
+        eventType: "user_invite_revoke_denied",
         userId: actorEmail,
         role: actorRole,
-        partnerCode: actor.partner_code ?? null,
-        identifier: invitedEmail,
+        partnerCode: actorCode,
+        identifier: normalizeEmail(invite.invited_email),
         success: false,
-        failureReason: "Invite no longer resendable (accepted concurrently)",
+        failureReason: "Invite no longer revocable (accepted concurrently)",
       });
-      return res.status(409).json({ ok: false, message: "Accepted invitation cannot be resent" });
+      return res
+        .status(409)
+        .json({ ok: false, message: "Accepted invitation cannot be revoked" });
     }
 
-    // ── 6. Audit success ────────────────────────────────────────────────────
+    await conn.commit();
+    conn.release();
+    conn = null;
+
+    // ── 4. Audit success ────────────────────────────────────────────────────
     await writeAuthLogSafe(req, {
-      eventType: "user_invite_resent",
+      eventType: "user_invite_revoked",
       userId: actorEmail,
       role: actorRole,
       partnerCode: actor.partner_code ?? null,
-      identifier: invitedEmail,
+      identifier: normalizeEmail(invite.invited_email),
       success: true,
-      failureReason: "Invitation email resent",
+      failureReason: reason,
     });
 
-    // ── 7. Respond (matches the PHP JSON shape) ─────────────────────────────
+    // ── 5. Respond (matches the PHP JSON shape) ─────────────────────────────
     const updatedInvite = {
       ...invite,
-      status: "pending",
-      expires_at: expiresAt,
-      sent_at: toUtcMysqlDateTime(new Date()),
+      status: "revoked",
+      updated_at: toUtcMysqlDateTime(new Date()),
     };
 
-    const response = {
+    return res.status(200).json({
       ok: true,
-      message: "Invitation resent successfully",
+      message: "Invitation revoked successfully",
       data: formatInviteResponse(updatedInvite),
-    };
-
-    if (RETURN_INVITE_LINK_FOR_TESTING) {
-      response.debug_invite_link = inviteLink;
-    }
-
-    return res.status(200).json(response);
+    });
   } catch (err) {
     if (conn) {
       try {
@@ -715,7 +581,7 @@ const resendUserInvite = async (req, res) => {
       conn = null;
     }
 
-    console.error("RESEND_USER_INVITE_ERROR:", {
+    console.error("REVOKE_USER_INVITE_ERROR:", {
       code: err?.code,
       errno: err?.errno,
       sqlState: err?.sqlState,
@@ -723,7 +589,7 @@ const resendUserInvite = async (req, res) => {
     });
 
     await writeAuthLogSafe(req, {
-      eventType: "user_invite_resend_error",
+      eventType: "user_invite_revoke_error",
       userId: actorEmail || actorUserId || null,
       role: actorRole,
       partnerCode: actorCode,
@@ -740,4 +606,4 @@ const resendUserInvite = async (req, res) => {
   }
 };
 
-module.exports = { resendUserInvite };
+module.exports = { revokeUserInvite };
