@@ -72,11 +72,14 @@ const INVITE_EXPIRY_HOURS = Math.max(
 
 const FRONTEND_ACCEPT_INVITE_URL =
   process.env.FRONTEND_ACCEPT_INVITE_URL ||
-  "https://app.respyr.in/accept-invite";
+  "https://app.respyr.ai/accept-invite";
+
+//    process.env.FRONTEND_ACCEPT_INVITE_URL ||
+//   "https://app.respyr.in/accept-invite";
 
 const RESEND_API_KEY            = process.env.RESEND_API_KEY            || "";
 const RESEND_INVITE_TEMPLATE_ID = process.env.RESEND_INVITE_TEMPLATE_ID || "";
-const RESEND_FROM_EMAIL         = process.env.RESEND_FROM_EMAIL         || "Respyr <no-reply@respyr.in>";
+const RESEND_FROM_EMAIL         = process.env.RESEND_FROM_EMAIL         || "Respyr <no-reply@respyr.ai>";
 
 const APP_DEBUG = process.env.NODE_ENV !== "production";
 
@@ -657,7 +660,7 @@ async function sendResendTemplateEmail(toEmail, subject, templateId, vars) {
  *   {
  *     "first_name": "poornesh",
  *     "last_name":  "kumar",
- *     "email":      "poornesh@respyr.in",
+ *     "email":      "poornesh@respyr.ai",
  *     "phone":      "8520046632589"   // optional
  *   }
  *
