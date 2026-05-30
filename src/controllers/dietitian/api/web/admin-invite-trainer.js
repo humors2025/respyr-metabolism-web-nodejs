@@ -217,11 +217,16 @@ async function writeAuthLogSafe(req, {
 async function resolveActorFromToken(req, requiredRole = "admin") {
   const payload = req.user || {};
 
-  const rawUserId = payload.user_id || payload.email || payload.sub || "";
-  const userId    = normalizeEmail(rawUserId);
+  // This codebase's JWTs carry the dietician_id as `sub` (and `dietician_id`),
+  // with the email nested under `dietician.email` — there is NO top-level email
+  // claim. Resolve both, prefer the dietician_id (token subject), fall back to
+  // email. Mirrors resolveActorFromToken() in resend-user-invite.js.
+  const dieticianId = String(payload.sub || payload.dietician_id || "").trim();
+  const tokenEmail  = normalizeEmail(
+    payload.email || payload.user_id || payload?.dietician?.email || ""
+  );
 
-  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-  if (!userId || !emailRegex.test(userId)) {
+  if ((!dieticianId || dieticianId.length > 64) && tokenEmail === "") {
     return {
       error: {
         status: 401,
@@ -230,23 +235,46 @@ async function resolveActorFromToken(req, requiredRole = "admin") {
     };
   }
 
-  const [rows] = await pool.execute(
-    `
-      SELECT
-        td.id,
-        td.email,
-        aur.role,
-        aur.partner_code,
-        aur.parent_user_id,
-        aur.status
-      FROM table_dietician td
-      INNER JOIN app_user_roles aur
-        ON LOWER(aur.user_id) = LOWER(td.email)
-      WHERE LOWER(td.email) = LOWER(?)
-      LIMIT 1
-    `,
-    [userId]
-  );
+  // Prefer dietician_id (token subject); fall back to email.
+  const [rows] = dieticianId
+    ? await pool.execute(
+        `
+          SELECT
+            td.id,
+            td.dietician_id,
+            td.email,
+            aur.user_id,
+            aur.role,
+            aur.partner_code,
+            aur.parent_user_id,
+            aur.status
+          FROM table_dietician td
+          INNER JOIN app_user_roles aur
+            ON LOWER(aur.user_id) = LOWER(td.email)
+          WHERE td.dietician_id = ?
+          LIMIT 1
+        `,
+        [dieticianId]
+      )
+    : await pool.execute(
+        `
+          SELECT
+            td.id,
+            td.dietician_id,
+            td.email,
+            aur.user_id,
+            aur.role,
+            aur.partner_code,
+            aur.parent_user_id,
+            aur.status
+          FROM table_dietician td
+          INNER JOIN app_user_roles aur
+            ON LOWER(aur.user_id) = LOWER(td.email)
+          WHERE LOWER(td.email) = LOWER(?)
+          LIMIT 1
+        `,
+        [tokenEmail]
+      );
 
   const actor = rows[0];
 
@@ -277,7 +305,7 @@ async function resolveActorFromToken(req, requiredRole = "admin") {
     };
   }
 
-  return { actor, actorEmail: userId };
+  return { actor, actorEmail: normalizeEmail(actor.user_id || actor.email) };
 }
 
 // ─── Input validation ────────────────────────────────────────────────────────
@@ -654,7 +682,13 @@ const adminInviteTrainer = async (req, res) => {
         userId:        null,
         role:          null,
         partnerCode:   null,
-        identifier:    normalizeEmail(req.user?.user_id || req.user?.email || ""),
+        identifier:    normalizeEmail(
+          req.user?.email ||
+          req.user?.user_id ||
+          req.user?.dietician?.email ||
+          req.user?.sub ||
+          ""
+        ),
         success:       false,
         failureReason: resolved.error.body?.message || "actor resolution failed",
       });
