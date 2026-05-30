@@ -191,10 +191,6 @@ const {
 } = require("../controllers/dietitian/api/web/referral-client-list");
 
 
-const {
-  resendClientSubscriptionInvite,
-} = require("../controllers/dietitian/api/web/resend-client-subscription-invite");
-
 
 /* ===============================
    Middlewares
@@ -510,12 +506,6 @@ router.post(
   referralClientList
 );
 
-
-router.post(
-  "/dietitian/api/web/resend-client-subscription-invite",
-  authMiddleware,
-  resendClientSubscriptionInvite
-);
 
 module.exports = router;
 
