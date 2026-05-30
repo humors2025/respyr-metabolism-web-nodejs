@@ -186,6 +186,11 @@ const {
 } = require("../controllers/dietitian/api/web/revoke-user-invite");
 
 
+const {
+  referralClientList,
+} = require("../controllers/dietitian/api/web/referral-client-list");
+
+
 /* ===============================
    Middlewares
 ================================ */
@@ -491,6 +496,13 @@ router.post(
   "/dietitian/api/web/revoke-user-invite",
   authMiddleware,
   revokeUserInvite
+);
+
+
+router.post(
+  "/dietitian/api/web/referral-client-list",
+  authMiddleware,
+  referralClientList
 );
 
 module.exports = router;
