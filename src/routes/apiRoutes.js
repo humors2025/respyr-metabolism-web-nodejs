@@ -92,6 +92,11 @@ const {
 
 
 const {
+  trainerUpdateWeeklyFoodJson,
+} = require("../controllers/dietitian/api/web/trainer-update-weekly-food-json");
+
+
+const {
   get_graph_all_seven_trends_graph,
 } = require("../controllers/dietitian/api/web/get_graph_all_seven_trends_graph");
 
@@ -364,6 +369,13 @@ router.post(
   "/dietitian/api/web/get_weekly_food_json_suggestions_weeks",
   authMiddleware,
   get_weekly_food_json_suggestions_weeks
+);
+
+
+router.post(
+  "/dietitian/api/web/trainer-update-weekly-food-json",
+  authMiddleware,
+  trainerUpdateWeeklyFoodJson
 );
 
 
