@@ -1,5 +1,11 @@
 const pool = require("../../../../config/db");
 
+const {
+  normalizeId,
+  normalizeDieticianId,
+  requireProfileAccess,
+} = require("../../../../utils/accessControl");
+
 /**
  * Converted from PHP:
  * - Takes profile_id and date from body
@@ -19,6 +25,33 @@ const pool = require("../../../../config/db");
 function toNumber(value) {
   const num = Number(value);
   return Number.isFinite(num) ? num : 0;
+}
+
+/**
+ * Validates a calendar date in strict YYYY-MM-DD form (no SQL injection risk
+ * since queries are parameterized, but rejects malformed input early).
+ * Returns the normalized "YYYY-MM-DD" string, or null if invalid.
+ */
+function normalizeDate(value) {
+  if (typeof value !== "string") return null;
+
+  const trimmed = value.trim();
+
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) return null;
+
+  const [year, month, day] = trimmed.split("-").map(Number);
+
+  const parsed = new Date(Date.UTC(year, month - 1, day));
+
+  if (
+    parsed.getUTCFullYear() !== year ||
+    parsed.getUTCMonth() !== month - 1 ||
+    parsed.getUTCDate() !== day
+  ) {
+    return null;
+  }
+
+  return trimmed;
 }
 
 function roundOne(value) {
@@ -137,50 +170,94 @@ const get_macro_summary_by_date = async (req, res) => {
 
     const body = req.body || {};
 
-    const profile_id =
-      typeof body.profile_id === "string" ? body.profile_id.trim() : "";
-
-    const date = typeof body.date === "string" ? body.date.trim() : "";
-
-    if (!profile_id || !date) {
-      return res.status(200).json({
+    if (typeof body !== "object" || Array.isArray(body)) {
+      return res.status(400).json({
         success: false,
-        message: "profile_id and date are required",
+        message: "Invalid request body",
       });
     }
 
+    const profile_id = normalizeId(body.profile_id);
+    const requestedDietitianId = normalizeDieticianId(body.dietitian_id);
+    const date = normalizeDate(body.date);
+
+    if (!body.profile_id || !body.dietitian_id || !body.date) {
+      return res.status(400).json({
+        success: false,
+        message: "profile_id, dietitian_id and date are required",
+      });
+    }
+
+    if (!profile_id) {
+      return res.status(400).json({ success: false, message: "Invalid profile_id" });
+    }
+
+    if (!requestedDietitianId) {
+      return res.status(400).json({ success: false, message: "Invalid dietitian_id" });
+    }
+
+    if (!date) {
+      return res.status(400).json({ success: false, message: "Invalid date (expected YYYY-MM-DD)" });
+    }
+
     /**
-     * Same logic as PHP:
-     * WHERE profile_id = ?
-     * AND DATE(date_time) = ?
+     * VAPT / object-level authorization:
+     * 1. JWT dietician id must match requested dietitian_id
+     * 2. profile_id must belong to this dietitian in table_clients
+     * Blocks IDOR — a dietitian cannot read another dietitian's client PHI.
+     */
+    const access = await requireProfileAccess(
+      req,
+      requestedDietitianId,
+      profile_id
+    );
+
+    if (!access.allowed) {
+      return res.status(access.statusCode || 403).json({
+        success: false,
+        message: access.message || "Access denied",
+      });
+    }
+
+    const dietitianId = access.dieticianId;
+
+    /**
+     * Same logic as PHP (WHERE profile_id = ? AND DATE(date_time) = ?),
+     * additionally scoped to the authorized dietitian as defense-in-depth.
      */
     const currentSql = `
-      SELECT 
+      SELECT
         test_id,
         profile_id,
         DATE_FORMAT(date_time, '%Y-%m-%d %H:%i:%s') AS date_time,
         test_json
       FROM table_test_data
       WHERE profile_id = ?
+        AND UPPER(TRIM(dietitian_id)) = ?
         AND DATE(date_time) = ?
       ORDER BY date_time DESC
       LIMIT 1
     `;
 
-    const [currentRows] = await pool.execute(currentSql, [profile_id, date]);
+    const [currentRows] = await pool.execute(currentSql, [
+      profile_id,
+      dietitianId,
+      date,
+    ]);
 
     const currentData = extractMacroSummary(currentRows[0]);
 
     const selectedDateStart = `${date} 00:00:00`;
 
     const previousSql = `
-      SELECT 
+      SELECT
         test_id,
         profile_id,
         DATE_FORMAT(date_time, '%Y-%m-%d %H:%i:%s') AS date_time,
         test_json
       FROM table_test_data
       WHERE profile_id = ?
+        AND UPPER(TRIM(dietitian_id)) = ?
         AND date_time < ?
       ORDER BY date_time DESC
       LIMIT 1
@@ -188,6 +265,7 @@ const get_macro_summary_by_date = async (req, res) => {
 
     const [previousRows] = await pool.execute(previousSql, [
       profile_id,
+      dietitianId,
       selectedDateStart,
     ]);
 
