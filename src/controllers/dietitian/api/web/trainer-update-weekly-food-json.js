@@ -54,7 +54,10 @@
 
 const crypto = require("crypto");
 const pool = require("../../../../config/db");
-const { requireProfileAccess } = require("../../../../utils/accessControl");
+const {
+  requireDieticianSelfAccess,
+  normalizeId,
+} = require("../../../../utils/accessControl");
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -507,19 +510,31 @@ const trainerUpdateWeeklyFoodJson = async (req, res) => {
     }
 
     // ── 4. Token-bound authorization (IDOR fix) ─────────────────────────────
-    // JWT must prove the caller IS this dietician AND the profile belongs to it.
-    const access = await requireProfileAccess(req, dietitianId, profileId);
-    if (!access.allowed) {
+    // The JWT must prove the caller IS this dietician. Object-level ownership of
+    // the target row is then enforced by the weekly-row WHERE filter below
+    // (dietician_id + profile_id), exactly as the PHP did — no extra table.
+    const self = requireDieticianSelfAccess(req, dietitianId);
+    if (!self.allowed) {
       await writeAuthLogSafe(req, {
         eventType: "weekly_food_json_denied",
         userId: String(req.user?.sub || req.user?.dietician?.dietician_id || ""),
         partnerCode: null,
         identifier: profileId,
         success: false,
-        failureReason: access.message,
+        failureReason: self.message,
       });
-      return res.status(access.statusCode).json({ ok: false, message: access.message });
+      return res.status(self.statusCode).json({ ok: false, message: self.message });
     }
+
+    const normalizedProfileId = normalizeId(profileId);
+    if (!normalizedProfileId) {
+      fail(400, "Invalid profile_id");
+    }
+
+    const access = {
+      dieticianId: self.dieticianId,
+      profileId: normalizedProfileId,
+    };
 
     auditDietitianId = access.dieticianId;
     auditProfileId = access.profileId;
