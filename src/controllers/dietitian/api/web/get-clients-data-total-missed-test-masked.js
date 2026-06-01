@@ -62,6 +62,10 @@
 
 const crypto = require("crypto");
 const pool = require("../../../../config/db");
+const {
+  resolveActorFromToken: sharedResolveActorFromToken,
+  actorCanAccessCode: sharedActorCanAccessCode,
+} = require("../../../../utils/accessControl");
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -378,48 +382,23 @@ async function writeAuthLogSafe(req, {
  * body.actor_user_id. See the file header (VAPT hardening).
  */
 async function resolveActorFromToken(req) {
-  const payload = req.user || {};
-  const dieticianId = String(payload.sub || payload.dietician_id || "").trim();
+  // Delegates identity + status/role checks to the shared access-control module
+  // (single audited choke point), then maps the neutral, reason-coded result
+  // back into THIS controller's historical error shape so behavior is unchanged.
+  const resolved = await sharedResolveActorFromToken(req, ALLOWED_ACTOR_ROLES);
 
-  if (!dieticianId || dieticianId.length > 64) {
-    return { error: { status: 401, body: { status: false, ok: false, message: "Invalid token user" } } };
+  if (resolved.ok) {
+    return { actor: resolved.actor, actorEmail: resolved.actorEmail };
   }
 
-  const [rows] = await pool.execute(
-    `
-      SELECT
-        td.dietician_id,
-        td.name,
-        td.email,
-
-        aur.role,
-        aur.partner_code,
-        aur.parent_user_id,
-        aur.status
-      FROM table_dietician td
-      INNER JOIN app_user_roles aur
-        ON LOWER(aur.user_id) = LOWER(td.email)
-      WHERE td.dietician_id = ?
-      LIMIT 1
-    `,
-    [dieticianId]
-  );
-
-  const actor = rows[0];
-
-  if (!actor) {
-    return { error: { status: 403, body: { status: false, ok: false, message: "Actor user not found" } } };
-  }
-
-  if (String(actor.status) !== "active") {
-    return { error: { status: 403, body: { status: false, ok: false, message: "Actor account is not active" } } };
-  }
-
-  if (!ALLOWED_ACTOR_ROLES.has(String(actor.role))) {
-    return { error: { status: 403, body: { status: false, ok: false, message: "Invalid actor role" } } };
-  }
-
-  return { actor, actorEmail: normalizeEmail(actor.email) };
+  const REASON_BODY = {
+    invalid_token:    { status: 401, message: "Invalid token user" },
+    not_found:        { status: 403, message: "Actor user not found" },
+    inactive:         { status: 403, message: "Actor account is not active" },
+    role_not_allowed: { status: 403, message: "Invalid actor role" },
+  };
+  const m = REASON_BODY[resolved.reason] || REASON_BODY.not_found;
+  return { error: { status: m.status, body: { status: false, ok: false, message: m.message } } };
 }
 
 // ─── RBAC: can the actor view this dietician's clients? ───────────────────────
@@ -429,72 +408,9 @@ async function resolveActorFromToken(req) {
  * PHP — no extra recursion is introduced.
  */
 async function actorCanAccessCode(actor, actorEmail, targetCode) {
-  const target = normalizeCode(targetCode);
-  if (target === "") return false;
-
-  const ownCode = getActorCode(actor);
-  if (ownCode !== null && normalizeCode(ownCode) === target) {
-    return true;
-  }
-
-  const role = String(actor.role);
-
-  if (role === "trainer") {
-    return false;
-  }
-
-  if (role === "admin") {
-    const [rows] = await pool.execute(
-      `
-        SELECT aur.id
-        FROM app_user_roles aur
-        LEFT JOIN table_dietician td
-          ON LOWER(td.email) = LOWER(aur.user_id)
-        WHERE aur.role = 'trainer'
-          AND aur.status = 'active'
-          AND LOWER(aur.parent_user_id) = LOWER(?)
-          AND (
-                UPPER(aur.partner_code) = UPPER(?)
-             OR UPPER(td.dietician_id) = UPPER(?)
-          )
-        LIMIT 1
-      `,
-      [actorEmail, target, target]
-    );
-    return rows.length > 0;
-  }
-
-  if (role === "super_admin") {
-    const [rows] = await pool.execute(
-      `
-        SELECT aur.id
-        FROM app_user_roles aur
-        LEFT JOIN table_dietician td
-          ON LOWER(td.email) = LOWER(aur.user_id)
-        WHERE aur.status = 'active'
-          AND (
-                UPPER(aur.partner_code) = UPPER(?)
-             OR UPPER(td.dietician_id) = UPPER(?)
-          )
-          AND (
-                LOWER(aur.user_id) = LOWER(?)
-             OR LOWER(aur.parent_user_id) = LOWER(?)
-             OR LOWER(aur.parent_user_id) IN (
-                    SELECT LOWER(user_id)
-                    FROM app_user_roles
-                    WHERE role = 'admin'
-                      AND status = 'active'
-                      AND LOWER(parent_user_id) = LOWER(?)
-                )
-          )
-        LIMIT 1
-      `,
-      [target, target, actorEmail, actorEmail, actorEmail]
-    );
-    return rows.length > 0;
-  }
-
-  return false;
+  // One-level hierarchy RBAC now lives in the shared access-control module so it
+  // is defined and audited in exactly one place.
+  return sharedActorCanAccessCode(actor, actorEmail, targetCode);
 }
 
 // ─── Queries ─────────────────────────────────────────────────────────────────

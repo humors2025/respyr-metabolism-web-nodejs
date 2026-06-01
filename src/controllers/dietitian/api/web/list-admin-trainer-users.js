@@ -50,6 +50,8 @@
 
 const crypto = require("crypto");
 const pool   = require("../../../../config/db");
+const { resolveActorFromToken: sharedResolveActorFromToken } =
+  require("../../../../utils/accessControl");
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -206,67 +208,24 @@ async function writeAuthLogSafe(req, {
  * body-supplied actor_user_id.
  */
 async function resolveActorFromToken(req) {
-  const payload = req.user || {};
+  // Identity + status/role check delegated to the shared access-control module;
+  // the admin-hierarchy invariant below is file-specific and stays here.
+  const resolved = await sharedResolveActorFromToken(req, ["super_admin", "admin"]);
 
-  const dieticianId = String(payload.sub || payload.dietician_id || "").trim();
-
-  if (!dieticianId || dieticianId.length > 64) {
-    return {
-      error: { status: 401, body: { ok: false, error: "Invalid token user" } },
+  if (!resolved.ok) {
+    const REASON_BODY = {
+      invalid_token:    { status: 401, error: "Invalid token user" },
+      not_found:        { status: 401, error: "Token user not found" },
+      inactive:         { status: 403, error: "Account is not active" },
+      role_not_allowed: { status: 403, error: "Only super admin or admin can view this list" },
     };
+    const m = REASON_BODY[resolved.reason] || REASON_BODY.not_found;
+    return { error: { status: m.status, body: { ok: false, error: m.error } } };
   }
 
-  const [rows] = await pool.execute(
-    `
-      SELECT
-        td.id,
-        td.dietician_id,
-        td.name,
-        td.phone_no,
-        td.email,
-        td.location,
-        td.is_reset_password,
+  const { actor } = resolved;
 
-        aur.role,
-        aur.partner_code,
-        aur.parent_user_id,
-        aur.status,
-        aur.email_verified_at
-      FROM table_dietician td
-      INNER JOIN app_user_roles aur
-        ON LOWER(aur.user_id) = LOWER(td.email)
-      WHERE td.dietician_id = ?
-      LIMIT 1
-    `,
-    [dieticianId]
-  );
-
-  const actor = rows[0];
-
-  if (!actor) {
-    return {
-      error: { status: 401, body: { ok: false, error: "Token user not found" } },
-    };
-  }
-
-  if (String(actor.status) !== "active") {
-    return {
-      error: { status: 403, body: { ok: false, error: "Account is not active" } },
-    };
-  }
-
-  const role = String(actor.role);
-
-  if (role !== "super_admin" && role !== "admin") {
-    return {
-      error: {
-        status: 403,
-        body: { ok: false, error: "Only super admin or admin can view this list" },
-      },
-    };
-  }
-
-  if (role === "admin") {
+  if (String(actor.role) === "admin") {
     const hasPartnerCode = actor.partner_code !== null &&
       actor.partner_code !== undefined && String(actor.partner_code).trim() !== "";
     const hasParent = actor.parent_user_id !== null &&
@@ -282,7 +241,7 @@ async function resolveActorFromToken(req) {
     }
   }
 
-  return { actor, actorEmail: normalizeEmail(actor.email) };
+  return { actor, actorEmail: resolved.actorEmail };
 }
 
 // ─── Housekeeping ────────────────────────────────────────────────────────────

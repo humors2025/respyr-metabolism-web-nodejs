@@ -56,6 +56,8 @@
 
 const crypto = require("crypto");
 const pool = require("../../../../config/db");
+const { resolveActorFromToken: sharedResolveActorFromToken } =
+  require("../../../../utils/accessControl");
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -228,53 +230,22 @@ async function writeAuthLogSafe(req, {
  * keyed off the verified token rather than a body-supplied email.
  */
 async function resolveActorFromToken(req) {
-  const payload = req.user || {};
-  const dieticianId = String(payload.sub || payload.dietician_id || "").trim();
+  // Identity + status/role check delegated to the shared access-control module;
+  // the OVERVIEW_ROLES gate downstream still narrows to admin/super_admin.
+  const resolved = await sharedResolveActorFromToken(req, VALID_ACTOR_ROLES);
 
-  if (!dieticianId || dieticianId.length > 64) {
-    return { error: { status: 401, body: { ok: false, error: "Invalid token user" } } };
+  if (resolved.ok) {
+    return { actor: resolved.actor, actorEmail: resolved.actorEmail };
   }
 
-  const [rows] = await pool.execute(
-    `
-      SELECT
-        td.id,
-        td.dietician_id,
-        td.name,
-        td.phone_no,
-        td.email,
-        td.location,
-        td.is_reset_password,
-
-        aur.role,
-        aur.partner_code,
-        aur.parent_user_id,
-        aur.status,
-        aur.email_verified_at
-      FROM table_dietician td
-      INNER JOIN app_user_roles aur
-        ON LOWER(aur.user_id) = LOWER(td.email)
-      WHERE td.dietician_id = ?
-      LIMIT 1
-    `,
-    [dieticianId]
-  );
-
-  const actor = rows[0];
-
-  if (!actor) {
-    return { error: { status: 403, body: { ok: false, error: "Actor user not found" } } };
-  }
-
-  if (String(actor.status) !== "active") {
-    return { error: { status: 403, body: { ok: false, error: "Actor account is not active" } } };
-  }
-
-  if (!VALID_ACTOR_ROLES.has(String(actor.role))) {
-    return { error: { status: 403, body: { ok: false, error: "Invalid actor role" } } };
-  }
-
-  return { actor, actorEmail: normalizeEmail(actor.email) };
+  const REASON_BODY = {
+    invalid_token:    { status: 401, error: "Invalid token user" },
+    not_found:        { status: 403, error: "Actor user not found" },
+    inactive:         { status: 403, error: "Actor account is not active" },
+    role_not_allowed: { status: 403, error: "Invalid actor role" },
+  };
+  const m = REASON_BODY[resolved.reason] || REASON_BODY.not_found;
+  return { error: { status: m.status, body: { ok: false, error: m.error } } };
 }
 
 // ─── Network codes ───────────────────────────────────────────────────────────
