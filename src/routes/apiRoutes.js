@@ -97,6 +97,11 @@ const {
 
 
 const {
+  levelTypeUpdateChange,
+} = require("../controllers/dietitian/api/web/level-type-update-change");
+
+
+const {
   get_graph_all_seven_trends_graph,
 } = require("../controllers/dietitian/api/web/get_graph_all_seven_trends_graph");
 
@@ -376,6 +381,13 @@ router.post(
   "/dietitian/api/web/trainer-update-weekly-food-json",
   authMiddleware,
   trainerUpdateWeeklyFoodJson
+);
+
+
+router.post(
+  "/dietitian/api/web/level-type-update-change",
+  authMiddleware,
+  levelTypeUpdateChange
 );
 
 
