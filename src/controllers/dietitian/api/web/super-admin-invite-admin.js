@@ -53,6 +53,8 @@
 const crypto = require("crypto");
 const axios  = require("axios");
 const pool   = require("../../../../config/db");
+const { resolveActorByEmail: sharedResolveActorByEmail } =
+  require("../../../../utils/accessControl");
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -226,54 +228,23 @@ async function resolveActorFromToken(req, requiredRole = "super_admin") {
     };
   }
 
-  const [rows] = await pool.execute(
-    `
-      SELECT
-        td.id,
-        td.email,
-        aur.role,
-        aur.partner_code,
-        aur.parent_user_id,
-        aur.status
-      FROM table_dietician td
-      INNER JOIN app_user_roles aur
-        ON LOWER(aur.user_id) = LOWER(td.email)
-      WHERE LOWER(td.email) = LOWER(?)
-      LIMIT 1
-    `,
-    [userId]
-  );
+  // Identity (by email) + status/role check delegated to the shared
+  // access-control module; the email-format gate above and this controller's
+  // error shape are preserved.
+  const resolved = await sharedResolveActorByEmail(userId, [requiredRole]);
 
-  const actor = rows[0];
-
-  if (!actor) {
-    return {
-      error: {
-        status: 401,
-        body: { ok: false, message: "Token user not found" },
-      },
-    };
+  if (resolved.ok) {
+    return { actor: resolved.actor, actorEmail: userId };
   }
 
-  if (String(actor.status) !== "active") {
-    return {
-      error: {
-        status: 403,
-        body: { ok: false, message: "Account is not active" },
-      },
-    };
-  }
-
-  if (String(actor.role) !== requiredRole) {
-    return {
-      error: {
-        status: 403,
-        body: { ok: false, message: "You are not allowed to perform this action" },
-      },
-    };
-  }
-
-  return { actor, actorEmail: userId };
+  const REASON_BODY = {
+    invalid_token:    { status: 401, message: "Invalid token user" },
+    not_found:        { status: 401, message: "Token user not found" },
+    inactive:         { status: 403, message: "Account is not active" },
+    role_not_allowed: { status: 403, message: "You are not allowed to perform this action" },
+  };
+  const m = REASON_BODY[resolved.reason] || REASON_BODY.not_found;
+  return { error: { status: m.status, body: { ok: false, message: m.message } } };
 }
 
 // ─── Input validation ────────────────────────────────────────────────────────
@@ -308,7 +279,7 @@ function validateInviteInput(body) {
   // Disallow control chars in names — defends against CRLF injection
   // and bidi-override smuggling into downstream email templates.
   // eslint-disable-next-line no-control-regex
-  const nameSafeRegex = /^[^ -]+$/;
+  const nameSafeRegex = /^[^\u0000-\u001f]+$/;
   if (!nameSafeRegex.test(firstName) || !nameSafeRegex.test(lastName)) {
     return { ok: false, status: 400, message: "Names contain invalid characters" };
   }

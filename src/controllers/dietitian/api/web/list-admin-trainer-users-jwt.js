@@ -45,6 +45,8 @@
 
 const crypto = require("crypto");
 const pool = require("../../../../config/db");
+const { resolveActorFromToken: sharedResolveActorFromToken } =
+  require("../../../../utils/accessControl");
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -175,78 +177,22 @@ async function writeAuthLogSafe(req, {
  *  - tampered tokens that pass HMAC but reference a non-existent user
  */
 async function resolveActorFromToken(req) {
-  const payload = req.user || {};
+  // Identity + status/role check delegated to the shared access-control module;
+  // the neutral result is mapped back into this controller's error shape.
+  const resolved = await sharedResolveActorFromToken(req, VALID_ACTOR_ROLES);
 
-  // VAPT/HIPAA: tokens no longer carry email/user_id. Resolve the actor by
-  // their internal dietician_id (the JWT 'sub'), then pull email from DB.
-  const dieticianId = String(payload.sub || payload.dietician_id || "").trim();
-
-  if (!dieticianId || dieticianId.length > 64) {
-    return {
-      error: {
-        status: 401,
-        body: { ok: false, error: "Invalid token user" },
-      },
-    };
+  if (resolved.ok) {
+    return { actor: resolved.actor, actorEmail: resolved.actorEmail };
   }
 
-  const [rows] = await pool.execute(
-    `
-      SELECT
-        td.id,
-        td.dietician_id,
-        td.name,
-        td.phone_no,
-        td.email,
-        td.location,
-        td.is_reset_password,
-
-        aur.role,
-        aur.partner_code,
-        aur.parent_user_id,
-        aur.status,
-        aur.email_verified_at
-      FROM table_dietician td
-      INNER JOIN app_user_roles aur
-        ON LOWER(aur.user_id) = LOWER(td.email)
-      WHERE td.dietician_id = ?
-      LIMIT 1
-    `,
-    [dieticianId]
-  );
-
-  const actor = rows[0];
-
-  if (!actor) {
-    return {
-      error: {
-        status: 401,
-        body: { ok: false, error: "Token user not found" },
-      },
-    };
-  }
-
-  if (String(actor.status) !== "active") {
-    return {
-      error: {
-        status: 403,
-        body: { ok: false, error: "Account is not active" },
-      },
-    };
-  }
-
-  if (!VALID_ACTOR_ROLES.has(actor.role)) {
-    return {
-      error: {
-        status: 403,
-        body: { ok: false, error: "Invalid role configuration" },
-      },
-    };
-  }
-
-  // actorEmail now comes from the DB row, not the JWT (which no longer
-  // carries it). Downstream callers expect a normalized lowercased email.
-  return { actor, actorEmail: String(actor.email || "").trim().toLowerCase() };
+  const REASON_BODY = {
+    invalid_token:    { status: 401, error: "Invalid token user" },
+    not_found:        { status: 401, error: "Token user not found" },
+    inactive:         { status: 403, error: "Account is not active" },
+    role_not_allowed: { status: 403, error: "Invalid role configuration" },
+  };
+  const m = REASON_BODY[resolved.reason] || REASON_BODY.not_found;
+  return { error: { status: m.status, body: { ok: false, error: m.error } } };
 }
 
 // ─── Pending invite housekeeping ─────────────────────────────────────────────

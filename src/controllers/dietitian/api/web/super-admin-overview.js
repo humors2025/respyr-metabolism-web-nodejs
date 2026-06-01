@@ -45,6 +45,8 @@
 
 const crypto = require("crypto");
 const pool   = require("../../../../config/db");
+const { resolveActorFromToken: sharedResolveActorFromToken } =
+  require("../../../../utils/accessControl");
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -177,68 +179,23 @@ async function writeAuthLogSafe(req, {
  *  - body-supplied actor_user_id spoofing (PHP's IDOR vector)
  */
 async function resolveSuperAdminFromToken(req) {
-  const payload = req.user || {};
+  // Delegates the JWT→DB identity + status/role check to the shared
+  // access-control module, then maps the neutral result back into this
+  // controller's historical error shape so behavior is unchanged.
+  const resolved = await sharedResolveActorFromToken(req, ["super_admin"]);
 
-  const dieticianId = String(payload.sub || payload.dietician_id || "").trim();
-
-  if (!dieticianId || dieticianId.length > 64) {
-    return {
-      error: {
-        status: 401,
-        body: { ok: false, error: "Invalid token user" },
-      },
-    };
+  if (resolved.ok) {
+    return { actor: resolved.actor, actorEmail: resolved.actorEmail };
   }
 
-  const [rows] = await pool.execute(
-    `
-      SELECT
-        td.id,
-        td.dietician_id,
-        td.name,
-        td.phone_no,
-        td.email,
-        td.location,
-        td.is_reset_password,
-
-        aur.role,
-        aur.partner_code,
-        aur.parent_user_id,
-        aur.status,
-        aur.email_verified_at
-      FROM table_dietician td
-      INNER JOIN app_user_roles aur
-        ON LOWER(aur.user_id) = LOWER(td.email)
-      WHERE td.dietician_id = ?
-      LIMIT 1
-    `,
-    [dieticianId]
-  );
-
-  const actor = rows[0];
-
-  if (!actor) {
-    return {
-      error: { status: 401, body: { ok: false, error: "Token user not found" } },
-    };
-  }
-
-  if (String(actor.status) !== "active") {
-    return {
-      error: { status: 403, body: { ok: false, error: "Account is not active" } },
-    };
-  }
-
-  if (String(actor.role) !== "super_admin") {
-    return {
-      error: {
-        status: 403,
-        body: { ok: false, error: "Only super admin can view this overview" },
-      },
-    };
-  }
-
-  return { actor, actorEmail: normalizeEmail(actor.email) };
+  const REASON_BODY = {
+    invalid_token:    { status: 401, error: "Invalid token user" },
+    not_found:        { status: 401, error: "Token user not found" },
+    inactive:         { status: 403, error: "Account is not active" },
+    role_not_allowed: { status: 403, error: "Only super admin can view this overview" },
+  };
+  const m = REASON_BODY[resolved.reason] || REASON_BODY.not_found;
+  return { error: { status: m.status, body: { ok: false, error: m.error } } };
 }
 
 // ─── Housekeeping ────────────────────────────────────────────────────────────

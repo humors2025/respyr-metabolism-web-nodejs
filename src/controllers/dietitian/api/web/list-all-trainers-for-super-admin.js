@@ -53,6 +53,8 @@
 
 const crypto = require("crypto");
 const pool   = require("../../../../config/db");
+const { resolveActorByEmail: sharedResolveActorByEmail } =
+  require("../../../../utils/accessControl");
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -229,52 +231,24 @@ async function writeAuthLogSafe(req, {
  * SECURITY NOTE in the file header.
  */
 async function resolveActorByEmail(actorUserId) {
-  const [rows] = await pool.execute(
-    `
-      SELECT
-        td.id,
-        td.dietician_id,
-        td.name,
-        td.phone_no,
-        td.email,
+  // Identity (by email) + status/role check delegated to the shared
+  // access-control module; the neutral result is mapped back into this
+  // controller's error shape. NOTE: this endpoint resolves the actor from a
+  // body-supplied email (the legacy "no-JWT" variant) — see the file header.
+  const resolved = await sharedResolveActorByEmail(actorUserId, VALID_ACTOR_ROLES);
 
-        aur.role,
-        aur.partner_code,
-        aur.parent_user_id,
-        aur.status,
-        aur.email_verified_at,
-        aur.created_at,
-        aur.updated_at
-      FROM table_dietician td
-      INNER JOIN app_user_roles aur
-        ON LOWER(aur.user_id) = LOWER(td.email)
-      WHERE LOWER(td.email) = LOWER(?)
-      LIMIT 1
-    `,
-    [actorUserId]
-  );
-
-  const actor = rows[0];
-
-  if (!actor) {
-    return {
-      error: { status: 403, body: { ok: false, error: "Actor user not found" } },
-    };
+  if (resolved.ok) {
+    return { actor: resolved.actor, actorEmail: resolved.actorEmail };
   }
 
-  if (String(actor.status) !== "active") {
-    return {
-      error: { status: 403, body: { ok: false, error: "Actor account is not active" } },
-    };
-  }
-
-  if (!VALID_ACTOR_ROLES.has(String(actor.role))) {
-    return {
-      error: { status: 403, body: { ok: false, error: "Invalid actor role" } },
-    };
-  }
-
-  return { actor, actorEmail: normalizeEmail(actor.email) };
+  const REASON_BODY = {
+    invalid_token:    { status: 403, error: "Actor user not found" },
+    not_found:        { status: 403, error: "Actor user not found" },
+    inactive:         { status: 403, error: "Actor account is not active" },
+    role_not_allowed: { status: 403, error: "Invalid actor role" },
+  };
+  const m = REASON_BODY[resolved.reason] || REASON_BODY.not_found;
+  return { error: { status: m.status, body: { ok: false, error: m.error } } };
 }
 
 // ─── Housekeeping ────────────────────────────────────────────────────────────
