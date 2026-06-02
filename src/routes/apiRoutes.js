@@ -130,6 +130,10 @@ const {
   listTrainerClientInvites,
 } = require("../controllers/dietitian/api/web/list-trainer-client-invites");
 
+const {
+  sendTrainerClientInvite,
+} = require("../controllers/dietitian/api/web/send_trainer_client_invite");
+
 
 const {
   superAdminOverview,
@@ -437,6 +441,13 @@ router.post(
   "/dietitian/api/web/list-trainer-client-invites",
   authMiddleware,
   listTrainerClientInvites
+);
+
+
+router.post(
+  "/dietitian/api/web/send_trainer_client_invite",
+  authMiddleware,
+  sendTrainerClientInvite
 );
 
 
