@@ -2,11 +2,6 @@ const jwt = require("jsonwebtoken");
 
 const JWT_ALGORITHM = process.env.JWT_ALGORITHM || "HS256";
 
-// Must match the values the token signers use (loginController / refreshTokenController).
-const JWT_ISS = process.env.JWT_ISS || process.env.JWT_ISSUER || "api.respyr.ai";
-const JWT_AUD =
-  process.env.JWT_AUD || process.env.JWT_AUDIENCE || "respyr-dietitian-app";
-
 module.exports = (req, res, next) => {
   if (req.method === "OPTIONS") {
     return next();
@@ -58,8 +53,6 @@ module.exports = (req, res, next) => {
     const decoded = jwt.verify(token, jwtSecret, {
       algorithms: [JWT_ALGORITHM],
       clockTolerance: 5,
-      issuer: JWT_ISS,
-      audience: JWT_AUD,
     });
 
     req.user = decoded;

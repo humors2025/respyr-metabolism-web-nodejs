@@ -3,7 +3,6 @@ require("dotenv").config();
 
 const helmet = require("helmet");
 const rateLimit = require("express-rate-limit");
-const { RedisStore } = require("rate-limit-redis");
 
 const apiRoutes = require("./routes/apiRoutes");
 
@@ -104,33 +103,12 @@ app.use(
 // =====================================================
 // General API rate limiter
 // Login-specific limiter can still remain inside apiRoutes.js
-//
-// On serverless (Lambda) an in-memory store is per-instance: each warm
-// container keeps its own counter, so the effective limit is multiplied by
-// concurrency and resets on cold start (OWASP API4). Use a shared Redis store
-// so the limit is enforced globally across all instances.
 // =====================================================
-let rateLimitStore;
-
-if (process.env.REDIS_HOST) {
-  const redis = require("./config/redis");
-  rateLimitStore = new RedisStore({
-    sendCommand: (...args) => redis.call(...args),
-    prefix: "rl:api:",
-  });
-} else if (isProduction) {
-  console.warn(
-    "RATE_LIMIT_INMEMORY: REDIS_HOST not set — rate limiting is per-instance " +
-      "and ineffective on Lambda. Configure Redis or enforce limits at API Gateway/WAF."
-  );
-}
-
 const apiRateLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 500,
   standardHeaders: true,
   legacyHeaders: false,
-  ...(rateLimitStore ? { store: rateLimitStore } : {}),
   message: {
     status: false,
     message: "Too many requests. Please try again later.",
