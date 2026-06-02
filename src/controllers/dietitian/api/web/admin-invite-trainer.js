@@ -59,10 +59,6 @@
 const crypto = require("crypto");
 const axios  = require("axios");
 const pool   = require("../../../../config/db");
-const {
-  resolveActorByDieticianId: sharedResolveActorByDieticianId,
-  resolveActorByEmail: sharedResolveActorByEmail,
-} = require("../../../../utils/accessControl");
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -242,24 +238,77 @@ async function resolveActorFromToken(req, requiredRole = "admin") {
     };
   }
 
-  // Prefer dietician_id (token subject); fall back to email. Dispatched exactly
-  // as before, with the shared module performing the lookup + role/status gate.
-  const resolved = dieticianId
-    ? await sharedResolveActorByDieticianId(dieticianId, [requiredRole])
-    : await sharedResolveActorByEmail(tokenEmail, [requiredRole]);
+  // Prefer dietician_id (token subject); fall back to email.
+  const [rows] = dieticianId
+    ? await pool.execute(
+        `
+          SELECT
+            td.id,
+            td.dietician_id,
+            td.email,
+            aur.user_id,
+            aur.role,
+            aur.partner_code,
+            aur.parent_user_id,
+            aur.status
+          FROM table_dietician td
+          INNER JOIN app_user_roles aur
+            ON LOWER(aur.user_id) = LOWER(td.email)
+          WHERE td.dietician_id = ?
+          LIMIT 1
+        `,
+        [dieticianId]
+      )
+    : await pool.execute(
+        `
+          SELECT
+            td.id,
+            td.dietician_id,
+            td.email,
+            aur.user_id,
+            aur.role,
+            aur.partner_code,
+            aur.parent_user_id,
+            aur.status
+          FROM table_dietician td
+          INNER JOIN app_user_roles aur
+            ON LOWER(aur.user_id) = LOWER(td.email)
+          WHERE LOWER(td.email) = LOWER(?)
+          LIMIT 1
+        `,
+        [tokenEmail]
+      );
 
-  if (resolved.ok) {
-    return { actor: resolved.actor, actorEmail: resolved.actorEmail };
+  const actor = rows[0];
+
+  if (!actor) {
+    return {
+      error: {
+        status: 401,
+        body: { ok: false, message: "Token user not found" },
+      },
+    };
   }
 
-  const REASON_BODY = {
-    invalid_token:    { status: 401, message: "Invalid token user" },
-    not_found:        { status: 401, message: "Token user not found" },
-    inactive:         { status: 403, message: "Account is not active" },
-    role_not_allowed: { status: 403, message: "You are not allowed to perform this action" },
-  };
-  const m = REASON_BODY[resolved.reason] || REASON_BODY.not_found;
-  return { error: { status: m.status, body: { ok: false, message: m.message } } };
+  if (String(actor.status) !== "active") {
+    return {
+      error: {
+        status: 403,
+        body: { ok: false, message: "Account is not active" },
+      },
+    };
+  }
+
+  if (String(actor.role) !== requiredRole) {
+    return {
+      error: {
+        status: 403,
+        body: { ok: false, message: "You are not allowed to perform this action" },
+      },
+    };
+  }
+
+  return { actor, actorEmail: normalizeEmail(actor.user_id || actor.email) };
 }
 
 // ─── Input validation ────────────────────────────────────────────────────────

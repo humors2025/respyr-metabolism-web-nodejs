@@ -61,10 +61,6 @@
 
 const crypto = require("crypto");
 const pool = require("../../../../config/db");
-const {
-  resolveActorByDieticianId: sharedResolveActorByDieticianId,
-  resolveActorByEmail: sharedResolveActorByEmail,
-} = require("../../../../utils/accessControl");
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -247,24 +243,48 @@ async function resolveActorFromToken(req) {
     return { error: { status: 401, message: "Invalid token user" } };
   }
 
-  // Prefer dietician_id (token subject); fall back to email. Dispatched exactly
-  // as before, with the shared module performing the lookup + role/status gate.
-  const resolved = dieticianId
-    ? await sharedResolveActorByDieticianId(dieticianId, ALLOWED_ACTOR_ROLES)
-    : await sharedResolveActorByEmail(tokenEmail, ALLOWED_ACTOR_ROLES);
+  // Prefer dietician_id (token subject); fall back to email.
+  const [rows] = dieticianId
+    ? await pool.execute(
+        `
+          SELECT
+            td.id, td.dietician_id, td.name, td.email,
+            aur.user_id, aur.role, aur.partner_code, aur.parent_user_id, aur.status
+          FROM table_dietician td
+          INNER JOIN app_user_roles aur
+            ON LOWER(aur.user_id) = LOWER(td.email)
+          WHERE td.dietician_id = ?
+          LIMIT 1
+        `,
+        [dieticianId]
+      )
+    : await pool.execute(
+        `
+          SELECT
+            td.id, td.dietician_id, td.name, td.email,
+            aur.user_id, aur.role, aur.partner_code, aur.parent_user_id, aur.status
+          FROM table_dietician td
+          INNER JOIN app_user_roles aur
+            ON LOWER(aur.user_id) = LOWER(td.email)
+          WHERE LOWER(td.email) = LOWER(?)
+          LIMIT 1
+        `,
+        [tokenEmail]
+      );
 
-  if (resolved.ok) {
-    return { actor: resolved.actor, actorEmail: resolved.actorEmail };
+  const actor = rows[0];
+
+  if (!actor) {
+    return { error: { status: 403, message: "Actor user not found" } };
+  }
+  if (String(actor.status) !== "active") {
+    return { error: { status: 403, message: "Actor account is not active" } };
+  }
+  if (!ALLOWED_ACTOR_ROLES.has(String(actor.role))) {
+    return { error: { status: 403, message: "Invalid actor role" } };
   }
 
-  const REASON_BODY = {
-    invalid_token:    { status: 401, message: "Invalid token user" },
-    not_found:        { status: 403, message: "Actor user not found" },
-    inactive:         { status: 403, message: "Actor account is not active" },
-    role_not_allowed: { status: 403, message: "Invalid actor role" },
-  };
-  const m = REASON_BODY[resolved.reason] || REASON_BODY.not_found;
-  return { error: { status: m.status, message: m.message } };
+  return { actor, actorEmail: normalizeEmail(actor.user_id || actor.email) };
 }
 
 // ─── Invite resolution + manage permission ───────────────────────────────────

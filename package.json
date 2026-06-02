@@ -6,7 +6,6 @@
   "scripts": {
     "start": "node src/index.js",
     "dev": "nodemon src/index.js",
-    "check:phi-access": "node scripts/check-phi-access-control.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
