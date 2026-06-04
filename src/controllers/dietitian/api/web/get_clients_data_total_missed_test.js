@@ -158,6 +158,8 @@ const formatClientRows = (rows, selectedDate) => {
     const fitnessGoalValue =
       String(fitnessGoalRaw).trim() !== "" ? fitnessGoalRaw : "weight_loss";
 
+    const dietPlanGeneratedAt = row.diet_plan_generated_at ?? null;
+
     return {
       dietician_id: normalizeDieticianId(row.dietician_id),
       profile_id: row.profile_id,
@@ -181,6 +183,12 @@ const formatClientRows = (rows, selectedDate) => {
       test_taken_count: Number(row.test_taken_count ?? 0),
       last_logged_date: row.last_logged_date,
       last_logged: getLastLoggedText(row.last_logged_date, selectedDate),
+
+      // NEW: latest diet plan generated date from weekly_food_json_suggestions
+      diet_plan_generated_at: dietPlanGeneratedAt,
+      diet_plan_generated_date: dietPlanGeneratedAt
+        ? toDateOnly(dietPlanGeneratedAt)
+        : null,
 
       p_created: row.dttm,
       p_image: getProfileImageUrl(row),
@@ -235,7 +243,11 @@ exports.get_clients_data_total_missed_test = async (req, res) => {
   let debugStep = "controller_started";
 
   try {
-    res.setHeader("X-Controller-Version", "missed-test-v4");
+    // HIPAA: this endpoint returns UNMASKED client PHI (only ever to the owning
+    // dietitian — see requireDieticianSelfAccess). Never let intermediaries or
+    // the browser cache it.
+    res.setHeader("Cache-Control", "no-store");
+    res.setHeader("Pragma", "no-cache");
 
     debugStep = "parse_body";
     const body = parseBodyIfNeeded(req);
@@ -253,14 +265,6 @@ exports.get_clients_data_total_missed_test = async (req, res) => {
 
     debugStep = "access_check";
     const authResult = getAuthorizedDieticianId(req, requestedDieticianId);
-
-    console.log("GET_CLIENTS_MISSED_TEST_ACCESS_DEBUG", {
-      requestedDieticianId,
-      allowed: authResult.allowed,
-      dieticianId: authResult.dieticianId || null,
-      accessKeys: authResult.access ? Object.keys(authResult.access) : [],
-      userKeys: req.user ? Object.keys(req.user) : [],
-    });
 
     if (!authResult.allowed) {
       return res.status(authResult.statusCode).json({
@@ -338,11 +342,6 @@ exports.get_clients_data_total_missed_test = async (req, res) => {
 
     debugStep = "summary_query_execute";
 
-    console.log("GET_CLIENTS_MISSED_TEST_SUMMARY_PARAMS", {
-      selectedDate,
-      dieticianId,
-    });
-
     const [summaryRows] = await pool.execute(summarySql, summaryParams);
 
     const summary = summaryRows[0] || {};
@@ -376,6 +375,8 @@ exports.get_clients_data_total_missed_test = async (req, res) => {
         tc.dttm,
         tc.profile_image,
         tc.level_type,
+
+        wfj.diet_plan_generated_at,
 
         IFNULL(uh.goal, '') AS fitness_goal,
 
@@ -437,6 +438,17 @@ exports.get_clients_data_total_missed_test = async (req, res) => {
       ) ttc
         ON ttc.profile_id = tc.profile_id
 
+      LEFT JOIN (
+        SELECT
+          UPPER(TRIM(dietician_id)) AS dietician_id,
+          profile_id,
+          MAX(created_at) AS diet_plan_generated_at
+        FROM weekly_food_json_suggestions
+        GROUP BY UPPER(TRIM(dietician_id)), profile_id
+      ) wfj
+        ON wfj.profile_id = tc.profile_id
+        AND wfj.dietician_id = UPPER(TRIM(tc.dietician_id))
+
       WHERE UPPER(TRIM(tc.dietician_id)) = ?
       ${filterCondition}
 
@@ -456,15 +468,6 @@ exports.get_clients_data_total_missed_test = async (req, res) => {
     ];
 
     debugStep = "main_query_execute";
-
-    console.log("GET_CLIENTS_MISSED_TEST_MAIN_PARAMS", {
-      selectedDate,
-      dieticianId,
-      type,
-      page,
-      limit: safeLimit,
-      offset: safeOffset,
-    });
 
     const [rows] = await pool.execute(mainSql, mainParams);
 
