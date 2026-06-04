@@ -141,6 +141,11 @@ const {
 
 
 const {
+  superAdminAllClientsOverview,
+} = require("../controllers/dietitian/api/web/super-admin-all-clients-overview");
+
+
+const {
   listAdminTrainerUsers,
 } = require("../controllers/dietitian/api/web/list-admin-trainer-users");
 
@@ -455,6 +460,13 @@ router.post(
   "/dietitian/api/web/super-admin-overview",
   authMiddleware,
   superAdminOverview
+);
+
+
+router.post(
+  "/dietitian/api/web/super-admin-all-clients-overview",
+  authMiddleware,
+  superAdminAllClientsOverview
 );
 
 
