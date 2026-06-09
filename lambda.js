@@ -13,9 +13,13 @@ module.exports.handler = serverless(app, {
      * - cookies
      * - health/test/client data
      */
+    // Support both API Gateway payload formats:
+    //  - REST API / HTTP API v1.0 -> event.path, event.httpMethod
+    //  - HTTP API v2.0            -> event.rawPath, event.requestContext.http.method
     console.log("Lambda request:", {
-      path: event.path,
-      httpMethod: event.httpMethod,
+      path: event.path || event.rawPath || event.requestContext?.http?.path,
+      httpMethod:
+        event.httpMethod || event.requestContext?.http?.method,
       requestId: context.awsRequestId,
     });
 

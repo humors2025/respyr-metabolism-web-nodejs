@@ -40,7 +40,7 @@ const RESEND_FROM_EMAIL =
   process.env.RESEND_FROM_EMAIL || "Respyr <no-reply@respyr.ai>";
 
 const GENERIC_MESSAGE =
-  "If an account exists for that email, a verification code has been sent.";
+  "Verification code has been sent to your email.";
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
