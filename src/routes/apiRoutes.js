@@ -210,6 +210,20 @@ const {
 } = require("../controllers/dietitian/api/web/referral-client-list");
 
 
+// 🔑 Forgot-password (OTP) flow — public, rate-limited
+const {
+  sendDietitianOtp,
+} = require("../controllers/dietitian/api/web/send_diatitian_otp");
+
+const {
+  verifyDietitianOtp,
+} = require("../controllers/dietitian/api/web/verify_diatitian_otp");
+
+const {
+  updateDietitianPassword,
+} = require("../controllers/dietitian/api/web/update_diatitian_password");
+
+
 
 /* ===============================
    Middlewares
@@ -222,6 +236,14 @@ const {
   loginRateLimiter,
   loginIpRateLimiter,
 } = require('../middlewares/loginRateLimiter');
+
+const {
+  otpSendRateLimiter,
+  otpSendIpRateLimiter,
+  otpVerifyRateLimiter,
+  otpVerifyIpRateLimiter,
+  passwordResetRateLimiter,
+} = require('../middlewares/otpRateLimiter');
 
 const upload = require('../middlewares/upload');
 
@@ -280,6 +302,27 @@ router.post('/auth/refresh-token', refreshTokenController.refreshToken);
 
 // 🚪 Logout
 router.post('/auth/logout', logoutController.logout);
+
+// 🔑 Forgot-password OTP flow (public — secured by rate limiting + OTP/token)
+router.post(
+  '/auth/send_diatitian_otp',
+  otpSendIpRateLimiter,
+  otpSendRateLimiter,
+  sendDietitianOtp
+);
+
+router.post(
+  '/auth/verify_diatitian_otp',
+  otpVerifyIpRateLimiter,
+  otpVerifyRateLimiter,
+  verifyDietitianOtp
+);
+
+router.post(
+  '/auth/update_diatitian_password',
+  passwordResetRateLimiter,
+  updateDietitianPassword
+);
 
 // 📊 Analytics
 // router.post('/dietitian/api/web/get_test_analytics', authMiddleware, get_test_analytics); 
