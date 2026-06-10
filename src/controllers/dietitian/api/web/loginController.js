@@ -494,6 +494,7 @@ exports.login = async (req, res) => {
 
     const dieticianPayload = {
       dietician_id: String(user.dietician_id),
+      user_id: String(user.email).toLowerCase(),
       name: user.name,
       email: String(user.email).toLowerCase(),
       phone_no: user.phone_no,
@@ -517,6 +518,7 @@ exports.login = async (req, res) => {
 
       sub: String(user.dietician_id),
       dietician_id: String(user.dietician_id),
+      user_id: String(user.email).toLowerCase(),
 
       role,
       partner_code: partnerCode,
