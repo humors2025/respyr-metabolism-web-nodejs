@@ -176,6 +176,11 @@ const {
 
 
 const {
+  superAdminTrainersSummary,
+} = require("../controllers/dietitian/api/web/super-admin-trainers-summary");
+
+
+const {
   trainerClientsOverviewForSuperAdmin,
 } = require("../controllers/dietitian/api/web/trainer-clients-overview-for-super-admin");
 
@@ -545,6 +550,13 @@ router.post(
   "/dietitian/api/web/trainer-admin-trainers-summary",
   authMiddleware,
   trainerAdminTrainersSummary
+);
+
+
+router.post(
+  "/dietitian/api/web/super-admin-trainers-summary",
+  authMiddleware,
+  superAdminTrainersSummary
 );
 
 
