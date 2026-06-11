@@ -161,6 +161,11 @@ const {
 
 
 const {
+  get_clients_with_diet_plan,
+} = require("../controllers/dietitian/api/web/get_clients_with_diet_plan");
+
+
+const {
   trainerAdminClientsListDir,
 } = require("../controllers/dietitian/api/web/trainer-admin-clients-list-dir");
 
@@ -418,6 +423,13 @@ router.post(
   },
   authMiddleware,
   get_search_clients_details
+);
+
+
+router.post(
+  "/dietitian/api/web/get_clients_with_diet_plan",
+  authMiddleware,
+  get_clients_with_diet_plan
 );
 
 
