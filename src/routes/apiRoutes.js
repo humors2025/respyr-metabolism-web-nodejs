@@ -138,6 +138,10 @@ const {
   resendClientSubscriptionInvite,
 } = require("../controllers/dietitian/api/web/resend-client-subscription-invite");
 
+const {
+  revokeClientSubscriptionInvite,
+} = require("../controllers/dietitian/api/web/revoke-client-subscription-invite");
+
 
 const {
   superAdminOverview,
@@ -539,6 +543,13 @@ router.post(
   "/dietitian/api/web/resend-client-subscription-invite",
   authMiddleware,
   resendClientSubscriptionInvite
+);
+
+
+router.post(
+  "/dietitian/api/web/revoke-client-subscription-invite",
+  authMiddleware,
+  revokeClientSubscriptionInvite
 );
 
 
