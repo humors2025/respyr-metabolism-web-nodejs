@@ -481,10 +481,9 @@ async function createPendingInvite({
   tokenHash,
   expiresAt,
 }) {
-  // app_user_invitations stores a deterministic hash of the invited email
-  // (NOT NULL, no DB default) alongside the plaintext — a HIPAA minimum-necessary
-  // /dedup column the PHP auth_common.php populated. Use the same keyed hash the
-  // token uses so it is consistent and non-reversible without the pepper.
+  // invited_email_hash is a NOT-NULL column on app_user_invitations. Store a
+  // deterministic keyed hash of the email (same HMAC the token uses) so it is
+  // consistent and non-reversible without the pepper.
   const invitedEmailHash = secureHash(email);
 
   const [result] = await pool.execute(
