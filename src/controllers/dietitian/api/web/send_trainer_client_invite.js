@@ -70,8 +70,17 @@ const CLIENT_REDEEM_CODE_EXPIRY_DAYS = Math.max(
 );
 
 // Resend config (was resend_config.php constants).
+// Only RESEND_API_KEY is mandatory. RESEND_FROM_EMAIL falls back to the
+// RESEND_FROM_ADDRESS name used in the deployed env, then to a sane default
+// (parity with the sibling invite endpoints). RESEND_REPLY_TO and
+// RESEND_TEMPLATE_ID are optional — Resend has no server-side templates with
+// variable substitution, so the body is rendered inline below; the template id
+// is kept only for audit/tag traceability.
 const RESEND_API_KEY     = process.env.RESEND_API_KEY     || "";
-const RESEND_FROM_EMAIL  = process.env.RESEND_FROM_EMAIL  || "";
+const RESEND_FROM_EMAIL  =
+  process.env.RESEND_FROM_EMAIL ||
+  process.env.RESEND_FROM_ADDRESS ||
+  "Respyr <noreply@respyr.ai>";
 const RESEND_REPLY_TO    = process.env.RESEND_REPLY_TO    || "";
 const RESEND_TEMPLATE_ID = process.env.RESEND_TEMPLATE_ID || "";
 
@@ -149,6 +158,16 @@ function normalizeCode(code) {
 function isValidEmail(email) {
   // Conservative single-address check (parity with FILTER_VALIDATE_EMAIL intent).
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+}
+
+/** HTML-escape a value before interpolating into the email body (anti-injection). */
+function escapeHtml(value) {
+  return String(value === null || value === undefined ? "" : value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
 
 /** Format a Date as IST "YYYY-MM-DD HH:MM:SS" — matches PHP date() in Asia/Kolkata. */
@@ -765,27 +784,47 @@ async function sendResendTrainerInviteEmail(
     return { success: false, resend_email_id: null, error: "RESEND_API_KEY is not configured" };
   }
 
+  // Resend has no server-side templates with variable substitution, so the body
+  // is rendered inline here (parity with admin-invite-trainer / super-admin-invite-trainer).
+  const safe = {
+    CLIENT_NAME: escapeHtml(clientName),
+    TRAINER_NAME: escapeHtml(trainerName),
+    TRAINER_CODE: escapeHtml(trainerCode),
+    REDEEM_CODE: escapeHtml(redeemCode),
+    CODE_EXPIRES_AT: escapeHtml(codeExpiresAt),
+    PLAN_NAME: escapeHtml(selectedPlan.plan_name),
+    PLAN_PRICE_LABEL: escapeHtml(selectedPlan.plan_price_label),
+  };
+
+  const html = `<!doctype html>
+<html>
+  <body style="font-family: Arial, sans-serif; color:#222; line-height:1.5;">
+    <p>Hi ${safe.CLIENT_NAME},</p>
+    <p><strong>${safe.TRAINER_NAME}</strong> has invited you to Respyr on the
+       <strong>${safe.PLAN_NAME}</strong> plan (${safe.PLAN_PRICE_LABEL}).</p>
+    <p>Your redeem code: <strong style="font-size:18px;letter-spacing:1px;">${safe.REDEEM_CODE}</strong></p>
+    <p>Trainer code: <strong>${safe.TRAINER_CODE}</strong></p>
+    <p style="color:#666;">This code expires on ${safe.CODE_EXPIRES_AT}.</p>
+    <p style="font-size:12px;color:#666;">If you did not expect this email, you can ignore it.</p>
+  </body>
+</html>`;
+
   const payload = {
     from: RESEND_FROM_EMAIL,
     to: [clientEmail],
     subject: "You’ve been invited to Respyr",
-    reply_to: RESEND_REPLY_TO,
-    template: {
-      id: RESEND_TEMPLATE_ID,
-      variables: {
-        CLIENT_NAME: clientName,
-        TRAINER_NAME: trainerName,
-        TRAINER_CODE: trainerCode,
-
-        REDEEM_CODE: redeemCode,
-        CODE_EXPIRES_AT: codeExpiresAt,
-
-        PLAN_CODE: selectedPlan.plan_code,
-        PLAN_NAME: selectedPlan.plan_name,
-        PLAN_PRICE_LABEL: selectedPlan.plan_price_label,
-      },
-    },
+    html,
+    tags: [
+      { name: "kind", value: "client_invite" },
+      { name: "plan_code", value: String(selectedPlan.plan_code || "") },
+      { name: "template_id", value: String(RESEND_TEMPLATE_ID || "inline") },
+    ],
   };
+
+  // reply_to is optional — only include it when configured.
+  if (RESEND_REPLY_TO) {
+    payload.reply_to = RESEND_REPLY_TO;
+  }
 
   try {
     const response = await axios.post("https://api.resend.com/emails", payload, {
@@ -851,17 +890,11 @@ const sendTrainerClientInvite = async (req, res) => {
   let trainerCode = null;
 
   try {
-    // ── 0. Required Resend config (was resend_config.php constants) ──────────
-    const requiredEnv = {
-      RESEND_API_KEY,
-      RESEND_FROM_EMAIL,
-      RESEND_REPLY_TO,
-      RESEND_TEMPLATE_ID,
-    };
-    for (const [name, value] of Object.entries(requiredEnv)) {
-      if (!value) {
-        throw new ApiError(500, `${name} is not configured`);
-      }
+    // ── 0. Required Resend config ────────────────────────────────────────────
+    // Only the API key is truly required; FROM has a fallback and REPLY_TO /
+    // TEMPLATE_ID are optional (see the constants block above).
+    if (!RESEND_API_KEY) {
+      throw new ApiError(500, "RESEND_API_KEY is not configured");
     }
 
     // ── 1. Parse + validate the payload ──────────────────────────────────────
