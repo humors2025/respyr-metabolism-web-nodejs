@@ -209,8 +209,8 @@ async function writeAuthLogSafe(req, {
  * the same gates as PHP sas_get_super_admin_actor_by_email_or_fail(): active,
  * role = super_admin. Returns { actor, actorEmail } or { error }.
  *
- * Selects the extra role_id / role_created_at / role_updated_at /
- * dietician_joined_at columns the self-as-trainer row needs.
+ * Selects the extra role_id / role_created_at / role_updated_at columns the
+ * self-as-trainer row needs.
  */
 async function resolveSuperAdminFromToken(req) {
   const payload = req.user || {};
@@ -230,7 +230,6 @@ async function resolveSuperAdminFromToken(req) {
         td.email,
         td.location,
         td.is_reset_password,
-        td.dttm AS dietician_joined_at,
 
         aur.id AS role_id,
         aur.role,
@@ -412,9 +411,7 @@ async function buildSelfTrainerRow(actor, selfCode) {
   const joinedDate =
     (actor.role_created_at !== null && actor.role_created_at !== undefined && actor.role_created_at !== "")
       ? actor.role_created_at
-      : ((actor.dietician_joined_at !== null && actor.dietician_joined_at !== undefined && actor.dietician_joined_at !== "")
-        ? actor.dietician_joined_at
-        : null);
+      : null;
 
   const joinedDateStr = toMysqlDateTime(joinedDate);
 
