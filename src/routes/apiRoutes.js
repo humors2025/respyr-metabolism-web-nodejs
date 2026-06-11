@@ -206,6 +206,11 @@ const {
 
 
 const {
+  superAdminInviteTrainer,
+} = require("../controllers/dietitian/api/web/super-admin-invite-trainer");
+
+
+const {
   revokeUserInvite,
 } = require("../controllers/dietitian/api/web/revoke-user-invite");
 
@@ -592,6 +597,13 @@ router.post(
   "/dietitian/api/web/admin-invite-trainer",
   authMiddleware,
   adminInviteTrainer
+);
+
+
+router.post(
+  "/dietitian/api/web/super-admin-invite-trainer",
+  authMiddleware,
+  superAdminInviteTrainer
 );
 
 
