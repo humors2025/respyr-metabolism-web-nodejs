@@ -216,6 +216,11 @@ const {
 
 
 const {
+  superAdminRevokeTrainers,
+} = require("../controllers/dietitian/api/web/super-admin-revoke-trainers");
+
+
+const {
   revokeUserInvite,
 } = require("../controllers/dietitian/api/web/revoke-user-invite");
 
@@ -616,6 +621,13 @@ router.post(
   "/dietitian/api/web/super-admin-resend-trainers",
   authMiddleware,
   superAdminResendTrainers
+);
+
+
+router.post(
+  "/dietitian/api/web/super-admin-revoke-trainers",
+  authMiddleware,
+  superAdminRevokeTrainers
 );
 
 
