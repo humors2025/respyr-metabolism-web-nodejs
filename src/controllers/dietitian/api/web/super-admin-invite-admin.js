@@ -442,10 +442,16 @@ async function createPendingInvite({
   tokenHash,
   expiresAt,
 }) {
+  // invited_email_hash is a NOT-NULL column on app_user_invitations. Store a
+  // deterministic keyed hash of the email (same HMAC the token uses) so it is
+  // consistent and non-reversible without the pepper.
+  const invitedEmailHash = secureHash(email);
+
   const [result] = await pool.execute(
     `
       INSERT INTO app_user_invitations (
         invited_email,
+        invited_email_hash,
         invited_first_name,
         invited_last_name,
         invited_phone,
@@ -459,10 +465,11 @@ async function createPendingInvite({
         created_at,
         updated_at
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, UTC_TIMESTAMP(), UTC_TIMESTAMP())
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, UTC_TIMESTAMP(), UTC_TIMESTAMP())
     `,
     [
       email,
+      invitedEmailHash,
       firstName,
       lastName,
       phone,
