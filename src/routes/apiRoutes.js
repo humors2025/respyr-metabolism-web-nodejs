@@ -405,7 +405,7 @@ router.post(
 
 router.get(
   '/dietitian/api/web/get_profile_image',
-   authMiddleware,
+  //  authMiddleware,
   getProfileImageController.get_profile_image
 );
 
