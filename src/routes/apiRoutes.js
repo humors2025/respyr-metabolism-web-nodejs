@@ -417,11 +417,7 @@ router.get(
 
 
 router.post(
-  "/dietitian/api/web/get_clients_data_total_missed_test",
-  (req, res, next) => {
-    res.setHeader("X-Route-Version", "missed-test-route-v3");
-    next();
-  },
+  "/dietitian/api/web/get-clients-data-total-missed-test",
   authMiddleware,
   get_clients_data_total_missed_test
 );
