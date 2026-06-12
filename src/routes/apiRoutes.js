@@ -213,6 +213,11 @@ const {
 
 
 const {
+  getDataPointsScoreAllRangesCoach,
+} = require("../controllers/dietitian/api/web/get-data-points-score-all-ranges-coach");
+
+
+const {
   resendUserInvite,
 } = require("../controllers/dietitian/api/web/resend-user-invite");
 
@@ -633,6 +638,13 @@ router.post(
   "/dietitian/api/web/get-data-points-score-all-ranges-coach-masking",
   authMiddleware,
   getDataPointsScoreAllRangesCoachMasking
+);
+
+
+router.post(
+  "/dietitian/api/web/get-data-points-score-all-ranges-coach",
+  authMiddleware,
+  getDataPointsScoreAllRangesCoach
 );
 
 
