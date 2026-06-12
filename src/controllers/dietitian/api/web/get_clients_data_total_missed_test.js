@@ -125,6 +125,12 @@ const isValidHttpUrl = (str) => {
   }
 };
 
+// Public base for image URLs. Override per-env (e.g. http://localhost:3000 in dev);
+// trailing slash is stripped so we can concatenate the path safely.
+const PUBLIC_API_BASE_URL = (
+  process.env.PUBLIC_API_BASE_URL || "https://api.respyr.ai"
+).replace(/\/+$/, "");
+
 const getProfileImageUrl = (row) => {
   if (!row.profile_image) {
     return null;
@@ -137,7 +143,7 @@ const getProfileImageUrl = (row) => {
     return row.profile_image;
   }
 
-  return `/dietitian/api/web/get_profile_image?dietician_id=${encodeURIComponent(
+  return `${PUBLIC_API_BASE_URL}/dietitian/api/web/get_profile_image?dietician_id=${encodeURIComponent(
     row.dietician_id
   )}&profile_id=${encodeURIComponent(row.profile_id)}`;
 };
