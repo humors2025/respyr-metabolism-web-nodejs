@@ -1,5 +1,6 @@
 const pool = require("../../../../config/db");
 const { requireDieticianSelfAccess } = require("../../../../utils/accessControl");
+const { buildPublicBaseUrl } = require("../../../../utils/publicUrl");
 
 const ALLOWED_TYPES = ["all", "tested", "missed"];
 const PAGE_LIMIT = 10;
@@ -125,13 +126,7 @@ const isValidHttpUrl = (str) => {
   }
 };
 
-// Public base for image URLs. Override per-env (e.g. http://localhost:3000 in dev);
-// trailing slash is stripped so we can concatenate the path safely.
-const PUBLIC_API_BASE_URL = (
-  process.env.PUBLIC_API_BASE_URL || "https://api.respyr.ai"
-).replace(/\/+$/, "");
-
-const getProfileImageUrl = (row) => {
+const getProfileImageUrl = (row, baseUrl) => {
   if (!row.profile_image) {
     return null;
   }
@@ -143,12 +138,12 @@ const getProfileImageUrl = (row) => {
     return row.profile_image;
   }
 
-  return `${PUBLIC_API_BASE_URL}/dietitian/api/web/get_profile_image?dietician_id=${encodeURIComponent(
+  return `${baseUrl}/dietitian/api/web/get_profile_image?dietician_id=${encodeURIComponent(
     row.dietician_id
   )}&profile_id=${encodeURIComponent(row.profile_id)}`;
 };
 
-const formatClientRows = (rows, selectedDate) => {
+const formatClientRows = (rows, selectedDate, baseUrl) => {
   return rows.map((row) => {
     const rawScore = row.metabolism_score;
 
@@ -197,7 +192,7 @@ const formatClientRows = (rows, selectedDate) => {
         : null,
 
       p_created: row.dttm,
-      p_image: getProfileImageUrl(row),
+      p_image: getProfileImageUrl(row, baseUrl),
 
       level_type: Number(row.level_type ?? 1),
     };
@@ -495,7 +490,7 @@ exports.get_clients_data_total_missed_test = async (req, res) => {
         tested_total: Number(summary.tested_total ?? 0),
         missed_total: Number(summary.missed_total ?? 0),
       },
-      clients: formatClientRows(rows, selectedDate),
+      clients: formatClientRows(rows, selectedDate, buildPublicBaseUrl(req)),
     });
   } catch (error) {
     const safeLog = {

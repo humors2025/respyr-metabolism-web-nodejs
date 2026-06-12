@@ -23,6 +23,10 @@ module.exports.handler = serverless(app, {
       requestId: context.awsRequestId,
     });
 
+    // Expose the API Gateway stage (e.g. "v1") to the Express app so it can
+    // build absolute public URLs that include the stage segment dynamically.
+    request.apiGatewayStage = event.requestContext?.stage;
+
     return request;
   },
 });
