@@ -119,26 +119,12 @@ const get_calander_fill_data = async (req, res) => {
     requestedDieticianId = access.dieticianId;
 
     /**
-     * Role check.
-     * This endpoint is for dietician dashboard only.
+     * Authorization is fully enforced by requireDieticianSelfAccess:
+     * the JWT subject must match the requested dietician_id. No separate
+     * role gate is applied here, consistent with the other dietician
+     * dashboard endpoints (the issued role is super_admin/admin/trainer,
+     * never the literal "dietician").
      */
-    const role = req.user?.role ? String(req.user.role).toLowerCase() : null;
-
-    if (role !== "dietician") {
-      await writeAuditLog({
-        req,
-        action: "VIEW_CALENDAR_FILL_DATA",
-        resourceType: "dietician_calendar",
-        resourceId: requestedDieticianId,
-        status: "failure",
-        failureReason: "INVALID_ROLE",
-      });
-
-      return res.status(403).json({
-        status: false,
-        message: "Access denied",
-      });
-    }
 
     /**
      * Preserved your existing business logic:
