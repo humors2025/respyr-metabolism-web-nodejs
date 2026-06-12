@@ -218,6 +218,11 @@ const {
 
 
 const {
+  getGraphAllSevenTrendsGraph,
+} = require("../controllers/dietitian/api/web/get-graph-all-seven-trends-graph");
+
+
+const {
   resendUserInvite,
 } = require("../controllers/dietitian/api/web/resend-user-invite");
 
@@ -645,6 +650,15 @@ router.post(
   "/dietitian/api/web/get-data-points-score-all-ranges-coach",
   authMiddleware,
   getDataPointsScoreAllRangesCoach
+);
+
+
+// GET-only — matches the PHP REQUEST_METHOD gate. Identity is still token-bound
+// via authMiddleware + requireProfileAccess inside the controller.
+router.get(
+  "/dietitian/api/web/get-graph-all-seven-trends-graph",
+  authMiddleware,
+  getGraphAllSevenTrendsGraph
 );
 
 
