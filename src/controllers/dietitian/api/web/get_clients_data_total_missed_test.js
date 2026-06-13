@@ -66,10 +66,10 @@ const getMetabolismZone = (score) => {
     return null;
   }
 
-  if (numericScore >= 80) return "Optimal";
-  if (numericScore >= 70) return "Moderate";
+  if (numericScore >= 80) return "Strong";
+  if (numericScore >= 70) return "Steady";
 
-  return "Focus";
+  return "Building";
 };
 
 const formatFitnessGoal = (raw) => {
