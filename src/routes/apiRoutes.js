@@ -123,6 +123,10 @@ const {
 } = require("../controllers/dietitian/api/web/get-client-selected-habit-detail");
 
 const {
+  get_client_profile_details,
+} = require("../controllers/dietitian/api/web/get_client_profile_details");
+
+const {
   listAdminTrainerUsersJwt,
 } = require("../controllers/dietitian/api/web/list-admin-trainer-users-jwt");
 
@@ -524,6 +528,13 @@ router.post(
   "/dietitian/api/web/get-client-selected-habit-detail",
   authMiddleware,
   getClientSelectedHabitDetail
+);
+
+
+router.post(
+  "/dietitian/api/web/get_client_profile_details",
+  authMiddleware,
+  get_client_profile_details
 );
 
 
