@@ -76,7 +76,8 @@ const INVITE_EXPIRY_HOURS = Math.max(
 
 const FRONTEND_ACCEPT_INVITE_URL =
   process.env.FRONTEND_ACCEPT_INVITE_URL ||
-  "https://app.respyr.ai/accept-invite";
+  "https://api.respyr.ai/dietitian/api/web/accept-invite";
+  // "https://app.respyr.ai/accept-invite";
 
 const RESEND_API_KEY = process.env.RESEND_API_KEY || "";
 const RESEND_INVITE_TEMPLATE_ID = process.env.RESEND_INVITE_TEMPLATE_ID || "";
