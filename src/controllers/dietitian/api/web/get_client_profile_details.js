@@ -72,10 +72,10 @@ const isProduction =
   process.env.NODE_ENV === "production" ||
   Boolean(process.env.AWS_LAMBDA_FUNCTION_NAME);
 
-// Legacy default preserves PHP behaviour; override per-environment.
+// Image is served from the admin host; override per-environment.
 const PROFILE_IMAGE_BASE_URL =
   process.env.PROFILE_IMAGE_BASE_URL ||
-  "https://humorstech.com/dietitian/api/web/get_profile_image.php";
+  "https://www.admin.respyr.ai/dietitian/api/web/get_profile_image.php";
 
 /* ===============================
    Helpers
