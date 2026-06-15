@@ -247,6 +247,11 @@ const {
 
 
 const {
+  invitePreview,
+} = require("../controllers/dietitian/api/web/invite-preview");
+
+
+const {
   superAdminResendTrainers,
 } = require("../controllers/dietitian/api/web/super-admin-resend-trainers");
 
@@ -386,6 +391,15 @@ router.post(
   '/dietitian/api/web/accept-invite',
   loginIpRateLimiter,
   acceptInvite
+);
+
+// Public token-preview endpoint. No authMiddleware — read-only lookup keyed by
+// the single-use invite token, used to pre-fill the accept screen. IP
+// rate-limited to blunt enumeration / DB-abuse.
+router.post(
+  '/dietitian/api/web/invite-preview',
+  loginIpRateLimiter,
+  invitePreview
 );
 
 // 📊 Analytics
