@@ -242,6 +242,11 @@ const {
 
 
 const {
+  acceptInvite,
+} = require("../controllers/dietitian/api/web/accept-invite");
+
+
+const {
   superAdminResendTrainers,
 } = require("../controllers/dietitian/api/web/super-admin-resend-trainers");
 
@@ -373,6 +378,14 @@ router.post(
   '/auth/update_diatitian_password',
   passwordResetRateLimiter,
   updateDietitianPassword
+);
+
+// Public token-redemption endpoint. No authMiddleware — the single-use invite
+// token IS the credential. IP rate-limited to blunt DB-abuse / token guessing.
+router.post(
+  '/dietitian/api/web/accept-invite',
+  loginIpRateLimiter,
+  acceptInvite
 );
 
 // 📊 Analytics
