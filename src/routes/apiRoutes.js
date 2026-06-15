@@ -396,8 +396,16 @@ router.post(
 // Public token-preview endpoint. No authMiddleware — read-only lookup keyed by
 // the single-use invite token, used to pre-fill the accept screen. IP
 // rate-limited to blunt enumeration / DB-abuse.
+//
+// Mounted at BOTH paths on purpose: the API Gateway route is the flat
+// `/invite-preview` (after stage-strip Express sees `/invite-preview`), while
+// the rest of the app — and any caller using the full API path — uses
+// `/dietitian/api/web/invite-preview`. Accepting both means the endpoint
+// resolves no matter whether the gateway forwards the short path or rewrites it
+// to the full one, so it can never 404 at the Express layer over a prefix
+// mismatch.
 router.post(
-  '/dietitian/api/web/invite-preview',
+  ['/dietitian/api/web/invite-preview', '/invite-preview'],
   loginIpRateLimiter,
   invitePreview
 );
