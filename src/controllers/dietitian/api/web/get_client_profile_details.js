@@ -72,10 +72,12 @@ const isProduction =
   process.env.NODE_ENV === "production" ||
   Boolean(process.env.AWS_LAMBDA_FUNCTION_NAME);
 
-// Image is served from the admin host; override per-environment.
+// Points at the Node get_profile_image route (no .php). Override per-environment.
+// NOTE: that route is behind authMiddleware and needs both profile_id and
+// dietician_id query params — see p_image construction below.
 const PROFILE_IMAGE_BASE_URL =
   process.env.PROFILE_IMAGE_BASE_URL ||
-  "https://www.admin.respyr.ai/dietitian/api/web/get_profile_image.php";
+  "https://www.admin.respyr.ai/dietitian/api/web/get_profile_image";
 
 /* ===============================
    Helpers
@@ -400,7 +402,7 @@ const get_client_profile_details = async (req, res) => {
       p_image: row.profile_id
         ? `${PROFILE_IMAGE_BASE_URL}?profile_id=${encodeURIComponent(
             row.profile_id
-          )}`
+          )}&dietician_id=${encodeURIComponent(dietitianId)}`
         : "NA",
     };
 
