@@ -72,12 +72,13 @@ const isProduction =
   process.env.NODE_ENV === "production" ||
   Boolean(process.env.AWS_LAMBDA_FUNCTION_NAME);
 
-// Points at the Node get_profile_image route (no .php). Override per-environment.
-// NOTE: that route is behind authMiddleware and needs both profile_id and
-// dietician_id query params — see p_image construction below.
+// Points at the Node get_profile_image route on the API host (NOT the
+// admin.respyr.ai dashboard, which is a separate Next.js app and 404s here).
+// Override per-environment. NOTE: that route is behind authMiddleware and needs
+// both profile_id and dietician_id query params — see p_image construction below.
 const PROFILE_IMAGE_BASE_URL =
   process.env.PROFILE_IMAGE_BASE_URL ||
-  "https://www.admin.respyr.ai/dietitian/api/web/get_profile_image";
+  "https://api.respyr.ai/v1/dietitian/api/web/get_profile_image";
 
 /* ===============================
    Helpers
