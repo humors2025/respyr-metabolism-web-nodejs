@@ -392,35 +392,52 @@ function buildInPlaceholders(codes, params) {
 async function fetchSubscriptionRows(codes) {
   if (codes.length === 0) return [];
 
+  // Safe if the redeem_code column does not exist yet (parity with the PHP,
+  // which probed INFORMATION_SCHEMA before selecting it).
+  const subscriptionCols = await tableColumns("trainer_client_plan_subscriptions");
+  const redeemCodeSelect = subscriptionCols.redeem_code
+    ? "s.redeem_code"
+    : "NULL AS redeem_code";
+
   const params = [];
   const inList = buildInPlaceholders(codes, params);
 
   const [rows] = await pool.execute(
     `
       SELECT
-        id,
-        source_invite_id,
-        trainer_id,
-        trainer_code,
-        client_name,
-        client_mobile,
-        client_email,
-        plan_code,
-        plan_name,
-        plan_price_label,
-        status,
-        email_status,
-        resend_email_id,
-        accepted_profile_id,
-        accepted_at,
-        error_message,
-        created_by_user_id,
-        created_at,
-        updated_at
-      FROM trainer_client_plan_subscriptions
-      WHERE UPPER(trainer_code) IN (${inList})
-         OR UPPER(trainer_id) IN (${inList})
-      ORDER BY created_at DESC, id DESC
+        s.id,
+        s.source_invite_id,
+        s.trainer_id,
+        s.trainer_code,
+        ${redeemCodeSelect},
+        s.client_name,
+        s.client_mobile,
+        s.client_email,
+        s.plan_code,
+        s.plan_name,
+        s.plan_price_label,
+        s.status,
+        s.email_status,
+        s.resend_email_id,
+        s.accepted_profile_id,
+        s.accepted_at,
+        s.error_message,
+        s.created_by_user_id,
+        s.created_at,
+        s.updated_at,
+
+        tc.profile_id   AS mapped_accepted_profile_id,
+        tc.profile_name AS accepted_client_name,
+        tc.phone_no     AS accepted_client_phone,
+        tc.email        AS accepted_client_email,
+        tc.dietician_id AS accepted_client_dietician_id,
+        tc.dttm         AS accepted_client_joined_at
+      FROM trainer_client_plan_subscriptions s
+      LEFT JOIN table_clients tc
+        ON tc.profile_id = s.accepted_profile_id
+      WHERE UPPER(s.trainer_code) IN (${inList})
+         OR UPPER(s.trainer_id) IN (${inList})
+      ORDER BY s.created_at DESC, s.id DESC
     `,
     [...params, ...params]
   );
@@ -431,36 +448,71 @@ async function fetchSubscriptionRows(codes) {
 async function fetchInviteRows(codes) {
   if (codes.length === 0) return [];
 
+  // redeem_code for invite rows can only come from the linked subscription
+  // (direct latest_subscription_id, else the most recent source_invite_id row).
+  // Return NULL if the subscription table has no redeem_code column yet.
+  const subscriptionCols = await tableColumns("trainer_client_plan_subscriptions");
+  const subscriptionRedeemSelect = subscriptionCols.redeem_code
+    ? "COALESCE(ps_direct.redeem_code, ps_latest.redeem_code) AS subscription_redeem_code"
+    : "NULL AS subscription_redeem_code";
+
   const params = [];
   const inList = buildInPlaceholders(codes, params);
 
   const [rows] = await pool.execute(
     `
       SELECT
-        id,
-        trainer_id,
-        trainer_code,
-        client_name,
-        client_mobile,
-        client_email,
+        i.id,
+        i.trainer_id,
+        i.trainer_code,
+        i.client_name,
+        i.client_mobile,
+        i.client_email,
 
-        COALESCE(plan_code, 'free_trial') AS plan_code,
-        COALESCE(plan_name, 'Free Trial') AS plan_name,
-        plan_price_label,
-        latest_subscription_id,
+        COALESCE(i.plan_code, 'free_trial') AS plan_code,
+        COALESCE(i.plan_name, 'Free Trial') AS plan_name,
+        i.plan_price_label,
+        i.latest_subscription_id,
 
-        status,
-        email_status,
-        resend_email_id,
-        accepted_profile_id,
-        accepted_at,
-        error_message,
-        created_at,
-        updated_at
-      FROM trainer_client_invites
-      WHERE UPPER(trainer_code) IN (${inList})
-         OR UPPER(trainer_id) IN (${inList})
-      ORDER BY created_at DESC, id DESC
+        i.status,
+        i.email_status,
+        i.resend_email_id,
+        i.accepted_profile_id,
+        i.accepted_at,
+        i.error_message,
+        i.created_at,
+        i.updated_at,
+
+        ${subscriptionRedeemSelect},
+
+        tc.profile_id   AS mapped_accepted_profile_id,
+        tc.profile_name AS accepted_client_name,
+        tc.phone_no     AS accepted_client_phone,
+        tc.email        AS accepted_client_email,
+        tc.dietician_id AS accepted_client_dietician_id,
+        tc.dttm         AS accepted_client_joined_at
+      FROM trainer_client_invites i
+
+      LEFT JOIN trainer_client_plan_subscriptions ps_direct
+        ON ps_direct.id = i.latest_subscription_id
+
+      LEFT JOIN (
+        SELECT source_invite_id, MAX(id) AS latest_id
+        FROM trainer_client_plan_subscriptions
+        WHERE source_invite_id IS NOT NULL
+        GROUP BY source_invite_id
+      ) latest_sub
+        ON latest_sub.source_invite_id = i.id
+
+      LEFT JOIN trainer_client_plan_subscriptions ps_latest
+        ON ps_latest.id = latest_sub.latest_id
+
+      LEFT JOIN table_clients tc
+        ON tc.profile_id = i.accepted_profile_id
+
+      WHERE UPPER(i.trainer_code) IN (${inList})
+         OR UPPER(i.trainer_id) IN (${inList})
+      ORDER BY i.created_at DESC, i.id DESC
     `,
     [...params, ...params]
   );
@@ -565,6 +617,9 @@ async function fetchLegacyClientRows(codes, knownInviteKeys) {
       phone: row.client_mobile,
       email,
 
+      // Legacy rows have no subscription, hence no redeem code.
+      redeem_code: null,
+
       plan: {
         plan_code: "free_trial",
         plan_name: "Free Version",
@@ -577,6 +632,17 @@ async function fetchLegacyClientRows(codes, knownInviteKeys) {
       sent_on_date: toMysqlDateTime(row.created_on),
       accepted_profile_id: profileId !== "" ? profileId : null,
       accepted_at: toMysqlDateTime(row.created_on),
+
+      accepted_email: email,
+      accepted_client: {
+        profile_id: profileId !== "" ? profileId : null,
+        name: row.client_name,
+        phone: row.client_mobile,
+        email,
+        dietician_id: row.dietician_id,
+        joined_at: toMysqlDateTime(row.created_on),
+        matched_by: "table_clients_legacy",
+      },
 
       trainer_id: row.dietician_id,
       trainer_code: row.dietician_id,
@@ -604,11 +670,12 @@ async function fetchLegacyClientRows(codes, knownInviteKeys) {
 
 // ─── Row formatting ──────────────────────────────────────────────────────────
 
-function rowStatus(rawStatus, acceptedProfileId) {
+function rowStatus(rawStatus, acceptedProfileId, mappedAcceptedProfileId = null) {
   const status = String(rawStatus ?? "").toLowerCase();
   const accepted = cleanValue(acceptedProfileId);
+  const mapped = cleanValue(mappedAcceptedProfileId);
 
-  if (status === "accepted" || accepted !== "") return "accepted";
+  if (status === "accepted" || accepted !== "" || mapped !== "") return "accepted";
   if (status === "sent") return "pending";
   if (status === "failed") return "failed";
   if (status === "cancelled") return "cancelled";
@@ -625,8 +692,61 @@ function actionForStatus(status) {
   };
 }
 
+/**
+ * Strict rule (parity with the PHP getRedeemCodeFromRow): redeem_code may only
+ * come from trainer_client_plan_subscriptions. Subscription rows expose it as
+ * `redeem_code`; invite rows as `subscription_redeem_code` (from the linked
+ * subscription). Never trainer_code. Legacy rows have none.
+ */
+function getRedeemCodeFromRow(row) {
+  if (row.redeem_code !== undefined && cleanValue(row.redeem_code) !== "") {
+    return cleanValue(row.redeem_code);
+  }
+  if (
+    row.subscription_redeem_code !== undefined &&
+    cleanValue(row.subscription_redeem_code) !== ""
+  ) {
+    return cleanValue(row.subscription_redeem_code);
+  }
+  return null;
+}
+
+/**
+ * Build the accepted-client object from the table_clients LEFT JOIN, mapping
+ * accepted_profile_id -> table_clients.profile_id (parity with the PHP).
+ * Returns null when neither the raw nor the mapped profile id is present.
+ */
+function acceptedClientFromRow(row) {
+  const acceptedProfileId =
+    row.accepted_profile_id !== undefined ? cleanValue(row.accepted_profile_id) : "";
+  const mappedProfileId =
+    row.mapped_accepted_profile_id !== undefined
+      ? cleanValue(row.mapped_accepted_profile_id)
+      : "";
+
+  if (acceptedProfileId === "" && mappedProfileId === "") return null;
+
+  return {
+    profile_id: mappedProfileId !== "" ? mappedProfileId : acceptedProfileId,
+    name: row.accepted_client_name ?? null,
+    phone: row.accepted_client_phone ?? null,
+    email:
+      row.accepted_client_email !== undefined && row.accepted_client_email !== null
+        ? normalizeEmail(row.accepted_client_email)
+        : null,
+    dietician_id: row.accepted_client_dietician_id ?? null,
+    joined_at: toMysqlDateTime(row.accepted_client_joined_at),
+    matched_by: "accepted_profile_id",
+  };
+}
+
 function formatSubscriptionRow(row) {
-  const status = rowStatus(row.status, row.accepted_profile_id);
+  const acceptedClient = acceptedClientFromRow(row);
+  const status = rowStatus(
+    row.status,
+    row.accepted_profile_id,
+    row.mapped_accepted_profile_id
+  );
   return {
     source: "trainer_client_plan_subscriptions",
     subscription_id: Number(row.id),
@@ -638,6 +758,9 @@ function formatSubscriptionRow(row) {
     name: row.client_name,
     phone: row.client_mobile,
     email: normalizeEmail(row.client_email),
+
+    // New field; intentionally NOT added to `columns` to avoid a UI break.
+    redeem_code: getRedeemCodeFromRow(row),
 
     plan: {
       plan_code: row.plan_code,
@@ -651,6 +774,10 @@ function formatSubscriptionRow(row) {
     sent_on_date: toMysqlDateTime(row.created_at),
     accepted_profile_id: row.accepted_profile_id,
     accepted_at: toMysqlDateTime(row.accepted_at),
+
+    // New mapped fields (from the table_clients join); not in `columns`.
+    accepted_email: acceptedClient ? acceptedClient.email : null,
+    accepted_client: acceptedClient,
 
     trainer_id: row.trainer_id,
     trainer_code: row.trainer_code,
@@ -669,7 +796,12 @@ function formatSubscriptionRow(row) {
 }
 
 function formatInviteRow(row) {
-  const status = rowStatus(row.status, row.accepted_profile_id);
+  const acceptedClient = acceptedClientFromRow(row);
+  const status = rowStatus(
+    row.status,
+    row.accepted_profile_id,
+    row.mapped_accepted_profile_id
+  );
   return {
     source: "trainer_client_invites",
     subscription_id:
@@ -681,6 +813,9 @@ function formatInviteRow(row) {
     name: row.client_name,
     phone: row.client_mobile,
     email: normalizeEmail(row.client_email),
+
+    // Null unless the linked subscription has a redeem_code. Never trainer_code.
+    redeem_code: getRedeemCodeFromRow(row),
 
     plan: {
       plan_code: row.plan_code,
@@ -694,6 +829,10 @@ function formatInviteRow(row) {
     sent_on_date: toMysqlDateTime(row.created_at),
     accepted_profile_id: row.accepted_profile_id,
     accepted_at: toMysqlDateTime(row.accepted_at),
+
+    // New mapped fields (from the table_clients join); not in `columns`.
+    accepted_email: acceptedClient ? acceptedClient.email : null,
+    accepted_client: acceptedClient,
 
     trainer_id: row.trainer_id,
     trainer_code: row.trainer_code,
@@ -722,6 +861,9 @@ function buildKnownKeysFromInvites(inviteRows, subscriptionRows) {
     if (mobile !== "") keys.add("mobile:" + mobile);
     if (row.accepted_profile_id) {
       keys.add("profile:" + normalizeCode(row.accepted_profile_id));
+    }
+    if (row.mapped_accepted_profile_id) {
+      keys.add("profile:" + normalizeCode(row.mapped_accepted_profile_id));
     }
   };
 
