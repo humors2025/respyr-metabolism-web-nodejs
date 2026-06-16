@@ -79,7 +79,7 @@ const RETURN_INVITE_LINK_FOR_TESTING =
 
 const FRONTEND_ACCEPT_INVITE_URL =
   process.env.FRONTEND_ACCEPT_INVITE_URL ||
-  "https://www.admin.respyr.ai/signup";
+  "https://api.respyr.ai/signup";
 //   "https://api.respyr.ai/signup";
 
 const RESEND_API_KEY = process.env.RESEND_API_KEY || "";

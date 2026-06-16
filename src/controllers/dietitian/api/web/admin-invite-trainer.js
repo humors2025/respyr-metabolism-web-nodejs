@@ -72,7 +72,7 @@ const INVITE_EXPIRY_HOURS = Math.max(
 
 const FRONTEND_ACCEPT_INVITE_URL =
   process.env.FRONTEND_ACCEPT_INVITE_URL ||
-   "https://www.admin.respyr.ai/signup";
+   "https://api.respyr.ai/signup";
   // "https://api.respyr.ai/dietitian/api/web/accept-invite";
   // "https://app.respyr.ai/accept-invite";
 

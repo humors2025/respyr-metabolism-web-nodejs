@@ -66,7 +66,7 @@ const INVITE_EXPIRY_HOURS = Math.max(
 
 const FRONTEND_ACCEPT_INVITE_URL =
   process.env.FRONTEND_ACCEPT_INVITE_URL ||
-  "https://www.admin.respyr.ai/signup";
+  "https://api.respyr.ai/signup";
   //  "https://app.respyr.ai/accept-invite";
 
 const RESEND_API_KEY            = process.env.RESEND_API_KEY            || "";
