@@ -1,5 +1,8 @@
 const pool = require("../../../../config/db");
 const { requireProfileAccess } = require("../../../../utils/accessControl");
+const {
+  verifyProfileImageSignature,
+} = require("../../../../utils/imageUrlSigner");
 
 const MAX_IMAGE_BYTES = 5 * 1024 * 1024; // 5 MB
 
@@ -29,23 +32,50 @@ const setSecureImageHeaders = (res, contentType, length) => {
 
 exports.get_profile_image = async (req, res) => {
   try {
-    const access = await requireProfileAccess(
-      req,
-      req.query.dietician_id,
-      req.query.profile_id
-    );
+    // Two ways to authorize this request, in order:
+    //   1. Signed URL (sig + exp): minted by an already-authenticated dashboard
+    //      endpoint so the link can load in an <img> tag with no auth header.
+    //   2. Fallback: JWT/cookie access check (requireProfileAccess) for callers
+    //      that still issue unsigned URLs.
+    let profileId;
+    let dieticianId;
 
-    if (!access.allowed) {
-      return res.status(access.statusCode).json({
-        status: false,
-        ok: false,
-        message: access.message,
-      });
+    if (req.query.sig) {
+      const signed = verifyProfileImageSignature(req.query);
+      if (!signed.valid) {
+        return res.status(403).json({
+          status: false,
+          ok: false,
+          message: "Invalid or expired image link",
+        });
+      }
+      profileId = signed.profileId;
+      dieticianId = signed.dieticianId;
+    } else {
+      const access = await requireProfileAccess(
+        req,
+        req.query.dietician_id,
+        req.query.profile_id
+      );
+
+      if (!access.allowed) {
+        return res.status(access.statusCode).json({
+          status: false,
+          ok: false,
+          message: access.message,
+        });
+      }
+      profileId = access.profileId;
+      dieticianId = access.dieticianId;
     }
 
     const [rows] = await pool.execute(
-      "SELECT profile_image FROM table_clients WHERE profile_id = ? LIMIT 1",
-      [access.profileId]
+      `SELECT profile_image
+         FROM table_clients
+        WHERE profile_id = ?
+          AND UPPER(TRIM(dietician_id)) = ?
+        LIMIT 1`,
+      [profileId, dieticianId]
     );
 
     if (!rows.length || !rows[0].profile_image) {

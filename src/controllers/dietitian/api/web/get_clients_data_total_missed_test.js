@@ -1,6 +1,7 @@
 const pool = require("../../../../config/db");
 const { requireDieticianSelfAccess } = require("../../../../utils/accessControl");
 const { buildPublicBaseUrl } = require("../../../../utils/publicUrl");
+const { signProfileImageUrl } = require("../../../../utils/imageUrlSigner");
 
 const ALLOWED_TYPES = ["all", "tested", "missed"];
 const PAGE_LIMIT = 10;
@@ -138,9 +139,7 @@ const getProfileImageUrl = (row, baseUrl) => {
     return row.profile_image;
   }
 
-  return `${baseUrl}/dietitian/api/web/get_profile_image?dietician_id=${encodeURIComponent(
-    row.dietician_id
-  )}&profile_id=${encodeURIComponent(row.profile_id)}`;
+  return signProfileImageUrl(baseUrl, row.dietician_id, row.profile_id);
 };
 
 const formatClientRows = (rows, selectedDate, baseUrl) => {
