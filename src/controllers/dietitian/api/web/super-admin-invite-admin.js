@@ -520,48 +520,12 @@ async function markInviteSent(invitationId) {
 // ─── Email via Resend ────────────────────────────────────────────────────────
 
 /**
- * Render the invite email body. Variables are HTML-escaped to prevent
- * template injection if any field somehow bypassed validateInviteInput().
- */
-function escapeHtml(s) {
-  return String(s)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;");
-}
-
-function renderInviteHtml(vars) {
-  const safe = {};
-  for (const [k, v] of Object.entries(vars)) safe[k] = escapeHtml(v ?? "");
-
-  return `<!doctype html>
-<html>
-  <body style="font-family: Arial, sans-serif; color:#222; line-height:1.5;">
-    <p>Hi ${safe.INVITED_NAME},</p>
-    <p>${safe.INVITER_EMAIL} has invited you to Respyr as a <strong>${safe.INVITED_ROLE}</strong>.</p>
-    <p>Your partner code: <strong>${safe.PARTNER_CODE}</strong></p>
-    <p>
-      <a href="${safe.INVITE_LINK}"
-         style="display:inline-block;padding:10px 18px;background:#0a7d3b;color:#fff;text-decoration:none;border-radius:6px;">
-        Accept your invitation
-      </a>
-    </p>
-    <p>This invitation expires in ${safe.EXPIRES_IN}.</p>
-    <p style="font-size:12px;color:#666;">If you did not expect this email, you can ignore it.</p>
-  </body>
-</html>`;
-}
-
-/**
  * Sends the invite email via Resend's /emails endpoint. Returns
  * { ok: boolean, status?: number, error?: any }.
  *
- * NOTE: Resend does not have first-class server-side templates with variable
- * substitution. The PHP RESEND_INVITE_TEMPLATE_ID is logged for parity and
- * audit traceability, but the rendering is done here. If you later migrate
- * to a templating provider (e.g. Postmark), swap renderInviteHtml() out.
+ * Sends via the published Resend "admin_trainer_invitation" template
+ * (template id + variables). Resend substitutes the {{{VAR}}} placeholders
+ * server-side, so no HTML is rendered in this service.
  */
 async function sendResendTemplateEmail(toEmail, subject, templateId, vars) {
   if (!RESEND_API_KEY) {
@@ -569,6 +533,7 @@ async function sendResendTemplateEmail(toEmail, subject, templateId, vars) {
   }
 
   try {
+
     const response = await axios.post(
       "https://api.resend.com/emails",
       {
@@ -576,10 +541,10 @@ async function sendResendTemplateEmail(toEmail, subject, templateId, vars) {
         to:      [toEmail],
         subject: subject,
         // Send via the published Resend "admin_trainer_invitation" template.
-        // When a template is used you must NOT also send html/text/react —
-        // Resend rejects that combination. Every {{{VAR}}} the template uses
-        // must be present in `vars` or Resend returns 422; extra variables are
-        // ignored safely. subject/from here override the template's defaults.
+        // Resend rejects html/text/react when a template is supplied; every
+        // {{VAR}} the template uses must be present in `vars` or Resend
+        // returns 422 (extra variables are ignored). from/subject here
+        // override the template's own defaults.
         template: {
           id: templateId,
           variables: vars,
