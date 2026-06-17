@@ -70,7 +70,7 @@ const FRONTEND_ACCEPT_INVITE_URL =
   //  "https://app.respyr.ai/accept-invite";
 
 const RESEND_API_KEY            = process.env.RESEND_API_KEY            || "";
-const RESEND_INVITE_TEMPLATE_ID = process.env.RESEND_INVITE_TEMPLATE_ID || "";
+const RESEND_INVITE_TEMPLATE_ID = process.env.RESEND_INVITE_TEMPLATE_ID || "admin_trainer_invitation";
 const RESEND_FROM_EMAIL         = process.env.RESEND_FROM_EMAIL         || "Respyr <no-reply@respyr.ai>";
 
 const APP_DEBUG = process.env.NODE_ENV !== "production";
@@ -309,7 +309,7 @@ function validateInviteInput(body) {
   // Disallow control chars in names — defends against CRLF injection
   // and bidi-override smuggling into downstream email templates.
   // eslint-disable-next-line no-control-regex
-  const nameSafeRegex = /^[^ -]+$/;
+  const nameSafeRegex = /^[^\x00-\x1f\x7f]+$/;
   if (!nameSafeRegex.test(firstName) || !nameSafeRegex.test(lastName)) {
     return { ok: false, status: 400, message: "Names contain invalid characters" };
   }
@@ -569,15 +569,21 @@ async function sendResendTemplateEmail(toEmail, subject, templateId, vars) {
   }
 
   try {
-    const html = renderInviteHtml(vars);
-
     const response = await axios.post(
       "https://api.resend.com/emails",
       {
         from:    RESEND_FROM_EMAIL,
         to:      [toEmail],
         subject: subject,
-        html,
+        // Send via the published Resend "admin_trainer_invitation" template.
+        // When a template is used you must NOT also send html/text/react —
+        // Resend rejects that combination. Every {{{VAR}}} the template uses
+        // must be present in `vars` or Resend returns 422; extra variables are
+        // ignored safely. subject/from here override the template's defaults.
+        template: {
+          id: templateId,
+          variables: vars,
+        },
         headers: {
           // Aids deliverability / threading in the recipient's client.
           "X-Entity-Ref-ID": `invite-${vars.PARTNER_CODE}`,
