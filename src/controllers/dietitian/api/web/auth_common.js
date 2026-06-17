@@ -698,37 +698,10 @@ function escapeHtml(s) {
 }
 
 /**
- * Inline invite email body. Every variable is HTML-escaped to prevent template
- * injection if a field somehow bypassed validateInviteInput().
- */
-function renderInviteHtml(vars) {
-  const safe = {};
-  for (const [k, v] of Object.entries(vars)) safe[k] = escapeHtml(v ?? "");
-
-  return `<!doctype html>
-<html>
-  <body style="font-family: Arial, sans-serif; color:#222; line-height:1.5;">
-    <p>Hi ${safe.INVITED_NAME},</p>
-    <p>${safe.INVITER_EMAIL} has invited you to Respyr as a <strong>${safe.INVITED_ROLE}</strong>.</p>
-    <p>Your partner code: <strong>${safe.PARTNER_CODE}</strong></p>
-    <p>
-      <a href="${safe.INVITE_LINK}"
-         style="display:inline-block;padding:10px 18px;background:#0a7d3b;color:#fff;text-decoration:none;border-radius:6px;">
-        Accept your invitation
-      </a>
-    </p>
-    <p>This invitation expires in ${safe.EXPIRES_IN}.</p>
-    <p style="font-size:12px;color:#666;">If you did not expect this email, you can ignore it.</p>
-  </body>
-</html>`;
-}
-
-/**
  * PHP sendResendTemplateEmail(). Sends via Resend's /emails endpoint over HTTPS
- * with a hard timeout. Resend's public /emails API has no server-side template
- * variable substitution, so the body is rendered here; templateId is passed
- * through as a tag for audit traceability/parity. Returns
- * { ok, http_code, error, data }.
+ * with a hard timeout, using the published "admin_trainer_invitation" template.
+ * Resend substitutes the {{{VAR}}} placeholders server-side, so no HTML is
+ * rendered here. Returns { ok, http_code, error, data }.
  */
 async function sendResendTemplateEmail(toEmail, subject, templateId, variables) {
   if (!RESEND_API_KEY) {
@@ -748,7 +721,15 @@ async function sendResendTemplateEmail(toEmail, subject, templateId, variables) 
         to: [toEmail],
         subject,
         reply_to: RESEND_REPLY_TO,
-        html: renderInviteHtml(variables),
+        // Send via the published Resend "admin_trainer_invitation" template.
+        // Resend rejects html/text/react when a template is supplied; every
+        // {{VAR}} the template uses must be present in `variables` or Resend
+        // returns 422 (extra variables are ignored). from/subject here
+        // override the template's own defaults.
+        template: {
+          id: templateId,
+          variables: variables,
+        },
         headers: { "X-Entity-Ref-ID": `invite-${variables.PARTNER_CODE}` },
         tags: [
           { name: "kind", value: "invite" },
@@ -833,6 +814,5 @@ module.exports = {
   markInviteSent,
 
   // email
-  renderInviteHtml,
   sendResendTemplateEmail,
 };
