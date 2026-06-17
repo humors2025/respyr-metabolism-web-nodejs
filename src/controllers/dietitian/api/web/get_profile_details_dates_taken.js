@@ -45,14 +45,14 @@ const getZone = (score) => {
   }
 
   if (numericScore < 70) {
-    return "Focus";
+    return "Building";
   }
 
   if (numericScore >= 70 && numericScore < 80) {
-    return "Moderate";
+    return "Steady";
   }
 
-  return "Optimal";
+  return "Strong";
 };
 
 const getEmptyMacroSummary = () => ({
@@ -145,6 +145,15 @@ const formatDisplayDate = (dateValue) => {
 };
 
 const get_profile_details_dates_taken = async (req, res) => {
+  // HIPAA: PHI responses must never be cached by browsers or intermediaries.
+  res.setHeader("Cache-Control", "no-store");
+  res.setHeader("Pragma", "no-cache");
+
+  // VAPT: method gate (parity with the PHP REQUEST_METHOD check).
+  if (req.method !== "POST") {
+    return sendResponse(res, 405, false, "Only POST method is allowed");
+  }
+
   try {
     const body = req.body;
 
