@@ -490,7 +490,7 @@ exports.get_clients_data_total_missed_test = async (req, res) => {
         tested_total: Number(summary.tested_total ?? 0),
         missed_total: Number(summary.missed_total ?? 0),
       },
-      clients: formatClientRows(rows, selectedDate, "https://api.respyr.ai"),
+      clients: formatClientRows(rows, selectedDate, buildPublicBaseUrl(req)),
     });
   } catch (error) {
     const safeLog = {
