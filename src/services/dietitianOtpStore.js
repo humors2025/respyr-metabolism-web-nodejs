@@ -75,7 +75,8 @@ function intEnv(name, def, min, max) {
 }
 
 const OTP_LENGTH = intEnv("OTP_LENGTH", 6, 4, 10);
-const OTP_TTL_SECONDS = intEnv("OTP_TTL_SECONDS", 300, 30, 3600);
+// const OTP_TTL_SECONDS = intEnv("OTP_TTL_SECONDS", 300, 30, 3600);
+const OTP_TTL_SECONDS = intEnv("OTP_TTL_SECONDS", 60, 30, 3600);
 const OTP_RESEND_COOLDOWN_SECONDS = intEnv("OTP_RESEND_COOLDOWN_SECONDS", 60, 0, 3600);
 const OTP_MAX_VERIFY_ATTEMPTS = intEnv("OTP_MAX_VERIFY_ATTEMPTS", 5, 1, 20);
 const OTP_BCRYPT_ROUNDS = intEnv("OTP_BCRYPT_ROUNDS", 10, 8, 14);
