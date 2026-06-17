@@ -17,7 +17,8 @@
  *    ALWAYS return the same generic 200, doing equal work (dummy bcrypt) whether
  *    or not the account exists, so timing/response cannot reveal membership.
  *  - Resend cooldown prevents email-bombing a victim.
- *  - Email is sent via Resend (the project's provider), not PHP mail().
+ *  - Email is sent via the Resend "email-verification" template (NOT inline HTML).
+ *    The template must be PUBLISHED and use the {{{OTP}}} variable (uppercase).
  *
  * No DB tables added/removed — reads table_dietician only; audits app_auth_logs.
  */
@@ -38,6 +39,12 @@ const SECURITY_PEPPER = process.env.SECURITY_PEPPER || process.env.JWT_SECRET ||
 const RESEND_API_KEY = process.env.RESEND_API_KEY || "";
 const RESEND_FROM_EMAIL =
   process.env.RESEND_FROM_EMAIL || "Respyr <no-reply@respyr.ai>";
+
+// Resend template alias for the OTP email. Defaults to the published
+// "email-verification" template so a missing env var can't send an empty
+// template id (the same 422 that hit the invites_client flow).
+const RESEND_OTP_TEMPLATE_ID =
+  process.env.RESEND_OTP_TEMPLATE_ID || "email-verification";
 
 const GENERIC_MESSAGE =
   "Verification code has been sent to your email.";
@@ -91,32 +98,7 @@ async function writeAuthLogSafe(req, { eventType, userId, identifier, success, f
   }
 }
 
-function escapeHtml(s) {
-  return String(s)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;");
-}
-
-function renderOtpHtml(name, otp, ttlMinutes) {
-  const safeName = escapeHtml(name || "there");
-  const safeOtp = escapeHtml(otp);
-  return `<!doctype html>
-<html>
-  <body style="font-family:Arial,sans-serif;font-size:16px;color:#0B1A15;line-height:1.5;">
-    <p>Hi ${safeName},</p>
-    <p>Use the verification code below to reset your Respyr password:</p>
-    <p style="font-size:30px;letter-spacing:8px;margin:16px 0;"><strong>${safeOtp}</strong></p>
-    <p>This code expires in ${ttlMinutes} minutes. If you did not request a password
-       reset, you can safely ignore this email — your password will not change.</p>
-    <p style="font-size:12px;color:#666;">For your security, never share this code with anyone.</p>
-  </body>
-</html>`;
-}
-
-/** Send the OTP email via Resend. Returns { ok, status?, error? }. */
+/** Send the OTP email via the Resend "email-verification" template. Returns { ok, status?, error? }. */
 async function sendOtpEmail(toEmail, name, otp, ttlMinutes) {
   if (!RESEND_API_KEY) {
     return { ok: false, status: 0, error: "RESEND_API_KEY not configured" };
@@ -127,8 +109,22 @@ async function sendOtpEmail(toEmail, name, otp, ttlMinutes) {
       {
         from: RESEND_FROM_EMAIL,
         to: [toEmail],
-        subject: "Your Respyr password reset code",
-        html: renderOtpHtml(name, otp, ttlMinutes),
+        // When a template is used you must NOT also send html/text/react —
+        // Resend rejects that combination. subject/from here override the
+        // template's own defaults; delete `subject` to use the template's.
+        subject: "Your Respyr verification code",
+        template: {
+          id: RESEND_OTP_TEMPLATE_ID,
+          variables: {
+            // Names must match the {{{...}}} variables in the Resend template.
+            // The published email-verification template only uses OTP; NAME and
+            // TTL_MINUTES are sent for forward-compatibility and are ignored if
+            // the template does not reference them (extra variables are safe).
+            OTP: String(otp),
+            NAME: name || "there",
+            TTL_MINUTES: String(ttlMinutes),
+          },
+        },
         tags: [{ name: "kind", value: "password_reset_otp" }],
       },
       {
