@@ -247,6 +247,11 @@ const {
 
 
 const {
+  agreementUploadUrl,
+} = require("../controllers/dietitian/api/web/agreement-upload-url");
+
+
+const {
   invitePreview,
 } = require("../controllers/dietitian/api/web/invite-preview");
 
@@ -391,6 +396,13 @@ router.post(
   '/dietitian/api/web/accept-invite',
   loginIpRateLimiter,
   acceptInvite
+);
+
+
+router.post(
+  ["/dietitian/api/web/agreement-upload-url", "/agreement-upload-url"],
+  loginIpRateLimiter,
+  agreementUploadUrl
 );
 
 // Public token-preview endpoint. No authMiddleware — read-only lookup keyed by
