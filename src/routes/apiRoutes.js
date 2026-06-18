@@ -101,6 +101,11 @@ const {
 
 
 const {
+  foodJsonSuggestionApprovePlan,
+} = require("../controllers/dietitian/api/web/food_json_suggestion_approve_plan");
+
+
+const {
   levelTypeUpdateChange,
 } = require("../controllers/dietitian/api/web/level-type-update-change");
 
@@ -539,6 +544,13 @@ router.post(
   "/dietitian/api/web/trainer-update-weekly-food-json",
   authMiddleware,
   trainerUpdateWeeklyFoodJson
+);
+
+
+router.post(
+  "/dietitian/api/web/food_json_suggestion_approve_plan",
+  authMiddleware,
+  foodJsonSuggestionApprovePlan
 );
 
 
