@@ -4,6 +4,13 @@ const app = require("./src/index");
 module.exports.handler = serverless(app, {
   basePath: false,
 
+  // Binary responses (profile images from get_profile_image) must be
+  // base64-encoded with isBase64Encoded:true so API Gateway returns the raw
+  // bytes instead of UTF-8-mangling them into a corrupt/broken image. JSON
+  // responses are unaffected — they stay text. Requires the API Gateway
+  // binaryMediaTypes to include "*/*" (see deploy notes).
+  binary: ["image/png", "image/jpeg", "image/webp"],
+
   request: function (request, event, context) {
     /**
      * Safe Lambda logging only.
