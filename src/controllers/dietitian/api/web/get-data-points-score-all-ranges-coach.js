@@ -53,6 +53,8 @@ const {
   normalizeDieticianId,
   requireProfileAccess,
 } = require("../../../../utils/accessControl");
+const { buildPublicBaseUrl } = require("../../../../utils/publicUrl");
+const { signProfileImageUrl } = require("../../../../utils/imageUrlSigner");
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -198,26 +200,31 @@ const formatDisplayDate = (dateString) => {
   return `${String(day).padStart(2, "0")} ${shortMonths[month]}, ${year}`;
 };
 
-const resolveProfileImage = (profileImage, profileId) => {
+const resolveProfileImage = (profileImage, profileId, dieticianId, baseUrl) => {
   if (!profileImage) return null;
 
-  const image = String(profileImage).trim();
+  // mysql2 may hand back the column as a Buffer (BLOB-stored image) rather than
+  // a string URL. A Buffer is image bytes, not an external link — fall straight
+  // through to the signed Node route that streams those bytes.
+  if (typeof profileImage === "string") {
+    const image = profileImage.trim();
+    if (!image) return null;
 
-  if (!image) return null;
-
-  try {
-    const url = new URL(image);
-
-    if (url.protocol === "https:" || url.protocol === "http:") {
-      return image;
+    try {
+      const url = new URL(image);
+      if (url.protocol === "https:" || url.protocol === "http:") {
+        return image;
+      }
+    } catch (_) {
+      // Not a full URL. Fall through to the signed Node route below.
     }
-  } catch (_) {
-    // Not a full URL. Fallback below.
   }
 
-  return `https://humorstech.com/dietitian/api/web/get_profile_image.php?profile_id=${encodeURIComponent(
-    profileId
-  )}`;
+  // Short-lived signed link to the Node get_profile_image route (NOT the legacy
+  // PHP endpoint). Loads in an <img> tag without an auth header and is bound to
+  // dietician_id + profile_id + expiry, so it can't be enumerated. Returns null
+  // when ids/baseUrl are unavailable.
+  return signProfileImageUrl(baseUrl, dieticianId, profileId);
 };
 
 const parseFoodType = (foodTypeRaw) => {
@@ -524,6 +531,10 @@ const getDataPointsScoreAllRangesCoach = async (req, res) => {
       return sendResponse(res, access.statusCode, false, access.message);
     }
 
+    // Absolute base (scheme + host + stage) used to mint signed profile-image
+    // links; derived from the request, override via PUBLIC_API_BASE_URL in dev.
+    const baseUrl = buildPublicBaseUrl(req);
+
     // =========================
     // TOTAL TEST TAKEN
     // =========================
@@ -590,7 +601,9 @@ const getDataPointsScoreAllRangesCoach = async (req, res) => {
       email: cleanString(profileRow.email, "NA"),
       profile_image: resolveProfileImage(
         profileRow.profile_image,
-        profileRow.profile_id
+        profileRow.profile_id,
+        access.dieticianId,
+        baseUrl
       ),
       dob: cleanString(profileRow.dob, "NA"),
       age: cleanString(profileRow.age, "NA"),
