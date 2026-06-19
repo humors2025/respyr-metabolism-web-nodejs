@@ -24,8 +24,16 @@ const setSecureImageHeaders = (res, contentType, length) => {
   res.setHeader("Content-Type", contentType);
   res.setHeader("Content-Length", length);
   res.setHeader("X-Content-Type-Options", "nosniff");
-  res.setHeader("Content-Security-Policy", "default-src 'none'");
-  res.setHeader("Cross-Origin-Resource-Policy", "same-origin");
+  // Lock everything down BUT allow the image itself to render. A bare
+  // "default-src 'none'" also blocks the <img> in the synthetic document the
+  // browser builds when the URL is opened directly, producing a broken-image
+  // icon even though the bytes are a valid image. img-src 'self' fixes that
+  // while still blocking scripts/objects/frames. nosniff keeps the declared
+  // type authoritative, so this stays safe for user-uploaded content.
+  res.setHeader("Content-Security-Policy", "default-src 'none'; img-src 'self'");
+  // cross-origin so the dashboard (a different origin than api.respyr.ai) can
+  // embed the image in an <img> tag. The signed sig/exp still gate access.
+  res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
   res.setHeader("Referrer-Policy", "no-referrer");
   res.setHeader("Cache-Control", "private, max-age=3600, no-transform");
 };
