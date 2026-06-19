@@ -174,9 +174,17 @@ function buildDashboardRoute(role) {
   return '/login';
 }
 
+// Points at the Node logo endpoint (src/controllers/.../get_dietician_logo.js),
+// mounted at /dietitian/api/web/get_dietician_logo and exposed publicly under
+// the /v1 prefix. Base host is configurable; defaults to the API host.
+const LOGO_BASE_URL = (
+  process.env.PUBLIC_API_BASE_URL || 'https://api.respyr.ai'
+).replace(/\/+$/, '');
+
 function buildLogoUrl(dieticianId) {
   return (
-    'https://humorstech.com/humors_app/app_final/dieticianapp/api/get_dietician_logo.php?dietician_id=' +
+    LOGO_BASE_URL +
+    '/v1/dietitian/api/web/get_dietician_logo?dietician_id=' +
     encodeURIComponent(dieticianId)
   );
 }
