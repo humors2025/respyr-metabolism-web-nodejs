@@ -13,19 +13,25 @@
  * Authorized : super_admin | admin | trainer — but ONLY for a trainer code the
  *              actor is allowed to use (own code, or a child trainer's code).
  *
- * Behaviour parity with the PHP:
- *  - Resolves the trusted plan (referral_plans table if present, else the
- *    hard-coded backend plan map) — invalid plan_code → 400.
- *  - Prevents a duplicate pending invite for the same (trainer_code, client_email,
- *    plan_code) → 409.
- *  - Creates a trainer_client_plan_subscriptions row (unique RSP###### redeem code
- *    + expiry), then upserts the latest trainer_client_invites row WITHOUT
- *    clobbering an already-accepted invite.
+ * Behaviour parity with the PHP (Free-Trial-only flow):
+ *  - No plan_code is accepted from the frontend. Every invite is a Free Trial
+ *    (FREE_TRIAL_DAYS=7, MAX_FREE_TRIAL_DAYS=15). The redeem code expires after
+ *    FREE_TRIAL_DAYS (NOT the generic 30-day window).
+ *  - Rejects a duplicate ACTIVE pending free-trial invite for the same
+ *    (trainer_code, client_email) — i.e. status='sent', subscription_status=
+ *    'pending', code not yet expired → 409 (with the existing code + expiry).
+ *  - Creates a trainer_client_plan_subscriptions row (unique RSP###### redeem
+ *    code + 7-day expiry). Optional trial_* columns are populated only if they
+ *    exist (detected via INFORMATION_SCHEMA, exactly like the PHP).
+ *  - Upserts the latest trainer_client_invites row WITHOUT clobbering an
+ *    already-accepted invite (matched by trainer_id OR trainer_code + email).
  *  - Sends the invite email via the SAME Resend template payload as the PHP
- *    (template id + variables) — see client-subscription-action-common.sendEmail.
+ *    (template id + variables incl. TRIAL_DAYS / MAX_TRIAL_DAYS).
  *  - Writes the email result back to both rows (the invite row update is guarded
  *    against the accepted state).
- *  - Response shape matches the PHP exactly: { status, ok, message, data{...} }.
+ *  - Response shape matches the PHP: { status, ok, message, data{...} } with the
+ *    trial_started_at / trial_expires_at / trial_days_total / max_trial_days
+ *    fields.
  *
  * VAPT hardening (beyond the PHP — the point of the sprint):
  *  - Token-bound identity. The PHP only checked authorization when the caller
@@ -36,7 +42,9 @@
  *    code — there is no unauthenticated / unauthorized path. body.actor_user_id is
  *    still accepted for frontend back-compat but is only cross-checked against the
  *    token identity (mismatch → 403); it can never select another user.
- *  - Every query is fully parameterized; redeem codes use a CSPRNG.
+ *  - Every query is fully parameterized; redeem codes use a CSPRNG. The only
+ *    interpolated SQL identifiers are the optional trial column names, chosen
+ *    from a hardcoded whitelist (never raw user input).
  *  - Internal error / email-provider details are suppressed in production
  *    (gated behind APP_DEBUG). The PHP forced API_DEBUG=true and echoed file/
  *    line/message — an info-disclosure finding closed here.
@@ -49,12 +57,11 @@
  *
  * Shared logic (scalar helpers, actor resolution, allowed codes, redeem code,
  * email, audit) lives in client-subscription-action-common.js. Only the
- * send-invite-specific SQL (plan lookup, dup-check, subscription/invite creation)
- * stays here.
+ * send-invite-specific SQL (dup-check, subscription/invite creation) stays here.
  *
  * NOTE: No DB tables are added or removed vs. the PHP — same table_dietician,
- * app_user_roles, referral_plans (optional), trainer_client_invites,
- * trainer_client_plan_subscriptions, app_auth_logs.
+ * app_user_roles, trainer_client_invites, trainer_client_plan_subscriptions,
+ * app_auth_logs.
  */
 
 const pool = require("../../../../config/db");
@@ -66,43 +73,35 @@ const {
   RESEND_API_KEY,
 } = csi;
 
-// ─── Endpoint-specific constants ──────────────────────────────────────────────
+// ─── Endpoint-specific constants (was the define()s) ──────────────────────────
 
-// Hard-coded trusted backend plan map (fallback when referral_plans is absent).
-const FALLBACK_PLANS = {
-  free_trial: {
-    plan_code: "free_trial",
-    plan_name: "Free Trial",
-    plan_price_label: "Free",
-    amount: "0.00",
-    currency: "USD",
-    billing_cycle: "trial",
-  },
-  monthly: {
-    plan_code: "monthly",
-    plan_name: "Monthly Plan",
-    plan_price_label: "$50/mo",
-    amount: "50.00",
-    currency: "USD",
-    billing_cycle: "monthly",
-  },
-  lease_quarterly: {
-    plan_code: "lease_quarterly",
-    plan_name: "Lease (Quarterly)",
-    plan_price_label: "$150",
-    amount: "150.00",
-    currency: "USD",
-    billing_cycle: "quarterly",
-  },
-  yearly: {
-    plan_code: "yearly",
-    plan_name: "Yearly Plan",
-    plan_price_label: "$300/yr",
-    amount: "300.00",
-    currency: "USD",
-    billing_cycle: "yearly",
-  },
+const FREE_TRIAL_DAYS = Math.max(
+  1,
+  parseInt(process.env.FREE_TRIAL_DAYS, 10) || 7
+);
+const MAX_FREE_TRIAL_DAYS = Math.max(
+  FREE_TRIAL_DAYS,
+  parseInt(process.env.MAX_FREE_TRIAL_DAYS, 10) || 15
+);
+
+// The fixed backend Free-Trial plan (PHP getDefaultFreeTrialPlan()).
+const FREE_TRIAL_PLAN = {
+  plan_code: "free_trial",
+  plan_name: "Free Trial",
+  plan_price_label: "Free",
 };
+
+// Optional trial columns that are populated only when present in the table.
+// Hardcoded whitelist — these identifiers are the only ones interpolated into
+// SQL, and they never come from user input.
+const OPTIONAL_TRIAL_COLUMNS = [
+  "trial_started_at",
+  "trial_expires_at",
+  "trial_days_total",
+  "trial_extended_days",
+  "trial_extended_at",
+  "trial_extended_by_user_id",
+];
 
 // ─── Endpoint-specific helpers ────────────────────────────────────────────────
 
@@ -125,52 +124,18 @@ function formatDbDateTime(val) {
   return String(val);
 }
 
-/** @phpparity tableExists */
-async function tableExists(conn, tableName) {
+/** @phpparity tableColumns — set of column names that exist on a table. */
+async function tableColumns(conn, tableName) {
   const [rows] = await conn.execute(
-    `SELECT COUNT(*) AS total
-       FROM INFORMATION_SCHEMA.TABLES
+    `SELECT COLUMN_NAME
+       FROM INFORMATION_SCHEMA.COLUMNS
       WHERE TABLE_SCHEMA = DATABASE()
         AND TABLE_NAME = ?`,
     [tableName]
   );
-  return rows.length > 0 && Number(rows[0].total) > 0;
-}
-
-/**
- * @phpparity getTrustedPlanByCode — prefer referral_plans (if present), else the
- * hard-coded backend plan map. Invalid → ApiError 400.
- */
-async function getTrustedPlanByCode(conn, planCodeInput) {
-  let planCode = csi.clean(planCodeInput).toLowerCase();
-  if (planCode === "") planCode = "free_trial";
-
-  if (await tableExists(conn, "referral_plans")) {
-    const [rows] = await conn.execute(
-      `SELECT plan_code, plan_name, plan_price_label, amount, currency, billing_cycle
-         FROM referral_plans
-        WHERE plan_code = ?
-          AND status = 'active'
-        LIMIT 1`,
-      [planCode]
-    );
-    if (rows[0]) {
-      const r = rows[0];
-      return {
-        plan_code: r.plan_code,
-        plan_name: r.plan_name,
-        plan_price_label: r.plan_price_label,
-        amount: r.amount ?? null,
-        currency: r.currency ?? null,
-        billing_cycle: r.billing_cycle ?? null,
-      };
-    }
-  }
-
-  if (!Object.prototype.hasOwnProperty.call(FALLBACK_PLANS, planCode)) {
-    throw new ApiError(400, "Invalid plan_code");
-  }
-  return FALLBACK_PLANS[planCode];
+  const cols = new Set();
+  for (const row of rows) cols.add(row.COLUMN_NAME);
+  return cols;
 }
 
 /** @phpparity getTrainerByCode */
@@ -194,81 +159,169 @@ async function getTrainerByCode(conn, trainerCode) {
   return rows[0] || null;
 }
 
-/** @phpparity findExistingLatestInvite */
-async function findExistingLatestInvite(conn, trainerId, clientEmail) {
+/**
+ * @phpparity findExistingLatestInvite — latest invite for this client under the
+ * trainer, matched by trainer_id OR trainer_code (the new PHP widened this).
+ */
+async function findExistingLatestInvite(conn, trainerId, trainerCode, clientEmail) {
   const [rows] = await conn.execute(
     `SELECT *
        FROM trainer_client_invites
-      WHERE UPPER(trainer_id) = UPPER(?)
+      WHERE (
+              UPPER(trainer_id) = UPPER(?)
+           OR UPPER(trainer_code) = UPPER(?)
+      )
         AND LOWER(client_email) = LOWER(?)
       ORDER BY id DESC
       LIMIT 1`,
-    [trainerId, clientEmail]
+    [trainerId, trainerCode, clientEmail]
   );
   return rows[0] || null;
 }
 
-/** @phpparity hasPendingSamePlan */
-async function hasPendingSamePlan(conn, trainerCode, clientEmail, planCode) {
+/**
+ * @phpparity hasPendingFreeTrial — an ACTIVE (not-yet-expired) pending free-trial
+ * invite for this (trainer_code, client_email). Used to reject duplicates (409).
+ */
+async function hasPendingFreeTrial(conn, trainerCode, clientEmail) {
   const [rows] = await conn.execute(
-    `SELECT id, redeem_code, created_at
+    `SELECT id, redeem_code, created_at, code_expires_at
        FROM trainer_client_plan_subscriptions
       WHERE UPPER(trainer_code) = UPPER(?)
         AND LOWER(client_email) = LOWER(?)
-        AND plan_code = ?
+        AND plan_code = 'free_trial'
         AND status = 'sent'
         AND subscription_status = 'pending'
+        AND (
+              code_expires_at IS NULL
+           OR code_expires_at > NOW()
+        )
       ORDER BY id DESC
       LIMIT 1`,
-    [trainerCode, clientEmail, planCode]
+    [trainerCode, clientEmail]
   );
   return rows[0] || null;
 }
 
-/** @phpparity createPlanSubscription */
+/**
+ * @phpparity createPlanSubscription — insert the free-trial subscription/history
+ * row (unique redeem code + 7-day expiry). Optional trial_* columns are only
+ * written when the table has them. Returns the trial metadata for the response.
+ */
 async function createPlanSubscription(
   conn, sourceInviteId, trainerId, trainerCode,
   clientName, clientMobile, clientEmail, selectedPlan, createdByUserId
 ) {
   const redeemCode = await csi.uniqueRedeemCode(conn);
-  const expiresAt = csi.redeemCodeExpiry();
-  const paymentStatus = selectedPlan.plan_code === "free_trial" ? "not_required" : "pending";
 
-  const [result] = await conn.execute(
-    `INSERT INTO trainer_client_plan_subscriptions (
-       source_invite_id, trainer_id, trainer_code, client_name, client_mobile,
-       client_email, plan_code, plan_name, plan_price_label, redeem_code,
-       code_expires_at, status, subscription_status, payment_status, email_status,
-       resend_email_id, accepted_profile_id, accepted_at, error_message,
-       created_by_user_id, created_at, updated_at
-     )
-     VALUES (
-       ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-       'failed', 'pending', ?, 'failed', NULL, NULL, NULL,
-       'Email sending started', ?, NOW(), NOW()
-     )`,
-    [
-      sourceInviteId,
-      trainerId,
-      trainerCode,
-      clientName,
-      clientMobile !== "" ? clientMobile : null,
-      clientEmail,
-      selectedPlan.plan_code,
-      selectedPlan.plan_name,
-      selectedPlan.plan_price_label,
-      redeemCode,
-      expiresAt,
-      paymentStatus,
-      createdByUserId,
-    ]
+  // Free trial is FREE_TRIAL_DAYS days; code expiry == trial expiry. IST wall-clock.
+  const trialStartedAt = csi.istMysqlDateTime(new Date());
+  const expiresAt = csi.istMysqlDateTime(
+    new Date(Date.now() + FREE_TRIAL_DAYS * 24 * 60 * 60 * 1000)
   );
+  const paymentStatus = "not_required";
+
+  const subscriptionCols = await tableColumns(conn, "trainer_client_plan_subscriptions");
+
+  // Base columns / value-placeholders / params (kept in lockstep, parity with PHP).
+  const columns = [
+    "source_invite_id",
+    "trainer_id",
+    "trainer_code",
+    "client_name",
+    "client_mobile",
+    "client_email",
+    "plan_code",
+    "plan_name",
+    "plan_price_label",
+    "redeem_code",
+    "code_expires_at",
+    "status",
+    "subscription_status",
+    "payment_status",
+    "email_status",
+    "resend_email_id",
+    "accepted_profile_id",
+    "accepted_at",
+    "error_message",
+    "created_by_user_id",
+    "created_at",
+    "updated_at",
+  ];
+  const values = [
+    "?", "?", "?", "?", "?", "?", "?", "?", "?", "?", "?",
+    "'failed'",            // status
+    "'pending'",           // subscription_status
+    "?",                   // payment_status
+    "'failed'",            // email_status
+    "NULL",                // resend_email_id
+    "NULL",                // accepted_profile_id
+    "NULL",                // accepted_at
+    "'Email sending started'", // error_message
+    "?",                   // created_by_user_id
+    "NOW()",               // created_at
+    "NOW()",               // updated_at
+  ];
+  const params = [
+    sourceInviteId,
+    trainerId,
+    trainerCode,
+    clientName,
+    clientMobile !== "" ? clientMobile : null,
+    clientEmail,
+    selectedPlan.plan_code,
+    selectedPlan.plan_name,
+    selectedPlan.plan_price_label,
+    redeemCode,
+    expiresAt,
+    paymentStatus,
+    createdByUserId,
+  ];
+
+  // Optional trial columns — appended only when the column exists. The literal
+  // values (NOW()/0/NULL) carry no params; the bound ones push to params.
+  if (subscriptionCols.has("trial_started_at")) {
+    columns.push("trial_started_at");
+    values.push("NOW()");
+  }
+  if (subscriptionCols.has("trial_expires_at")) {
+    columns.push("trial_expires_at");
+    values.push("?");
+    params.push(expiresAt);
+  }
+  if (subscriptionCols.has("trial_days_total")) {
+    columns.push("trial_days_total");
+    values.push("?");
+    params.push(FREE_TRIAL_DAYS);
+  }
+  if (subscriptionCols.has("trial_extended_days")) {
+    columns.push("trial_extended_days");
+    values.push("0");
+  }
+  if (subscriptionCols.has("trial_extended_at")) {
+    columns.push("trial_extended_at");
+    values.push("NULL");
+  }
+  if (subscriptionCols.has("trial_extended_by_user_id")) {
+    columns.push("trial_extended_by_user_id");
+    values.push("NULL");
+  }
+
+  const sql =
+    `INSERT INTO trainer_client_plan_subscriptions (\n  ${columns.join(",\n  ")}\n)\n` +
+    `VALUES (\n  ${values.join(",\n  ")}\n)`;
+
+  const [result] = await conn.execute(sql, params);
 
   return {
     subscription_id: Number(result.insertId),
     redeem_code: redeemCode,
     code_expires_at: expiresAt,
     payment_status: paymentStatus,
+    trial_started_at: trialStartedAt,
+    trial_expires_at: expiresAt,
+    trial_days_total: FREE_TRIAL_DAYS,
+    max_trial_days: MAX_FREE_TRIAL_DAYS,
   };
 }
 
@@ -389,13 +442,14 @@ async function updateLatestInviteResultIfNotAccepted(
  * Headers: Authorization: Bearer <JWT>
  * Body:
  *   {
- *     "trainer_id": "RespyrD03",      // required — trainer/partner code
- *     "client_name": "Jane Doe",      // required
- *     "client_mobile": "+15551234567",// optional
- *     "client_email": "jane@x.com",   // required, valid email
- *     "plan_code": "monthly",         // optional, defaults free_trial
- *     "actor_user_id": ""             // optional; if set, must match token email
+ *     "trainer_id": "RespyrD03",       // required — trainer/partner code
+ *     "client_name": "Jane Doe",       // required
+ *     "client_mobile": "+15551234567", // optional
+ *     "client_email": "jane@x.com",    // required, valid email
+ *     "actor_user_id": ""              // optional; if set, must match token email
  *   }
+ *
+ * Note: plan_code is intentionally ignored — every invite is a Free Trial.
  */
 const sendTrainerClientInvite = async (req, res) => {
   // HIPAA: never let intermediaries cache invite responses.
@@ -426,7 +480,9 @@ const sendTrainerClientInvite = async (req, res) => {
     const clientName     = csi.clean(body.client_name ?? "");
     const clientMobile   = normalizeMobile(body.client_mobile ?? "");
     const clientEmail    = csi.email(body.client_email ?? "");
-    const planCode       = csi.clean(body.plan_code ?? "free_trial");
+
+    // Backend always uses the Free-Trial plan; no plan_code from the frontend.
+    const selectedPlan = FREE_TRIAL_PLAN;
 
     if (trainerIdInput === "") {
       throw new ApiError(400, "trainer_id is required");
@@ -445,8 +501,6 @@ const sendTrainerClientInvite = async (req, res) => {
     conn = await pool.getConnection();
     await conn.query("SET time_zone = '+05:30'");
 
-    const selectedPlan = await getTrustedPlanByCode(conn, planCode);
-
     // ── 3. Token-bound authorization (closes the PHP IDOR hole) ──────────────
     const { actor, actorEmail: resolvedEmail } = await csi.resolveActorFromToken(conn, req);
     actorEmail = resolvedEmail;
@@ -455,7 +509,7 @@ const sendTrainerClientInvite = async (req, res) => {
     // Optional actor_user_id is cross-checked, never trusted to select a user.
     if (actorUserId !== "" && actorUserId !== actorEmail) {
       await csi.audit(
-        pool, req, "client_plan_invite_denied",
+        pool, req, "client_free_trial_invite_denied",
         actorEmail, actorRole, csi.effectiveCode(actor),
         clientEmail, false, "actor_user_id does not match token identity"
       );
@@ -466,7 +520,7 @@ const sendTrainerClientInvite = async (req, res) => {
 
     if (!csi.canAccessCode(allowedCodes, trainerIdInput)) {
       await csi.audit(
-        pool, req, "client_plan_invite_denied",
+        pool, req, "client_free_trial_invite_denied",
         actorEmail, actorRole, csi.effectiveCode(actor),
         clientEmail, false, "actor not allowed to use this trainer code"
       );
@@ -496,26 +550,28 @@ const sendTrainerClientInvite = async (req, res) => {
     const trainerRole =
       trainer.role !== null && trainer.role !== undefined ? trainer.role : "trainer";
 
+    // Token-bound: the creator is always the authenticated actor.
     const createdByUserId = actorEmail;
 
-    // ── 5. Reject a duplicate pending invite for the same plan ───────────────
-    const pendingSamePlan = await hasPendingSamePlan(
-      conn, trainerCode, clientEmail, selectedPlan.plan_code
-    );
+    // ── 5. Reject a duplicate ACTIVE pending free-trial invite ───────────────
+    const pendingFreeTrial = await hasPendingFreeTrial(conn, trainerCode, clientEmail);
 
-    if (pendingSamePlan) {
-      throw new ApiError(409, "This client already has a pending invite for this plan", {
+    if (pendingFreeTrial) {
+      throw new ApiError(409, "This client already has a pending free trial invite", {
         data: {
-          subscription_id: Number(pendingSamePlan.id),
-          redeem_code: pendingSamePlan.redeem_code,
-          created_at: formatDbDateTime(pendingSamePlan.created_at),
-          plan_code: selectedPlan.plan_code,
+          subscription_id: Number(pendingFreeTrial.id),
+          redeem_code: pendingFreeTrial.redeem_code,
+          created_at: formatDbDateTime(pendingFreeTrial.created_at),
+          code_expires_at: formatDbDateTime(pendingFreeTrial.code_expires_at),
+          plan_code: "free_trial",
         },
       });
     }
 
     // ── 6. Create the subscription/history row first ─────────────────────────
-    const existingInvite = await findExistingLatestInvite(conn, trainerId, clientEmail);
+    const existingInvite = await findExistingLatestInvite(
+      conn, trainerId, trainerCode, clientEmail
+    );
     let sourceInviteId = existingInvite ? Number(existingInvite.id) : null;
 
     const subscriptionMeta = await createPlanSubscription(
@@ -556,6 +612,11 @@ const sendTrainerClientInvite = async (req, res) => {
       plan_code: selectedPlan.plan_code,
       plan_name: selectedPlan.plan_name,
       plan_price_label: selectedPlan.plan_price_label,
+      // Free-trial-specific template variables (additive, see sendEmail).
+      extra_variables: {
+        TRIAL_DAYS: FREE_TRIAL_DAYS,
+        MAX_TRIAL_DAYS: MAX_FREE_TRIAL_DAYS,
+      },
     });
 
     const inviteStatus  = emailResult.success ? "sent" : "failed";
@@ -574,25 +635,30 @@ const sendTrainerClientInvite = async (req, res) => {
     // ── 9. Audit ─────────────────────────────────────────────────────────────
     await csi.audit(
       pool, req,
-      emailResult.success ? "client_plan_invite_sent" : "client_plan_invite_failed",
+      emailResult.success ? "client_free_trial_invite_sent" : "client_free_trial_invite_failed",
       createdByUserId, trainerRole, trainerCode,
       clientEmail, emailResult.success,
-      emailResult.success ? "Client plan invite sent" : "Client plan invite failed"
+      emailResult.success ? "Client free trial invite sent" : "Client free trial invite failed"
     );
 
-    // ── 10. Respond (matches the PHP JSON shape exactly) ─────────────────────
+    // ── 10. Respond (matches the PHP JSON shape) ─────────────────────────────
     return res.status(emailResult.success ? 200 : 500).json({
       status: emailResult.success,
       ok: emailResult.success,
       message: emailResult.success
-        ? "Invite email sent successfully"
-        : "Invite saved but email sending failed",
+        ? "Free trial invite email sent successfully"
+        : "Free trial invite saved but email sending failed",
       data: {
         subscription_id: subscriptionId,
         source_invite_id: sourceInviteId,
 
         redeem_code: redeemCode,
         code_expires_at: codeExpiresAt,
+
+        trial_started_at: subscriptionMeta.trial_started_at,
+        trial_expires_at: subscriptionMeta.trial_expires_at,
+        trial_days_total: subscriptionMeta.trial_days_total,
+        max_trial_days: subscriptionMeta.max_trial_days,
 
         trainer_id: trainerId,
         trainer_name: trainerName,
@@ -603,9 +669,9 @@ const sendTrainerClientInvite = async (req, res) => {
         client_mobile: clientMobile,
         client_email: clientEmail,
 
-        plan_code: selectedPlan.plan_code,
-        plan_name: selectedPlan.plan_name,
-        plan_price_label: selectedPlan.plan_price_label,
+        plan_code: "free_trial",
+        plan_name: "Free Trial",
+        plan_price_label: "Free",
 
         subscription_status: "pending",
         payment_status: paymentStatus,
@@ -630,7 +696,7 @@ const sendTrainerClientInvite = async (req, res) => {
     });
 
     await csi.audit(
-      pool, req, "client_plan_invite_error",
+      pool, req, "client_free_trial_invite_error",
       actorEmail, actorRole, trainerCode,
       csi.email(body.client_email ?? ""), false, err?.code || "internal_error"
     );

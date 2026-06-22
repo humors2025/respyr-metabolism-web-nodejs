@@ -614,6 +614,12 @@ async function sendEmail(sub) {
         PLAN_CODE: sub.plan_code,
         PLAN_NAME: sub.plan_name,
         PLAN_PRICE_LABEL: sub.plan_price_label,
+        // Additive: callers may pass endpoint-specific template variables
+        // (e.g. the free-trial flow sends TRIAL_DAYS / MAX_TRIAL_DAYS). Other
+        // callers omit this, so their payload is unchanged.
+        ...(sub.extra_variables && typeof sub.extra_variables === "object"
+          ? sub.extra_variables
+          : {}),
       },
     },
   };
