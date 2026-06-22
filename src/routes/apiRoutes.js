@@ -155,6 +155,10 @@ const {
   revokeClientSubscriptionInvite,
 } = require("../controllers/dietitian/api/web/revoke-client-subscription-invite");
 
+const {
+  extendClientFreeTrial14Days,
+} = require("../controllers/dietitian/api/web/extend-client-free-trial-14days");
+
 
 const {
   superAdminOverview,
@@ -635,6 +639,13 @@ router.post(
   "/dietitian/api/web/revoke-client-subscription-invite",
   authMiddleware,
   revokeClientSubscriptionInvite
+);
+
+
+router.post(
+  "/dietitian/api/web/extend-client-free-trial-14days",
+  authMiddleware,
+  extendClientFreeTrial14Days
 );
 
 
