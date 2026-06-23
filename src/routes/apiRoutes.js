@@ -290,6 +290,35 @@ const {
 } = require("../controllers/dietitian/api/web/referral-client-list");
 
 
+// 🥗 Habits — selected-habits (5-habit system)
+const {
+  getHabitMaster,
+  saveSelectedHabits,
+  getHabitsStatus,
+  trackHabit,
+  getWeeklyTracking,
+} = require("../controllers/dietitian/api/web/selected_habits.controller");
+
+// 🥗 Habits — check if a client has active habits
+const {
+  checkClientHabitsAdded,
+} = require("../controllers/dietitian/api/web/habits_check.controller");
+
+// 🥗 Habits — user preferences + tracking (user_habits)
+const {
+  fetchUserHabits,
+  addUserHabits,
+  getTrackingData,
+  trackBatch,
+  updateGlp1,
+} = require("../controllers/dietitian/api/web/habits.controller");
+
+// 🥗 Habits — per-client dashboard (all-time completion %)
+const {
+  getHabitsDashboard,
+} = require("../controllers/dietitian/api/web/habits_dashboard.controller");
+
+
 // 🔑 Forgot-password (OTP) flow — public, rate-limited
 const {
   sendDietitianOtp,
@@ -800,6 +829,87 @@ router.post(
   "/dietitian/api/web/referral-client-list",
   authMiddleware,
   referralClientList
+);
+
+
+/* ===============================
+   🥗 Habits
+================================ */
+
+// selected-habits (5-habit system)
+router.post(
+  "/dietitian/api/web/selected-habits/master",
+  authMiddleware,
+  getHabitMaster
+);
+
+router.post(
+  "/dietitian/api/web/selected-habits/save",
+  authMiddleware,
+  saveSelectedHabits
+);
+
+router.post(
+  "/dietitian/api/web/selected-habits/status",
+  authMiddleware,
+  getHabitsStatus
+);
+
+router.post(
+  "/dietitian/api/web/selected-habits/track",
+  authMiddleware,
+  trackHabit
+);
+
+router.post(
+  "/dietitian/api/web/selected-habits/weekly",
+  authMiddleware,
+  getWeeklyTracking
+);
+
+// check if a client has active habits
+router.post(
+  "/dietitian/api/web/habits/check",
+  authMiddleware,
+  checkClientHabitsAdded
+);
+
+// user preferences + tracking (user_habits)
+router.post(
+  "/dietitian/api/web/habits/fetch",
+  authMiddleware,
+  fetchUserHabits
+);
+
+router.post(
+  "/dietitian/api/web/habits/add",
+  authMiddleware,
+  addUserHabits
+);
+
+router.post(
+  "/dietitian/api/web/habits/tracking-data",
+  authMiddleware,
+  getTrackingData
+);
+
+router.post(
+  "/dietitian/api/web/habits/track-batch",
+  authMiddleware,
+  trackBatch
+);
+
+router.post(
+  "/dietitian/api/web/habits/update-glp1",
+  authMiddleware,
+  updateGlp1
+);
+
+// per-client dashboard (all-time completion %)
+router.post(
+  "/dietitian/api/web/habits/dashboard",
+  authMiddleware,
+  getHabitsDashboard
 );
 
 
