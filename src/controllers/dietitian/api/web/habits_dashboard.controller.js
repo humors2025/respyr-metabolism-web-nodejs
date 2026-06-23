@@ -8,7 +8,7 @@
  * selected_habits.controller.js / habits.controller.js.
  *
  * Endpoint (POST, behind authMiddleware):
- *   /habits/dashboard   getHabitsDashboard
+ *   /dietitian/api/web/habits-dashboard   getHabitsDashboard
  *
  * Per-CLIENT habit dashboard. Returns the client header (name + level), each
  * active selected habit with its ALL-TIME completion % (since the habit's
