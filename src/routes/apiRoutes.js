@@ -907,7 +907,7 @@ router.post(
 
 // per-client dashboard (all-time completion %)
 router.post(
-  "/dietitian/api/web/habits/dashboard",
+  "/dietitian/api/web/habits-dashboard",
   authMiddleware,
   getHabitsDashboard
 );
