@@ -66,6 +66,15 @@ function getDayName(dateStr) {
   });
 }
 
+/** YYYY-MM-DD `n` days after (negative = before) the given YYYY-MM-DD (UTC). */
+function addDays(ymd, n) {
+  const d = new Date(`${ymd}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + n);
+  return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(
+    d.getUTCDate()
+  )}`;
+}
+
 /**
  * Inclusive whole-day count between two YYYY-MM-DD strings (UTC). Returns 0 when
  * `from` is after `to` (e.g. a habit whose start_date is in the future).
@@ -208,6 +217,18 @@ async function getHabitsDashboard(req, res) {
             completed_days: 0,
             completion_percent: 0,
           },
+          summary: {
+            total_days: 0,
+            total_days_tracked: 0,
+            total_perfect_days: 0,
+            tracking_rate: 0,
+            completion_rate: 0,
+          },
+          completion_trend: {
+            week: { range: "week", granularity: "day", points: [] },
+            month: { range: "month", granularity: "day", points: [] },
+            all: { range: "all", granularity: "week", points: [] },
+          },
           habits: [],
         },
         error: null,
@@ -308,6 +329,120 @@ async function getHabitsDashboard(req, res) {
       };
     });
 
+    // ── Cross-habit daily aggregate (earliest start_date → today) ────────────
+    // For each calendar day: how many habits were expected (already started),
+    // how many were tracked (any entry), and how many were completed. Every
+    // summary stat and the trend graph derive from this single pass.
+    const earliestStart = Object.values(startBySid).reduce(
+      (min, d) => (d < min ? d : min),
+      today
+    );
+
+    const dailyAgg = [];
+    {
+      const cursor = new Date(`${earliestStart}T00:00:00Z`);
+      const last = new Date(`${today}T00:00:00Z`);
+      while (cursor <= last) {
+        const dateKey = `${cursor.getUTCFullYear()}-${pad(
+          cursor.getUTCMonth() + 1
+        )}-${pad(cursor.getUTCDate())}`;
+
+        let expected = 0;
+        let tracked = 0;
+        let completed = 0;
+        for (const h of selectedHabits) {
+          const sid = Number(h.selected_habit_id);
+          if (startBySid[sid] <= dateKey) {
+            expected++;
+            const entry = trackBySid[sid] && trackBySid[sid][dateKey];
+            if (entry) {
+              tracked++;
+              if (entry.is_completed) completed++;
+            }
+          }
+        }
+
+        dailyAgg.push({
+          date: dateKey,
+          day: getDayName(dateKey),
+          expected,
+          tracked,
+          completed,
+          completion_rate: pct(completed, expected),
+        });
+        cursor.setUTCDate(cursor.getUTCDate() + 1);
+      }
+    }
+
+    // ── Summary stats (all-time) ─────────────────────────────────────────────
+    let sumExpected = 0;
+    let sumTracked = 0;
+    let sumCompleted = 0;
+    let daysTracked = 0;
+    let perfectDays = 0;
+    for (const d of dailyAgg) {
+      sumExpected += d.expected;
+      sumTracked += d.tracked;
+      sumCompleted += d.completed;
+      if (d.tracked > 0) daysTracked++;
+      if (d.expected > 0 && d.completed === d.expected) perfectDays++;
+    }
+
+    const summary = {
+      total_days: dailyAgg.length, // calendar days since the first habit started
+      total_days_tracked: daysTracked, // days with at least one habit logged
+      total_perfect_days: perfectDays, // days where every active habit was done
+      tracking_rate: pct(sumTracked, sumExpected), // logged vs expected habit-days
+      completion_rate: pct(sumCompleted, sumExpected), // completed vs expected
+    };
+
+    // ── Completion-rate trend (week / month / all) ───────────────────────────
+    const dailyPointsFrom = (fromKey) =>
+      dailyAgg
+        .filter((d) => d.date >= fromKey)
+        .map((d) => ({
+          date: d.date,
+          day: d.day,
+          completed: d.completed,
+          expected: d.expected,
+          completion_rate: d.completion_rate,
+        }));
+
+    const weeklyBuckets = () => {
+      const points = [];
+      for (let i = 0; i < dailyAgg.length; i += 7) {
+        const chunk = dailyAgg.slice(i, i + 7);
+        const exp = chunk.reduce((s, d) => s + d.expected, 0);
+        const comp = chunk.reduce((s, d) => s + d.completed, 0);
+        points.push({
+          week_start: chunk[0].date,
+          week_end: chunk[chunk.length - 1].date,
+          completed: comp,
+          expected: exp,
+          completion_rate: pct(comp, exp),
+        });
+      }
+      return points;
+    };
+
+    const completion_trend = {
+      week: {
+        range: "week",
+        granularity: "day",
+        points: dailyPointsFrom(addDays(today, -6)),
+      },
+      month: {
+        range: "month",
+        granularity: "day",
+        points: dailyPointsFrom(addDays(today, -29)),
+      },
+      all: {
+        range: "all",
+        granularity: "week",
+        points: weeklyBuckets(),
+      },
+    };
+
     console.info("habits.dashboard: access granted", {
       dietitian_id: dieticianId,
       profile_id: profileId,
@@ -329,6 +464,8 @@ async function getHabitsDashboard(req, res) {
           completed_days: overallCompleted,
           completion_percent: pct(overallCompleted, overallExpected),
         },
+        summary,
+        completion_trend,
         habits,
       },
       error: null,
