@@ -59,6 +59,13 @@ function normDate(val) {
   return String(val).slice(0, 10);
 }
 
+/** Short weekday name (e.g. "Mon") for a YYYY-MM-DD string. */
+function getDayName(dateStr) {
+  return new Date(`${dateStr}T00:00:00`).toLocaleDateString("en-US", {
+    weekday: "short",
+  });
+}
+
 /**
  * Inclusive whole-day count between two YYYY-MM-DD strings (UTC). Returns 0 when
  * `from` is after `to` (e.g. a habit whose start_date is in the future).
@@ -218,6 +225,7 @@ async function getHabitsDashboard(req, res) {
         SELECT
           selected_habit_id,
           tracking_date,
+          completed_count,
           is_completed
         FROM client_habit_tracking
         WHERE profile_id = ?
@@ -227,8 +235,7 @@ async function getHabitsDashboard(req, res) {
       [profileId, ...ids, today]
     );
 
-    // Index completed-day counts by selected_habit_id, honouring each habit's
-    // own start_date (a row before start_date doesn't count toward that habit).
+    // Each habit's own start_date (a row before start_date doesn't count).
     const startBySid = {};
     for (const h of selectedHabits) {
       startBySid[Number(h.selected_habit_id)] = h.start_date
@@ -236,14 +243,18 @@ async function getHabitsDashboard(req, res) {
         : today;
     }
 
-    const completedBySid = {};
+    // Index every tracking row by selected_habit_id → date so we can both count
+    // completed days and emit a per-day breakdown.
+    const trackBySid = {};
     for (const r of trackRows) {
       const sid = Number(r.selected_habit_id);
       const rowDate = normDate(r.tracking_date);
       if (rowDate < startBySid[sid]) continue; // before this habit started
-      if (parseInt(r.is_completed, 10) === 1) {
-        completedBySid[sid] = (completedBySid[sid] || 0) + 1;
-      }
+      if (!trackBySid[sid]) trackBySid[sid] = {};
+      trackBySid[sid][rowDate] = {
+        completed_count: parseInt(r.completed_count, 10) || 0,
+        is_completed: parseInt(r.is_completed, 10) === 1,
+      };
     }
 
     let overallExpected = 0;
@@ -253,7 +264,28 @@ async function getHabitsDashboard(req, res) {
       const sid = Number(h.selected_habit_id);
       const startDate = startBySid[sid];
       const expectedDays = inclusiveDays(startDate, today);
-      const completedDays = completedBySid[sid] || 0;
+      const dayMap = trackBySid[sid] || {};
+
+      // Day-by-day fan-out from start_date → today (inclusive).
+      const days = [];
+      let completedDays = 0;
+      const cursor = new Date(`${startDate}T00:00:00Z`);
+      const last = new Date(`${today}T00:00:00Z`);
+      while (cursor <= last) {
+        const dateKey = `${cursor.getUTCFullYear()}-${pad(
+          cursor.getUTCMonth() + 1
+        )}-${pad(cursor.getUTCDate())}`;
+        const entry = dayMap[dateKey];
+        const isCompleted = entry ? entry.is_completed : false;
+        if (isCompleted) completedDays++;
+        days.push({
+          date: dateKey,
+          day: getDayName(dateKey),
+          completed_count: entry ? entry.completed_count : 0,
+          is_completed: isCompleted,
+        });
+        cursor.setUTCDate(cursor.getUTCDate() + 1);
+      }
 
       overallExpected += expectedDays;
       overallCompleted += completedDays;
@@ -272,6 +304,7 @@ async function getHabitsDashboard(req, res) {
         expected_days: expectedDays,
         completed_days: completedDays,
         completion_percent: pct(completedDays, expectedDays),
+        days,
       };
     });
 
