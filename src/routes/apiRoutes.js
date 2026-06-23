@@ -201,6 +201,11 @@ const {
 
 
 const {
+  trainerSalesAnalytics,
+} = require("../controllers/dietitian/api/web/trainer-sales-analytics");
+
+
+const {
   trainerAdminTrainersSummary,
 } = require("../controllers/dietitian/api/web/trainer-admin-trainers-summary");
 
@@ -688,6 +693,13 @@ router.post(
   "/dietitian/api/web/trainer-admin-overview",
   authMiddleware,
   trainerAdminOverview
+);
+
+
+router.post(
+  "/dietitian/api/web/trainer-sales-analytics",
+  authMiddleware,
+  trainerSalesAnalytics
 );
 
 
