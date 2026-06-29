@@ -309,6 +309,13 @@ const {
 } = require("../controllers/dietitian/api/web/habits_dashboard.controller");
 
 
+// 🥗 Habits — consolidated manager (single action-dispatched endpoint).
+// Ports selected_habits + habits_check + user_habits handlers into one route.
+const {
+  habitsManager,
+} = require("../controllers/dietitian/api/web/habits-manager.controller");
+
+
 // 🔑 Forgot-password (OTP) flow — public, rate-limited
 const {
   sendDietitianOtp,
@@ -902,6 +909,19 @@ router.post(
   getHabitsDashboard
 );
 
+
+
+// consolidated habits manager — single endpoint, action-dispatched.
+// Body: { action, dietitian_id?, profile_id, ...actionFields }
+// Actions: habit_master | save_selected_habits | selected_status | track_habit
+//        | weekly_tracking | check_habits | fetch_preferences
+//        | save_preferences | update_glp1 | tracking_data | track_batch
+router.post(
+  "/dietitian/api/web/habits-manager",
+  authMiddleware,
+  habitsManager
+);
+ 
 
 module.exports = router;
 
