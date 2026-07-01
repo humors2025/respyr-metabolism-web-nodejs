@@ -934,6 +934,11 @@ async function actionWeeklyTracking({ req, res, access }) {
         week_end: weekEnd,
         today,
         total_habits: 0,
+        total_days: 0,
+        total_days_tracked: 0,
+        total_perfect_days: 0,
+        tracking_rate: 0,
+        completion_rate: 0,
         week_summary: { completed_total: 0, pending_total: 0, future_total: 0 },
         habits: [],
       },
@@ -1154,6 +1159,60 @@ async function actionWeeklyTracking({ req, res, access }) {
     weekSummary.weekly_rate = 0;
   }
 
+  // ── All-time cross-habit summary (perfect days, days tracked, rates) ────────
+  //    Range = earliest habit start_date → today. For each (habit, day) cell
+  //    where the habit had started:
+  //      expected++            always
+  //      tracked++             a tracking row exists that day
+  //      completed++           obligation met (daily → is_completed=1;
+  //                            weekly → a session was logged, completed_count>0)
+  //    Day-level rollups: a day is "tracked" if ANY habit was tracked, and
+  //    "perfect" if EVERY expected habit was completed. Rates are pooled over
+  //    all cells. Reuses allTimeMap (already built) — no extra query.
+  let totalDays = 0;
+  let daysTracked = 0;
+  let totalPerfectDays = 0;
+  let sumExpected = 0;
+  let sumTracked = 0;
+  let sumCompleted = 0;
+
+  let earliestStart = null;
+  for (const h of habitsRows) {
+    const hs = normDate(h.start_date);
+    if (hs && (earliestStart === null || hs < earliestStart)) earliestStart = hs;
+  }
+  if (earliestStart) {
+    for (const d of buildDateRange(earliestStart, today)) {
+      let expected = 0;
+      let tracked = 0;
+      let completed = 0;
+      for (const h of habitsRows) {
+        const hs = normDate(h.start_date);
+        if (!hs || hs > d) continue; // habit not started on this day
+        expected++;
+        const rec = allTimeMap.get(Number(h.selected_habit_id))?.[d];
+        if (!rec) continue;
+        tracked++;
+        const done =
+          h.frequency_type === "weekly"
+            ? (Number(rec.completed_count) || 0) > 0
+            : Number(rec.is_completed) === 1;
+        if (done) completed++;
+      }
+      totalDays++;
+      sumExpected += expected;
+      sumTracked += tracked;
+      sumCompleted += completed;
+      if (tracked > 0) daysTracked++;
+      if (expected > 0 && completed === expected) totalPerfectDays++;
+    }
+  }
+
+  const overallCompletionRate =
+    sumExpected > 0 ? round2((sumCompleted / sumExpected) * 100) : 0;
+  const overallTrackingRate =
+    sumExpected > 0 ? round2((sumTracked / sumExpected) * 100) : 0;
+
   return ok(res, 200, {
     message: "Weekly habit tracking fetched successfully",
     data: {
@@ -1163,6 +1222,11 @@ async function actionWeeklyTracking({ req, res, access }) {
       week_end: weekEnd,
       today,
       total_habits: outputHabits.length,
+      total_days: totalDays,
+      total_days_tracked: daysTracked,
+      total_perfect_days: totalPerfectDays,
+      tracking_rate: overallTrackingRate,
+      completion_rate: overallCompletionRate,
       week_summary: weekSummary,
       habits: outputHabits,
     },
@@ -1810,8 +1874,6 @@ const habitsManager = async (req, res) => {
 };
 
 module.exports = { habitsManager };
-
-
 
 
 
