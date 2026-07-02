@@ -67,13 +67,13 @@ const getZone = (score) => {
   if (numericScore === null) {
     return "NA";
   }
-  if (numericScore < 70) {
-    return "Focus";
+  if (numericScore < 50) {
+    return "Building";
   }
-  if (numericScore >= 70 && numericScore < 80) {
-    return "Moderate";
+  if (numericScore >= 50 && numericScore < 70) {
+    return "Steady";
   }
-  return "Optimal";
+  return "Strong";
 };
 
 const getEmptyMacroSummary = () => ({
