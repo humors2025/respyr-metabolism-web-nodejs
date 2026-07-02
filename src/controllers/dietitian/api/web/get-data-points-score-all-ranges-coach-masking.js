@@ -946,6 +946,7 @@ const getDataPointsScoreAllRangesCoachMasking = async (req, res) => {
         test_id: Number(selectedRow.test_id),
         profile_id: selectedRow.profile_id,
         dietitian_id: dietitianId,
+        requested_date: dateProvided ? selectedDate : null,
         date: testDateOnly || "NA",
         display_date: testDateOnly ? formatDisplayDate(testDateOnly) : "NA",
         date_time: formatDateTime(selectedRow.date_time),

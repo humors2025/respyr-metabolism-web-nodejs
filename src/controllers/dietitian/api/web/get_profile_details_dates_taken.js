@@ -44,11 +44,11 @@ const getZone = (score) => {
     return "NA";
   }
 
-  if (numericScore < 70) {
+  if (numericScore < 50) {
     return "Building";
   }
 
-  if (numericScore >= 70 && numericScore < 80) {
+  if (numericScore >= 50 && numericScore < 70) {
     return "Steady";
   }
 

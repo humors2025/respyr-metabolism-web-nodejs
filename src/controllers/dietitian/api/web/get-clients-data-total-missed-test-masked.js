@@ -238,9 +238,9 @@ function getMetabolismZone(score) {
   if (score === null || score === undefined || score === "") return null;
   const s = Number(score);
   if (Number.isNaN(s)) return null;
-  if (s >= 80) return "Strong";
-  if (s >= 70) return "Steady";
-  return "Building";
+  if (s < 50) return "Building";
+  if (s >= 50 && s < 70) return "Steady";
+  return "Strong";
 }
 
 function formatFitnessGoal(raw) {
