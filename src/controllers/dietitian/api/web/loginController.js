@@ -517,7 +517,7 @@ exports.login = async (req, res) => {
 
     const now = Math.floor(Date.now() / 1000);
 
-    const accessPayload = {
+    const accessPayload = { 
       iss: JWT_ISS,
       aud: JWT_AUD,
       iat: now,
