@@ -601,16 +601,15 @@ async function fetchClients(dieticianId, selectedDate, type, limit, offset) {
           LIMIT 1
         )
 
-      LEFT JOIN (
-        SELECT
-          profile_id,
-          COUNT(DISTINCT DATE(date_time)) AS test_taken_count
-        FROM table_test_data
-        WHERE UPPER(TRIM(dietitian_id)) = ?
-          AND date_time >= DATE_SUB(CURDATE(), INTERVAL 3 MONTH)
-        GROUP BY profile_id
-      ) ttc
-        ON ttc.profile_id = tc.profile_id
+    LEFT JOIN (
+    SELECT
+        profile_id,
+        COUNT(*) AS test_taken_count
+    FROM table_test_data
+    WHERE UPPER(TRIM(dietitian_id)) = :dietician_id
+    GROUP BY profile_id
+) ttc
+ON ttc.profile_id = tc.profile_id
 
       WHERE UPPER(TRIM(tc.dietician_id)) = ?
       ${filterCondition}
