@@ -277,6 +277,63 @@ async function resolveActorFromToken(req) {
   return { actor, actorEmail: normalizeEmail(actor.email) };
 }
 
+// ─── Target resolution (super_admin "view as" drill-down) ────────────────────
+
+/**
+ * Resolve a super_admin's drill-down target and verify it is inside the actor's
+ * own network. The target must be an ACTIVE 'admin' whose parent_user_id is the
+ * authenticated super_admin — i.e. exactly the set of admins the super_admin
+ * already sees in getNetworkCodesForOverview(). This binds the "view as" scope
+ * to the caller's tenant and prevents cross-tenant reads (IDOR).
+ *
+ * Returns { target } or { error: { status, body } }. Same column shape as
+ * resolveActorFromToken so the overview helpers can consume it unchanged.
+ */
+async function resolveTargetAdmin(actorEmail, targetEmail) {
+  const [rows] = await pool.execute(
+    `
+      SELECT
+        td.id,
+        td.dietician_id,
+        td.name,
+        td.phone_no,
+        td.email,
+        td.location,
+        td.is_reset_password,
+
+        aur.role,
+        aur.partner_code,
+        aur.parent_user_id,
+        aur.status,
+        aur.email_verified_at
+      FROM table_dietician td
+      INNER JOIN app_user_roles aur
+        ON LOWER(aur.user_id) = LOWER(td.email)
+      WHERE LOWER(aur.user_id) = LOWER(?)
+        AND aur.role = 'admin'
+        AND aur.status = 'active'
+        AND LOWER(aur.parent_user_id) = LOWER(?)
+      LIMIT 1
+    `,
+    [targetEmail, actorEmail]
+  );
+
+  const target = rows[0];
+
+  if (!target) {
+    // One opaque reason for "not an admin" / "not active" / "not in your
+    // network" / "does not exist" — no enumeration of who is/isn't in the tenant.
+    return {
+      error: {
+        status: 403,
+        body: { ok: false, error: "Target is not an active trainer admin in your network" },
+      },
+    };
+  }
+
+  return { target };
+}
+
 // ─── Network codes ───────────────────────────────────────────────────────────
 
 /**
@@ -595,7 +652,17 @@ function parseInputs(req) {
   // Optional. Accepted for frontend/back-compat, never authoritative — see the
   // cross-check in the controller. The JWT remains the source of truth.
   const actorUserId = normalizeEmail(src.actor_user_id);
-  return { actorUserId };
+  // Optional super_admin drill-down ("view as"). When present and different from
+  // the authenticated actor, a super_admin views the scoped overview of one of
+  // their downstream trainer admins. Accepted under `email` (primary) with
+  // `target_user_id` / `view_as_user_id` kept as back-compat aliases.
+  // Authorization is enforced server-side (super_admin only + target must be an
+  // active admin parented to the actor); it can NEVER be used to read outside
+  // the caller's own network.
+  const targetUserId = normalizeEmail(
+    src.email ?? src.target_user_id ?? src.view_as_user_id
+  );
+  return { actorUserId, targetUserId };
 }
 
 // ─── Controller ──────────────────────────────────────────────────────────────
@@ -617,7 +684,7 @@ const trainerAdminOverview = async (req, res) => {
     return res.status(405).json({ ok: false, error: "Method not allowed" });
   }
 
-  const { actorUserId } = parseInputs(req);
+  const { actorUserId, targetUserId } = parseInputs(req);
 
   let actorEmail = null;
   let actorRole = null;
@@ -679,9 +746,57 @@ const trainerAdminOverview = async (req, res) => {
       });
     }
 
-    // ── 2. Network codes + trainer rows ─────────────────────────────────────
-    const networkCodes = await getNetworkCodesForOverview(actor, actorEmail);
-    const trainerRows = await getNetworkTrainers(actor, actorEmail);
+    // ── 1d. Optional super_admin "view as" drill-down ───────────────────────
+    // Default: the effective actor IS the authenticated actor. When a super_admin
+    // passes target_user_id, the overview is computed for that downstream admin
+    // instead — but only after verifying the target is an active admin inside the
+    // caller's own network. Every helper below runs against the effective actor.
+    let effectiveActor = actor;
+    let effectiveEmail = actorEmail;
+    let viewedAs = null; // the target's email when impersonating, else null
+
+    if (targetUserId !== "" && targetUserId !== actorEmail) {
+      if (actorRole !== "super_admin") {
+        await writeAuthLogSafe(req, {
+          eventType: "trainer_admin_overview_denied",
+          userId: actorEmail,
+          role: actorRole,
+          partnerCode: actorCode,
+          identifier: targetUserId,
+          success: false,
+          failureReason: "Only super_admin may view another admin's overview",
+        });
+        return res.status(403).json({
+          ok: false,
+          error: "Only a super admin can view another admin's overview",
+        });
+      }
+
+      const resolvedTarget = await resolveTargetAdmin(actorEmail, targetUserId);
+      if (resolvedTarget.error) {
+        await writeAuthLogSafe(req, {
+          eventType: "trainer_admin_overview_denied",
+          userId: actorEmail,
+          role: actorRole,
+          partnerCode: actorCode,
+          identifier: targetUserId,
+          success: false,
+          failureReason: resolvedTarget.error.body?.error || "target not authorized",
+        });
+        return res.status(resolvedTarget.error.status).json(resolvedTarget.error.body);
+      }
+
+      effectiveActor = resolvedTarget.target;
+      effectiveEmail = normalizeEmail(resolvedTarget.target.email);
+      viewedAs = effectiveEmail;
+    }
+
+    const effectiveRole = String(effectiveActor.role);
+    const effectiveCode = getActorEffectivePartnerCode(effectiveActor);
+
+    // ── 2. Network codes + trainer rows (scoped to the effective actor) ─────
+    const networkCodes = await getNetworkCodesForOverview(effectiveActor, effectiveEmail);
+    const trainerRows = await getNetworkTrainers(effectiveActor, effectiveEmail);
 
     // ── 3. Counts ────────────────────────────────────────────────────────────
     const [
@@ -692,11 +807,11 @@ const trainerAdminOverview = async (req, res) => {
       revokedTrainerInvitesCount,
       clientInviteTotals,
     ] = await Promise.all([
-      countClientsForPartnerCode(actorCode),
+      countClientsForPartnerCode(effectiveCode),
       countClientsForCodes(networkCodes),
-      countTrainerInvitesByStatus(actorEmail, "pending"),
-      countTrainerInvitesByStatus(actorEmail, "expired"),
-      countTrainerInvitesByStatus(actorEmail, "revoked"),
+      countTrainerInvitesByStatus(effectiveEmail, "pending"),
+      countTrainerInvitesByStatus(effectiveEmail, "expired"),
+      countTrainerInvitesByStatus(effectiveEmail, "revoked"),
       countClientInvitesForCodes(networkCodes),
     ]);
 
@@ -704,31 +819,43 @@ const trainerAdminOverview = async (req, res) => {
     const trainerClientsCount = Math.max(0, totalClientsInNetwork - ownClientsCount);
 
     // ── 4. Audit — success (fire-and-forget) ────────────────────────────────
+    // When impersonating, the audit trail records the authenticated super_admin
+    // as the userId and the viewed admin as the identifier — so "who looked at
+    // whom" is always reconstructable from app_auth_logs.
     writeAuthLogSafe(req, {
-      eventType: "trainer_admin_overview_viewed",
+      eventType: viewedAs
+        ? "trainer_admin_overview_viewed_as"
+        : "trainer_admin_overview_viewed",
       userId: actorEmail,
       role: actorRole,
       partnerCode: actorCode,
-      identifier: actorEmail,
+      identifier: viewedAs || actorEmail,
       success: true,
-      failureReason: "Trainer admin overview viewed",
+      failureReason: viewedAs
+        ? "Super admin viewed downstream admin overview"
+        : "Trainer admin overview viewed",
     });
 
     // ── 5. Respond (matches the PHP JSON shape) ─────────────────────────────
+    // `actor` reflects the EFFECTIVE actor (the admin being viewed). `viewed_by`
+    // is null on a normal call and carries the super_admin's identity on a
+    // drill-down, so the frontend can render a "viewing as" banner.
     return res.status(200).json({
       ok: true,
-      mode: actorRole === "super_admin"
+      mode: effectiveRole === "super_admin"
         ? "super_admin_trainer_admin_overview"
         : "trainer_admin_overview",
       title: "Trainer Admin Overview",
 
+      viewed_by: viewedAs ? actorEmail : null,
+
       actor: {
-        user_id: actorEmail,
-        role: actorRole,
-        partner_code: actorCode,
-        parent_user_id: actor.parent_user_id ?? null,
-        name: actor.name ?? null,
-        email: normalizeEmail(actor.email),
+        user_id: effectiveEmail,
+        role: effectiveRole,
+        partner_code: effectiveCode,
+        parent_user_id: effectiveActor.parent_user_id ?? null,
+        name: effectiveActor.name ?? null,
+        email: normalizeEmail(effectiveActor.email),
       },
 
       overview: {
