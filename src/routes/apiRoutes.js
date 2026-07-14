@@ -738,14 +738,14 @@ router.post(
 
 
 router.post(
-  "/dietitian/api/web/get-group-details",
+  "/dietitian/api/web/get_group_details",
   authMiddleware,
   getGroupDetails
 );
 
 
 router.post(
-  "/dietitian/api/web/manage-admin-groups",
+  "/dietitian/api/web/manage_admin_groups",
   authMiddleware,
   manageAdminGroups
 );
