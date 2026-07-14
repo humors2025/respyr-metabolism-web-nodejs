@@ -201,6 +201,21 @@ const {
 
 
 const {
+  getGroupDetails,
+} = require("../controllers/dietitian/api/web/get_group_details");
+
+
+const {
+  manageAdminGroups,
+} = require("../controllers/dietitian/api/web/manage_admin_groups");
+
+
+const {
+  weightTracking,
+} = require("../controllers/dietitian/api/web/weight-tracking");
+
+
+const {
   trainerSalesAnalytics,
 } = require("../controllers/dietitian/api/web/trainer-sales-analytics");
 
@@ -719,6 +734,27 @@ router.post(
   "/dietitian/api/web/trainer-admin-overview",
   authMiddleware,
   trainerAdminOverview
+);
+
+
+router.post(
+  "/dietitian/api/web/get-group-details",
+  authMiddleware,
+  getGroupDetails
+);
+
+
+router.post(
+  "/dietitian/api/web/manage-admin-groups",
+  authMiddleware,
+  manageAdminGroups
+);
+
+
+router.post(
+  "/dietitian/api/web/weight-tracking",
+  authMiddleware,
+  weightTracking
 );
 
 
