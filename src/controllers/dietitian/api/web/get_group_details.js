@@ -509,7 +509,27 @@ async function getMembersInfo(codes, excludeEmails) {
                 WHERE UPPER(c3.dietician_id) = UPPER(COALESCE(aur.partner_code, td.dietician_id))
           )
           AND ${keepTest2.sql}
-      ) AS total_tested_clients
+      ) AS total_tested_clients,
+
+      /* The admin's OWN readings: tests on a profile that belongs to a client
+         whose email is the admin's own email — i.e. the admin testing
+         themselves. Exact inverse of the exclusion applied above. Counted by
+         distinct profile+day, matching total_tests. */
+      (
+        SELECT COUNT(DISTINCT t.profile_id, DATE(t.date_time))
+        FROM table_test_data t
+        WHERE UPPER(t.dietitian_id) = UPPER(COALESCE(aur.partner_code, td.dietician_id))
+          AND td.email IS NOT NULL
+          AND TRIM(td.email) <> ''
+          AND t.profile_id IN (
+                SELECT c4.profile_id
+                FROM table_clients c4
+                WHERE UPPER(c4.dietician_id) = UPPER(COALESCE(aur.partner_code, td.dietician_id))
+                  AND c4.email IS NOT NULL
+                  AND TRIM(c4.email) <> ''
+                  AND LOWER(TRIM(c4.email)) = LOWER(TRIM(td.email))
+          )
+      ) AS self_readings
 
     FROM table_dietician td
     LEFT JOIN app_user_roles aur
@@ -544,6 +564,7 @@ async function getMembersInfo(codes, excludeEmails) {
       total_clients: toInt(row.total_clients),
       total_tests: toInt(row.total_tests),
       total_tested_clients: toInt(row.total_tested_clients),
+      self_readings: toInt(row.self_readings),
     });
   }
 
@@ -625,7 +646,28 @@ async function getChildTrainers(adminEmails, excludeEmails) {
                 WHERE UPPER(c3.dietician_id) = UPPER(COALESCE(aur.partner_code, td.dietician_id))
           )
           AND ${keepTest2.sql}
-      ) AS total_tested_clients
+      ) AS total_tested_clients,
+
+      /* The trainer's OWN readings: tests on a profile that belongs to a client
+         whose email is the trainer's own email — i.e. the trainer testing
+         themselves. This is the exact inverse of the exclusion applied above, so
+         a reading is counted either as a client's test OR as a self reading,
+         never both. Counted by distinct profile+day, matching total_tests. */
+      (
+        SELECT COUNT(DISTINCT t.profile_id, DATE(t.date_time))
+        FROM table_test_data t
+        WHERE UPPER(t.dietitian_id) = UPPER(COALESCE(aur.partner_code, td.dietician_id))
+          AND td.email IS NOT NULL
+          AND TRIM(td.email) <> ''
+          AND t.profile_id IN (
+                SELECT c4.profile_id
+                FROM table_clients c4
+                WHERE UPPER(c4.dietician_id) = UPPER(COALESCE(aur.partner_code, td.dietician_id))
+                  AND c4.email IS NOT NULL
+                  AND TRIM(c4.email) <> ''
+                  AND LOWER(TRIM(c4.email)) = LOWER(TRIM(td.email))
+          )
+      ) AS self_readings
 
     FROM app_user_roles aur
     LEFT JOIN table_dietician td
@@ -665,6 +707,7 @@ async function getChildTrainers(adminEmails, excludeEmails) {
       total_clients: toInt(row.total_clients),
       total_tests: toInt(row.total_tests),
       total_tested_clients: toInt(row.total_tested_clients),
+      self_readings: toInt(row.self_readings),
     });
   }
 
@@ -1027,6 +1070,7 @@ const getGroupDetails = async (req, res) => {
       total_clients: m.total_clients,
       total_tests: m.total_tests,
       total_tested_clients: m.total_tested_clients,
+      self_readings: m.self_readings,
     }));
 
     const trainers = [...adminEntries, ...childTrainers];
