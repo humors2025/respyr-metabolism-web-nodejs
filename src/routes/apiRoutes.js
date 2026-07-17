@@ -132,6 +132,10 @@ const {
 } = require("../controllers/dietitian/api/web/get_client_profile_details");
 
 const {
+  get_client_profile_details_masked,
+} = require("../controllers/dietitian/api/web/get_client_profile_details_masked");
+
+const {
   listAdminTrainerUsersJwt,
 } = require("../controllers/dietitian/api/web/list-admin-trainer-users-jwt");
 
@@ -643,6 +647,13 @@ router.post(
   "/dietitian/api/web/get_client_profile_details",
   authMiddleware,
   get_client_profile_details
+);
+
+
+router.post(
+  "/dietitian/api/web/get_client_profile_details_masked",
+  authMiddleware,
+  get_client_profile_details_masked
 );
 
 
