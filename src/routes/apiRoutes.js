@@ -309,6 +309,16 @@ const {
 } = require("../controllers/dietitian/api/web/referral-client-list");
 
 
+// 🤖 Service-to-service (HMAC-signed key, not a dietitian JWT)
+const {
+  storeWeeklyFoodJsonSuggestion,
+} = require("../controllers/dietitian/api/web/store_weekly_food_json_suggestion");
+
+const {
+  getLatest72hrTests,
+} = require("../controllers/dietitian/api/web/get_latest_72hr_tests");
+
+
 // // 🥗 Habits — selected-habits (5-habit system)
 // const {
 //   getHabitMaster,
@@ -356,6 +366,8 @@ const {
 
 
 const authMiddleware = require('../middlewares/authMiddleware');
+const serviceAuthMiddleware = require('../middlewares/serviceAuthMiddleware');
+const { serviceApiRateLimiter } = require('../middlewares/serviceRateLimiter');
 // const loginRateLimiter = require('../middlewares/loginRateLimiter');
 const {
   loginRateLimiter,
@@ -873,6 +885,36 @@ router.post(
   "/dietitian/api/web/referral-client-list",
   authMiddleware,
   referralClientList
+);
+
+
+/* ===============================
+   🤖 Service-to-service (no JWT)
+================================ */
+
+// Upserts the current week's generated meal plan. The caller is a backend plan
+// generator, not a signed-in dietitian, so there is no JWT to bind identity to.
+// serviceAuthMiddleware is the substitute credential: an HMAC-SHA256 signature
+// over a timestamped, single-use-nonced canonical request (HIPAA §164.312(d)).
+// Authorization is then key scoping + the table_clients ownership gate inside
+// the controller. IP rate-limited ahead of the signature check.
+router.post(
+  "/dietitian/api/web/store_weekly_food_json_suggestion",
+  serviceApiRateLimiter,
+  serviceAuthMiddleware,
+  storeWeeklyFoodJsonSuggestion
+);
+
+// The read side of the same pipeline: the generator pulls the last 72h of tests
+// here, then writes plans back to the route above under the same key. GET-only,
+// matching the PHP's $_GET. This is a BULK PHI export — the whole client base is
+// reachable through it — so the key's `dietician_codes` scope is what bounds the
+// blast radius. The query string is part of the signature.
+router.get(
+  "/dietitian/api/web/get_latest_72hr_tests",
+  serviceApiRateLimiter,
+  serviceAuthMiddleware,
+  getLatest72hrTests
 );
 
 

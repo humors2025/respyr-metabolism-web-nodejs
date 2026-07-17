@@ -85,10 +85,17 @@ app.use((req, res, next) => {
 // =====================================================
 // Body parsers with strict size limits
 // =====================================================
+// `verify` stashes the raw bytes so HMAC-signed service requests can be checked
+// against exactly what was parsed (see middlewares/serviceAuthMiddleware.js).
+// Re-serialising req.body instead would let a caller sign one payload and have
+// the app act on another. Bounded by the same 1mb limit as the parser.
 app.use(
   express.json({
     limit: "1mb",
     strict: true,
+    verify: (req, res, buf) => {
+      req.rawBody = buf && buf.length ? Buffer.from(buf) : Buffer.alloc(0);
+    },
   })
 );
 
