@@ -19,6 +19,8 @@
  *                     PLUS the group's own admins as entries
  *   - clients       : all clients owned by (members + their trainers), paginated,
  *                     with name/email MASKED
+ *   - period_overview : date-wise total readings (trainer self + client), optionally
+ *                     scoped to ONE member/trainer subtree
  *
  * Behaviour parity with the PHP:
  *  - Member codes come from ta_admin_groups (status = 'active').
@@ -27,13 +29,24 @@
  *    (emailKeepClause / profileNotAdminClause ported verbatim).
  *  - Per-member / per-trainer total_clients, total_tests, total_tested_clients
  *    computed with the exact same correlated subqueries.
+ *  - Each provider (admin + trainer) carries a self_reading object built from one
+ *    getSelfReadingsByEmail() lookup: their OWN test data, which is deliberately
+ *    excluded from total_clients / total_tests so nothing is double counted.
  *  - Network codes = member codes ∪ trainer codes; clients are listed for those.
  *  - Client rows carry MASKED profile_name and email, masked owner email, latest
  *    test date + metabolism score, and a per-client distinct-day test count.
+ *  - period_overview: a "reading" = 1 per profile per day (the same
+ *    COUNT(DISTINCT profile_id, DATE(date_time)) convention as total_tests).
+ *      overview_date          -> that single day
+ *      overview_from/_to      -> that range (a missing side defaults to the other)
+ *      neither                -> today (Asia/Kolkata)
+ *      overview_member        -> scope to an ADMIN member (self + child trainers +
+ *                                their clients) or a TRAINER (self + own clients);
+ *                                a code outside the group's network -> 404
  *  - Response keys/shape match the PHP (status, message, group_name, actor,
- *    group_member_codes, network_codes, counts, group_members, trainers,
- *    clients_pagination, clients). `ok` is mirrored alongside `status` like the
- *    sibling Node controllers.
+ *    group_member_codes, network_codes, counts, period_overview, group_members,
+ *    trainers, clients_pagination, clients). `ok` is mirrored alongside `status`
+ *    like the sibling Node controllers.
  *  - Same DB tables only: table_dietician, app_user_roles, ta_admin_groups,
  *    table_clients, table_test_data, user_habits, app_auth_logs. Nothing added.
  *
@@ -51,6 +64,12 @@
  *    statements reject bound LIMIT/OFFSET on some MySQL builds).
  *  - LIKE search wildcards (% _ \) in the user term are escaped so a caller
  *    cannot widen the search beyond what they typed.
+ *  - overview_* dates are strictly validated (a real calendar date, so 2026-02-31
+ *    is rejected) before ever reaching SQL, and the span is capped at
+ *    MAX_OVERVIEW_RANGE_DAYS so a caller cannot force an unbounded table scan.
+ *    The PHP had no such cap.
+ *  - overview_member must be one of the group's own network codes (else 404), so
+ *    it cannot be used to read readings for a code outside the group.
  *  - Internal error details are suppressed in production responses (gated behind
  *    APP_DEBUG). Server logs carry only error metadata (code/errno/sqlState).
  *  - Cache-Control: no-store, Pragma: no-cache on every response.
@@ -58,6 +77,9 @@
  *    a shared mysql2 pool and mutating the session TZ would leak into other
  *    concurrent requests. Date bucketing (DATE(date_time)) uses the DB server
  *    clock, matching the documented decision in trainer-admin-clients-list-dir.js.
+ *    The period_overview DEFAULT day is app-computed in IST (todayDateIST), which
+ *    preserves the PHP's Asia/Kolkata semantics without touching the session TZ —
+ *    the same approach as get-clients-data-total-missed-test-masked.js.
  *
  * HIPAA controls:
  *  - Minimum-necessary columns; no SELECT * over PHI rows.
@@ -81,6 +103,10 @@ const ALLOWED_ACTOR_ROLES = new Set(["admin", "super_admin"]);
 
 const MAX_LIMIT = 50;
 const DEFAULT_LIMIT = 10;
+
+// VAPT: bound the period_overview scan window. The PHP accepted any span, so a
+// caller could ask for 1970..2999 and force a full table_test_data scan.
+const MAX_OVERVIEW_RANGE_DAYS = 366;
 
 // ─── Generic helpers ─────────────────────────────────────────────────────────
 
@@ -126,6 +152,45 @@ function toMysqlDateTime(val) {
     );
   }
   return String(val);
+}
+
+/**
+ * Port of PHP validDateYmd(): strictly validate a YYYY-MM-DD string, returning the
+ * normalized date or null. Round-tripping through Date rejects impossible calendar
+ * dates the way DateTime::createFromFormat + format() comparison does (2026-02-31
+ * rolls forward to 2026-03-03, so the round-trip no longer matches).
+ */
+function validDateYmd(value) {
+  if (value === null || value === undefined) return null;
+
+  const str = String(value).trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(str)) return null;
+
+  const d = new Date(`${str}T00:00:00Z`);
+  if (Number.isNaN(d.getTime()) || d.toISOString().slice(0, 10) !== str) return null;
+
+  return str;
+}
+
+/** Today's date in Asia/Kolkata as "YYYY-MM-DD" — the PHP's default TZ. */
+function todayDateIST() {
+  const ist = new Date(Date.now() + (5 * 60 + 30) * 60 * 1000);
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${ist.getUTCFullYear()}-${pad(ist.getUTCMonth() + 1)}-${pad(ist.getUTCDate())}`;
+}
+
+/** PHP date('Y-m-d', strtotime($ymd . ' +1 day')): the next calendar day. */
+function nextDayYmd(ymd) {
+  const d = new Date(`${ymd}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + 1);
+  return d.toISOString().slice(0, 10);
+}
+
+/** Inclusive whole-day span between two validated YYYY-MM-DD strings. */
+function daysBetweenInclusive(fromYmd, toYmd) {
+  const from = new Date(`${fromYmd}T00:00:00Z`).getTime();
+  const to = new Date(`${toYmd}T00:00:00Z`).getTime();
+  return Math.floor((to - from) / 86400000) + 1;
 }
 
 /**
@@ -509,27 +574,7 @@ async function getMembersInfo(codes, excludeEmails) {
                 WHERE UPPER(c3.dietician_id) = UPPER(COALESCE(aur.partner_code, td.dietician_id))
           )
           AND ${keepTest2.sql}
-      ) AS total_tested_clients,
-
-      /* The admin's OWN readings: tests on a profile that belongs to a client
-         whose email is the admin's own email — i.e. the admin testing
-         themselves. Exact inverse of the exclusion applied above. Counted by
-         distinct profile+day, matching total_tests. */
-      (
-        SELECT COUNT(DISTINCT t.profile_id, DATE(t.date_time))
-        FROM table_test_data t
-        WHERE UPPER(t.dietitian_id) = UPPER(COALESCE(aur.partner_code, td.dietician_id))
-          AND td.email IS NOT NULL
-          AND TRIM(td.email) <> ''
-          AND t.profile_id IN (
-                SELECT c4.profile_id
-                FROM table_clients c4
-                WHERE UPPER(c4.dietician_id) = UPPER(COALESCE(aur.partner_code, td.dietician_id))
-                  AND c4.email IS NOT NULL
-                  AND TRIM(c4.email) <> ''
-                  AND LOWER(TRIM(c4.email)) = LOWER(TRIM(td.email))
-          )
-      ) AS self_readings
+      ) AS total_tested_clients
 
     FROM table_dietician td
     LEFT JOIN app_user_roles aur
@@ -564,7 +609,6 @@ async function getMembersInfo(codes, excludeEmails) {
       total_clients: toInt(row.total_clients),
       total_tests: toInt(row.total_tests),
       total_tested_clients: toInt(row.total_tested_clients),
-      self_readings: toInt(row.self_readings),
     });
   }
 
@@ -646,28 +690,7 @@ async function getChildTrainers(adminEmails, excludeEmails) {
                 WHERE UPPER(c3.dietician_id) = UPPER(COALESCE(aur.partner_code, td.dietician_id))
           )
           AND ${keepTest2.sql}
-      ) AS total_tested_clients,
-
-      /* The trainer's OWN readings: tests on a profile that belongs to a client
-         whose email is the trainer's own email — i.e. the trainer testing
-         themselves. This is the exact inverse of the exclusion applied above, so
-         a reading is counted either as a client's test OR as a self reading,
-         never both. Counted by distinct profile+day, matching total_tests. */
-      (
-        SELECT COUNT(DISTINCT t.profile_id, DATE(t.date_time))
-        FROM table_test_data t
-        WHERE UPPER(t.dietitian_id) = UPPER(COALESCE(aur.partner_code, td.dietician_id))
-          AND td.email IS NOT NULL
-          AND TRIM(td.email) <> ''
-          AND t.profile_id IN (
-                SELECT c4.profile_id
-                FROM table_clients c4
-                WHERE UPPER(c4.dietician_id) = UPPER(COALESCE(aur.partner_code, td.dietician_id))
-                  AND c4.email IS NOT NULL
-                  AND TRIM(c4.email) <> ''
-                  AND LOWER(TRIM(c4.email)) = LOWER(TRIM(td.email))
-          )
-      ) AS self_readings
+      ) AS total_tested_clients
 
     FROM app_user_roles aur
     LEFT JOIN table_dietician td
@@ -707,11 +730,250 @@ async function getChildTrainers(adminEmails, excludeEmails) {
       total_clients: toInt(row.total_clients),
       total_tests: toInt(row.total_tests),
       total_tested_clients: toInt(row.total_tested_clients),
-      self_readings: toInt(row.self_readings),
     });
   }
 
   return trainers;
+}
+
+// ─── Self readings (each provider's OWN test data) ────────────────────────────
+
+/**
+ * Port of PHP getSelfReadingsByEmail().
+ *
+ * A trainer/admin who tested themselves has a table_clients row whose email matches
+ * their own login email. Those self rows are deliberately excluded from every
+ * provider's total_clients / total_tests above, so they are looked up separately
+ * here and exposed as the provider's OWN reading data.
+ *
+ * Returns a Map keyed by lower-cased email:
+ *   email => { total_tests, latest_date_time, latest_score, profile_id }
+ */
+async function getSelfReadingsByEmail(emails) {
+  // normalize + dedupe (PHP built an assoc array keyed by email)
+  const norm = [
+    ...new Set(
+      emails
+        .filter((e) => e !== null && e !== undefined)
+        .map(normalizeEmail)
+        .filter((e) => e !== "")
+    ),
+  ];
+
+  const map = new Map();
+  if (norm.length === 0) return map;
+
+  const inList = norm.map(() => "?").join(",");
+
+  const [rows] = await pool.execute(
+    `
+      SELECT
+        LOWER(TRIM(tc.email)) AS owner_email,
+        tc.profile_id,
+        tc.dietician_id,
+
+        (
+          SELECT COUNT(DISTINCT DATE(tt.date_time))
+          FROM table_test_data tt
+          WHERE tt.profile_id = tc.profile_id
+            AND UPPER(tt.dietitian_id) = UPPER(tc.dietician_id)
+        ) AS total_tests,
+
+        latest.date_time AS latest_date_time,
+        latest.fat_loss_metabolism_score AS latest_score
+
+      FROM table_clients tc
+
+      LEFT JOIN table_test_data latest
+        ON latest.test_id = (
+          SELECT t1.test_id
+          FROM table_test_data t1
+          WHERE t1.profile_id = tc.profile_id
+            AND UPPER(t1.dietitian_id) = UPPER(tc.dietician_id)
+          ORDER BY t1.date_time DESC, t1.test_id DESC
+          LIMIT 1
+        )
+
+      WHERE tc.email IS NOT NULL
+        AND TRIM(tc.email) <> ''
+        AND LOWER(TRIM(tc.email)) IN (${inList})
+    `,
+    norm
+  );
+
+  for (const row of rows) {
+    const email = row.owner_email;
+    if (!email) continue;
+
+    if (!map.has(email)) {
+      map.set(email, {
+        total_tests: 0,
+        latest_date_time: null,
+        latest_score: null,
+        profile_id: null,
+      });
+    }
+
+    const entry = map.get(email);
+    entry.total_tests += toInt(row.total_tests);
+
+    // a provider may have more than one self profile; keep the most recent test.
+    // Compare on the raw driver value (Date or string) the way PHP compared its
+    // datetime strings — both orderings are monotonic in time.
+    if (row.latest_date_time !== null && row.latest_date_time !== undefined) {
+      const current = entry.latest_date_time;
+      const isNewer =
+        current === null ||
+        (row.latest_date_time instanceof Date && current instanceof Date
+          ? row.latest_date_time.getTime() > current.getTime()
+          : String(row.latest_date_time) > String(current));
+
+      if (isNewer) {
+        entry.latest_date_time = row.latest_date_time;
+        entry.latest_score = row.latest_score;
+        entry.profile_id = row.profile_id;
+      }
+    }
+  }
+
+  return map;
+}
+
+/** Port of PHP buildSelfReading(): the self_reading object on a provider entry. */
+function buildSelfReading(selfMap, email) {
+  const key = email !== null && email !== undefined ? normalizeEmail(email) : "";
+  const self = key !== "" ? selfMap.get(key) : undefined;
+
+  if (self) {
+    return {
+      has_reading: toInt(self.total_tests) > 0,
+      profile_id: self.profile_id,
+      total_tests: toInt(self.total_tests),
+      latest_test: {
+        date_time: toMysqlDateTime(self.latest_date_time),
+        metabolism_score: scoreValue(self.latest_score),
+      },
+    };
+  }
+
+  return {
+    has_reading: false,
+    profile_id: null,
+    total_tests: 0,
+    latest_test: {
+      date_time: null,
+      metabolism_score: null,
+    },
+  };
+}
+
+// ─── Period overview ─────────────────────────────────────────────────────────
+
+/**
+ * Port of PHP getPeriodOverview(): total readings (provider self + client) for a
+ * date range.
+ *
+ * A "reading" = 1 per profile per day, matching the
+ * COUNT(DISTINCT profile_id, DATE(date_time)) convention used for total_tests.
+ *
+ *  - trainer_readings : tests on a SELF profile, i.e. a table_clients row whose
+ *    email matches one of the group's provider (admin/trainer) emails. Same
+ *    matching logic as getSelfReadingsByEmail.
+ *  - client_readings  : tests under the scope's codes on real client profiles;
+ *    self profiles are excluded so nothing is counted twice.
+ *
+ * dateFrom / dateTo are validated YYYY-MM-DD strings (inclusive). Half-open
+ * datetime bounds (>= from 00:00:00, < to+1day) keep the date_time index usable.
+ */
+async function getPeriodOverview(codes, providerEmails, dateFrom, dateTo) {
+  const overview = {
+    date_from: dateFrom,
+    date_to: dateTo,
+    total_readings: 0,
+    trainer_readings: 0,
+    client_readings: 0,
+  };
+
+  if (codes.length === 0) return overview;
+
+  // normalize + dedupe provider emails
+  const emails = [
+    ...new Set(
+      providerEmails
+        .filter((e) => e !== null && e !== undefined)
+        .map(normalizeEmail)
+        .filter((e) => e !== "")
+    ),
+  ];
+
+  const fromDt = `${dateFrom} 00:00:00`;
+  const toDtExclusive = `${nextDayYmd(dateTo)} 00:00:00`;
+
+  // ---- 1) Trainer / admin self readings ----
+  if (emails.length > 0) {
+    const inEmails = emails.map(() => "?").join(",");
+
+    const [rows] = await pool.execute(
+      `
+        SELECT COUNT(DISTINCT t.profile_id, DATE(t.date_time)) AS cnt
+        FROM table_test_data t
+        INNER JOIN table_clients sc
+          ON sc.profile_id = t.profile_id
+         AND UPPER(sc.dietician_id) = UPPER(t.dietitian_id)
+        WHERE sc.email IS NOT NULL
+          AND TRIM(sc.email) <> ''
+          AND LOWER(TRIM(sc.email)) IN (${inEmails})
+          AND t.date_time >= ?
+          AND t.date_time < ?
+      `,
+      [...emails, fromDt, toDtExclusive]
+    );
+
+    overview.trainer_readings = toInt(rows[0]?.cnt);
+  }
+
+  // ---- 2) Client readings (self profiles excluded) ----
+  const inCodesA = codes.map(() => "?").join(",");
+  const inCodesB = codes.map(() => "?").join(",");
+
+  let selfExcludeSql = "1=1";
+  let selfExcludeParams = [];
+
+  if (emails.length > 0) {
+    const inSelf = emails.map(() => "?").join(",");
+    selfExcludeSql = `t.profile_id NOT IN (
+            SELECT sc2.profile_id
+            FROM table_clients sc2
+            WHERE sc2.email IS NOT NULL
+              AND TRIM(sc2.email) <> ''
+              AND LOWER(TRIM(sc2.email)) IN (${inSelf})
+        )`;
+    selfExcludeParams = emails;
+  }
+
+  const normCodes = codes.map(normalizeCode);
+
+  const [rows] = await pool.execute(
+    `
+      SELECT COUNT(DISTINCT t.profile_id, DATE(t.date_time)) AS cnt
+      FROM table_test_data t
+      WHERE UPPER(t.dietitian_id) IN (${inCodesA})
+        AND t.date_time >= ?
+        AND t.date_time < ?
+        AND t.profile_id IN (
+              SELECT c.profile_id
+              FROM table_clients c
+              WHERE UPPER(c.dietician_id) IN (${inCodesB})
+        )
+        AND ${selfExcludeSql}
+    `,
+    [...normCodes, fromDt, toDtExclusive, ...normCodes, ...selfExcludeParams]
+  );
+
+  overview.client_readings = toInt(rows[0]?.cnt);
+  overview.total_readings = overview.trainer_readings + overview.client_readings;
+
+  return overview;
 }
 
 // ─── Clients ─────────────────────────────────────────────────────────────────
@@ -933,7 +1195,74 @@ function parseInputs(req) {
   // cross-check in the controller. The JWT remains the source of truth.
   const actorUserId = normalizeEmail(src.actor_user_id);
 
-  return { page, limit, search, groupName, actorUserId, offset: (page - 1) * limit };
+  // period_overview scope + window (all optional)
+  const overviewMember = normalizeCode(src.overview_member);
+  const overviewDateRaw = String(src.overview_date ?? "").trim();
+  const overviewFromRaw = String(src.overview_from ?? "").trim();
+  const overviewToRaw = String(src.overview_to ?? "").trim();
+
+  return {
+    page,
+    limit,
+    search,
+    groupName,
+    actorUserId,
+    overviewMember,
+    overviewDateRaw,
+    overviewFromRaw,
+    overviewToRaw,
+    offset: (page - 1) * limit,
+  };
+}
+
+/**
+ * Port of the PHP's period_overview date rules:
+ *   overview_date sent            -> that single day
+ *   else overview_from/_to        -> that range (a missing side defaults to the other)
+ *   else                          -> today (Asia/Kolkata)
+ * Returns { from, to } or { error: { status, body } }.
+ */
+function resolveOverviewRange({ overviewDateRaw, overviewFromRaw, overviewToRaw }) {
+  const fail = (message) => ({
+    error: { status: 422, body: { status: false, ok: false, message } },
+  });
+
+  let from;
+  let to;
+
+  if (overviewDateRaw !== "") {
+    // single day mode
+    from = validDateYmd(overviewDateRaw);
+    if (from === null) return fail("overview_date must be a valid YYYY-MM-DD date");
+    to = from;
+  } else if (overviewFromRaw !== "" || overviewToRaw !== "") {
+    // range mode; a missing side defaults to the other
+    from = overviewFromRaw !== "" ? validDateYmd(overviewFromRaw) : null;
+    to = overviewToRaw !== "" ? validDateYmd(overviewToRaw) : null;
+
+    if (overviewFromRaw !== "" && from === null) {
+      return fail("overview_from must be a valid YYYY-MM-DD date");
+    }
+    if (overviewToRaw !== "" && to === null) {
+      return fail("overview_to must be a valid YYYY-MM-DD date");
+    }
+
+    if (from === null) from = to;
+    if (to === null) to = from;
+
+    if (from > to) return fail("overview_from cannot be after overview_to");
+  } else {
+    // default: today (Asia/Kolkata)
+    from = todayDateIST();
+    to = from;
+  }
+
+  // VAPT: cap the scan window (not in the PHP).
+  if (daysBetweenInclusive(from, to) > MAX_OVERVIEW_RANGE_DAYS) {
+    return fail(`overview range cannot exceed ${MAX_OVERVIEW_RANGE_DAYS} days`);
+  }
+
+  return { from, to };
 }
 
 // ─── Controller ──────────────────────────────────────────────────────────────
@@ -948,7 +1277,11 @@ function parseInputs(req) {
  *     "page": 1,                             // optional, default 1
  *     "limit": 10,                           // optional, default 10, max 50
  *     "search": "",                          // optional, filters clients
- *     "actor_user_id": ""                    // optional; if set, must match token
+ *     "actor_user_id": "",                   // optional; if set, must match token
+ *     "overview_date": "2026-07-16",         // optional; period_overview for ONE day
+ *     "overview_from": "2026-07-01",         // optional; period_overview range start
+ *     "overview_to": "2026-07-16",           // optional; period_overview range end
+ *     "overview_member": "RESPYRD06"         // optional; scope overview to ONE member
  *   }
  */
 const getGroupDetails = async (req, res) => {
@@ -961,7 +1294,8 @@ const getGroupDetails = async (req, res) => {
     return res.status(405).json({ status: false, ok: false, message: "Only POST method is allowed" });
   }
 
-  const { page, limit, search, groupName, actorUserId, offset } = parseInputs(req);
+  const inputs = parseInputs(req);
+  const { page, limit, search, groupName, actorUserId, overviewMember, offset } = inputs;
 
   let actorEmail = null;
   let actorRole = null;
@@ -1011,6 +1345,13 @@ const getGroupDetails = async (req, res) => {
     if (groupName === "") {
       return res.status(422).json({ status: false, ok: false, message: "group_name is required" });
     }
+
+    // ── 1d. period_overview window (validated before it can reach SQL) ───────
+    const range = resolveOverviewRange(inputs);
+    if (range.error) {
+      return res.status(range.error.status).json(range.error.body);
+    }
+    const { from: overviewFrom, to: overviewTo } = range;
 
     // ── 2. Group members ────────────────────────────────────────────────────
     const memberCodes = await getGroupMemberCodes(groupName);
@@ -1070,10 +1411,24 @@ const getGroupDetails = async (req, res) => {
       total_clients: m.total_clients,
       total_tests: m.total_tests,
       total_tested_clients: m.total_tested_clients,
-      self_readings: m.self_readings,
     }));
 
     const trainers = [...adminEntries, ...childTrainers];
+
+    // ── 3b. Self readings (each provider's OWN test data) ────────────────────
+    // one lookup for every provider email, then attached to both lists.
+    const providerEmails = trainers
+      .map((t) => t.email)
+      .filter((e) => e !== null && e !== undefined && String(e).trim() !== "");
+
+    const selfMap = await getSelfReadingsByEmail(providerEmails);
+
+    for (const t of trainers) {
+      t.self_reading = buildSelfReading(selfMap, t.email ?? null);
+    }
+    for (const m of members) {
+      m.self_reading = buildSelfReading(selfMap, m.email ?? null);
+    }
 
     // ── 4. Network codes = members + trainers (de-duplicated, UPPER) ─────────
     const networkCodesMap = new Map();
@@ -1099,6 +1454,101 @@ const getGroupDetails = async (req, res) => {
       memberEmails
     );
 
+    // ── 5b. Period overview (date-wise total readings) ───────────────────────
+    // Optional member scope. When overview_member is sent, the overview counts
+    // only that member's subtree:
+    //   - ADMIN member code -> the admin + their child trainers + their clients
+    //   - TRAINER code      -> that trainer + their clients only
+    // The code must belong to this group's network, otherwise 404 — this is also
+    // the authz gate that stops overview_member reading outside the group.
+    let overviewScopeCodes = networkCodes;
+    let overviewScopeEmails = providerEmails;
+    let overviewScope = { type: "group", partner_code: null, name: null };
+
+    if (overviewMember !== "") {
+      if (!networkCodes.includes(overviewMember)) {
+        await writeAuthLogSafe(req, {
+          eventType: "group_details_denied",
+          userId: actorEmail,
+          role: actorRole,
+          partnerCode: actorCode,
+          identifier: overviewMember,
+          success: false,
+          failureReason: "overview_member is not part of this group",
+        });
+        return res.status(404).json({
+          status: false,
+          ok: false,
+          message: "overview_member is not part of this group",
+        });
+      }
+
+      if (memberCodes.includes(overviewMember)) {
+        // ---- admin member: self + child trainers ----
+        const member = members.find(
+          (m) =>
+            normalizeCode(m.partner_code) === overviewMember ||
+            normalizeCode(m.dietician_id) === overviewMember
+        );
+
+        const memberEmail = member ? member.email : null;
+        const memberName = member ? member.name : null;
+
+        const scopeCodes = new Map([[overviewMember, overviewMember]]);
+        const scopeEmails = new Map();
+
+        if (memberEmail !== null && memberEmail !== "") {
+          scopeEmails.set(memberEmail, memberEmail);
+        }
+
+        // child trainers of this admin (matched on parent_admin_email)
+        for (const t of trainers) {
+          const parent = t.parent_admin_email ?? null;
+
+          if (
+            parent !== null &&
+            memberEmail !== null &&
+            normalizeEmail(parent) === normalizeEmail(memberEmail)
+          ) {
+            const tc = normalizeCode(t.partner_code);
+            if (tc !== "") scopeCodes.set(tc, tc);
+
+            if (t.email !== null && t.email !== undefined && String(t.email).trim() !== "") {
+              const te = normalizeEmail(t.email);
+              scopeEmails.set(te, te);
+            }
+          }
+        }
+
+        overviewScopeCodes = [...scopeCodes.values()];
+        overviewScopeEmails = [...scopeEmails.values()];
+        overviewScope = { type: "member", partner_code: overviewMember, name: memberName };
+      } else {
+        // ---- single trainer scope ----
+        const trainer = trainers.find(
+          (t) => normalizeCode(t.partner_code) === overviewMember
+        );
+
+        const trainerEmail = trainer ? trainer.email ?? null : null;
+        const trainerName = trainer ? trainer.name ?? null : null;
+
+        overviewScopeCodes = [overviewMember];
+        overviewScopeEmails =
+          trainerEmail !== null && String(trainerEmail).trim() !== ""
+            ? [normalizeEmail(trainerEmail)]
+            : [];
+        overviewScope = { type: "trainer", partner_code: overviewMember, name: trainerName };
+      }
+    }
+
+    const periodOverview = await getPeriodOverview(
+      overviewScopeCodes,
+      overviewScopeEmails,
+      overviewFrom,
+      overviewTo
+    );
+    periodOverview.scope = overviewScope;
+
     // ── 6. Audit the read (fire-and-forget) ─────────────────────────────────
     writeAuthLogSafe(req, {
       eventType: "group_details_viewed",
@@ -1106,7 +1556,10 @@ const getGroupDetails = async (req, res) => {
       role: actorRole,
       partnerCode: actorCode,
       identifier:
-        "group:" + groupName + "|page:" + page + "|search:" + search + "|masked:true",
+        "group:" + groupName + "|page:" + page + "|search:" + search +
+        "|overview:" + overviewFrom + ".." + overviewTo +
+        "|scope:" + overviewScope.type + (overviewMember !== "" ? ":" + overviewMember : "") +
+        "|masked:true",
       success: true,
       failureReason: "Group details viewed (client identity masked)",
     });
@@ -1132,6 +1585,9 @@ const getGroupDetails = async (req, res) => {
         trainers: trainers.length,
         clients: totalClients,
       },
+
+      // date-wise total readings (trainer self readings + client readings)
+      period_overview: periodOverview,
 
       // the admins in the group
       group_members: members,
