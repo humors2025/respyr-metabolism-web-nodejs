@@ -210,6 +210,11 @@ const {
 
 
 const {
+  getGroupOnboarding,
+} = require("../controllers/dietitian/api/web/get_group_onboarding");
+
+
+const {
   manageAdminGroups,
 } = require("../controllers/dietitian/api/web/manage_admin_groups");
 
@@ -764,6 +769,13 @@ router.post(
   "/dietitian/api/web/get_group_details",
   authMiddleware,
   getGroupDetails
+);
+
+
+router.post(
+  "/dietitian/api/web/get_group_onboarding",
+  authMiddleware,
+  getGroupOnboarding
 );
 
 
