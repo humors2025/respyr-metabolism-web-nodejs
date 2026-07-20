@@ -13,20 +13,21 @@
  * Purpose (onboarding roster). Given a group_name and a date window, returns the
  * people who were ONBOARDED into that group's network inside the window — the
  * trainers/admins whose app_user_roles row was created, and the clients whose
- * table_clients row was created — as ONE feed ordered newest-first.
+ * table_clients row was created.
  *
  * Sibling of get_group_details.js: identical actor resolution, identical RBAC,
- * identical group/network derivation, identical masking. Where get_group_details
- * answers "who is in this group right now", this answers "who joined between
- * these two dates".
+ * identical group/network derivation, identical masking, and the same
+ * two-list response shape (trainers + clients as SEPARATE arrays, each with its
+ * own pagination block). Where get_group_details answers "who is in this group
+ * right now", this answers "who joined between these two dates".
  *
  * Sources (no new tables):
- *   - providers : app_user_roles.created_at  (admins of the group + their trainers)
- *   - clients   : table_clients.dttm         (clients owned by any network code)
- * Both streams are UNION ALL'd in SQL on (kind, key, onboarded_at) so ONE page of
- * the merged feed is fetched, then each page row is hydrated with detail. Counts
- * are computed over the same filters, so counts.* always describe the full window,
- * not the page.
+ *   - trainers : app_user_roles.created_at  (admins of the group + their trainers)
+ *   - clients  : table_clients.dttm         (clients owned by any network code)
+ * The two streams are queried, counted and paginated INDEPENDENTLY — paging
+ * through clients never disturbs the trainers list. Each stream fetches only its
+ * page of keys, then hydrates just those rows with detail. Counts are computed
+ * over the same filters, so counts.* always describe the full window, not the page.
  *
  * Exclusion rule (deliberate, documented deviation from get_group_details):
  *   A table_clients row whose email matches ANY network provider (admin/trainer)
@@ -560,15 +561,18 @@ async function getGroupTrainers(adminEmails) {
   });
 }
 
-// ─── Feed building blocks ────────────────────────────────────────────────────
+// ─── Stream building blocks ──────────────────────────────────────────────────
+//
+// Each stream is defined ONCE as a { sql, params } key-set — (key_id, onboarded_at)
+// — then reused for both its COUNT and its page fetch, so the count and the rows
+// can never drift apart. Detail hydration happens afterwards, for the page only.
 
 /**
- * The provider half of the feed. Keyed on LOWER(user_id) because partner_code can
- * be NULL in app_user_roles (the admin fallback above), while user_id is the join
- * key the rest of this file already trusts.
- *   { sql, params } producing (kind, key_id, onboarded_at).
+ * The trainer/admin stream. Keyed on LOWER(user_id) because partner_code can be
+ * NULL in app_user_roles (the admin fallback above), while user_id is the join key
+ * the rest of this file already trusts.
  */
-function providerFeedPart(providerEmails, escapedSearch, fromDt, toDtExclusive) {
+function trainerStream(providerEmails, escapedSearch, fromDt, toDtExclusive) {
   const inList = providerEmails.map(() => "?").join(",");
   const params = [...providerEmails.map(normalizeEmail), fromDt, toDtExclusive];
 
@@ -588,7 +592,6 @@ function providerFeedPart(providerEmails, escapedSearch, fromDt, toDtExclusive) 
   return {
     sql: `
       SELECT
-        'provider' AS kind,
         LOWER(aur.user_id) AS key_id,
         aur.created_at AS onboarded_at
       FROM app_user_roles aur
@@ -605,11 +608,10 @@ function providerFeedPart(providerEmails, escapedSearch, fromDt, toDtExclusive) 
 }
 
 /**
- * The client half of the feed: clients owned by any network code, minus provider
- * self-test profiles.
- *   { sql, params } producing (kind, key_id, onboarded_at).
+ * The client stream: clients owned by any network code, minus provider self-test
+ * profiles.
  */
-function clientFeedPart(networkCodes, providerEmails, escapedSearch, fromDt, toDtExclusive) {
+function clientStream(networkCodes, providerEmails, escapedSearch, fromDt, toDtExclusive) {
   const inList = networkCodes.map(() => "?").join(",");
   const keepClient = emailKeepClause(providerEmails, "tc.email");
 
@@ -637,7 +639,6 @@ function clientFeedPart(networkCodes, providerEmails, escapedSearch, fromDt, toD
   return {
     sql: `
       SELECT
-        'client' AS kind,
         tc.profile_id AS key_id,
         tc.dttm AS onboarded_at
       FROM table_clients tc
@@ -652,40 +653,41 @@ function clientFeedPart(networkCodes, providerEmails, escapedSearch, fromDt, toD
   };
 }
 
-/** COUNT(*) over one feed part. */
-async function countFeedPart(part) {
+/** COUNT(*) over one stream — the full window total, independent of paging. */
+async function countStream(stream) {
+  if (stream === null) return 0;
+
   const [rows] = await pool.execute(
-    `SELECT COUNT(*) AS total FROM (${part.sql}) AS feed`,
-    part.params
+    `SELECT COUNT(*) AS total FROM (${stream.sql}) AS s`,
+    stream.params
   );
   return toInt(rows[0]?.total);
 }
 
 /**
- * One page of the merged feed. Parenthesised SELECTs so the trailing ORDER BY
- * applies to the union, not to the last branch.
+ * One page of a stream's keys, newest onboarding first.
  *
  * limit/offset are hard-coerced to non-negative ints, so inlining is
  * injection-safe. mysql2 prepared statements reject bound LIMIT/OFFSET on some
  * MySQL builds, hence they are not passed as placeholders.
  */
-async function fetchFeedPage(parts, limit, offset) {
-  if (parts.length === 0) return [];
+async function fetchStreamPage(stream, limit, offset) {
+  if (stream === null) return [];
 
   const safeLimit = Math.max(0, toInt(limit));
   const safeOffset = Math.max(0, toInt(offset));
 
-  const sql =
-    parts.map((p) => `(${p.sql})`).join(" UNION ALL ") +
+  const [rows] = await pool.execute(
     `
-      ORDER BY onboarded_at DESC, kind ASC, key_id ASC
+      SELECT key_id, onboarded_at
+      FROM (${stream.sql}) AS s
+      ORDER BY onboarded_at DESC, key_id ASC
       LIMIT ${safeLimit} OFFSET ${safeOffset}
-    `;
+    `,
+    stream.params
+  );
 
-  const params = parts.flatMap((p) => p.params);
-
-  const [rows] = await pool.execute(sql, params);
-  return rows;
+  return rows.map((r) => String(r.key_id));
 }
 
 // ─── Page hydration ──────────────────────────────────────────────────────────
@@ -969,7 +971,6 @@ function formatClientEntry(row) {
   const totalTests = toInt(row.total_tests);
 
   return {
-    kind: "client",
     profile_id: row.profile_id,
     dietician_id: row.dietician_id,
     profile_name: maskName(row.profile_name),
@@ -1008,13 +1009,12 @@ function formatClientEntry(row) {
   };
 }
 
-/** Onboarded provider (admin/trainer) entry. Providers are staff, so not masked. */
-function formatProviderEntry(provider, clientCounts, testCounts, selfMap) {
+/** Onboarded trainer/admin entry. Providers are staff, so identity is not masked. */
+function formatTrainerEntry(provider, clientCounts, testCounts, selfMap) {
   const code = normalizeCode(provider.partner_code);
   const tests = testCounts.get(code) || { total_tests: 0, total_tested_clients: 0 };
 
   return {
-    kind: "provider",
     partner_code: provider.partner_code,
     dietician_id: provider.dietician_id ?? null,
     name: provider.name,
@@ -1036,16 +1036,34 @@ function formatProviderEntry(provider, clientCounts, testCounts, selfMap) {
 
 // ─── Input parsing ───────────────────────────────────────────────────────────
 
+/** page -> a sane 1-based page number. */
+function parsePage(val, fallback) {
+  const n = parseInt(val, 10);
+  if (!Number.isFinite(n) || n <= 0) return fallback;
+  return n;
+}
+
+/** limit -> a sane page size, capped at MAX_LIMIT. */
+function parseLimit(val, fallback) {
+  const n = parseInt(val, 10);
+  if (!Number.isFinite(n) || n <= 0 || n > MAX_LIMIT) return fallback;
+  return n;
+}
+
 function parseInputs(req) {
   const src = req.body && typeof req.body === "object" ? req.body : {};
 
-  let page = parseInt(src.page, 10);
-  if (!Number.isFinite(page) || page <= 0) page = 1;
+  // The trainers and clients lists page INDEPENDENTLY. page/limit set both;
+  // trainer_page/trainer_limit and client_page/client_limit override per list, so
+  // the UI can walk a long client list while the trainers list stays put.
+  const page = parsePage(src.page, 1);
+  const limit = parseLimit(src.limit, DEFAULT_LIMIT);
 
-  let limit = parseInt(src.limit, 10);
-  if (!Number.isFinite(limit) || limit <= 0 || limit > MAX_LIMIT) {
-    limit = DEFAULT_LIMIT;
-  }
+  const trainerPage = parsePage(src.trainer_page, page);
+  const trainerLimit = parseLimit(src.trainer_limit, limit);
+
+  const clientPage = parsePage(src.client_page, page);
+  const clientLimit = parseLimit(src.client_limit, limit);
 
   const search = typeof src.search === "string" ? src.search.trim() : "";
   const groupName = typeof src.group_name === "string" ? src.group_name.trim() : "";
@@ -1061,17 +1079,21 @@ function parseInputs(req) {
   const memberCode = normalizeCode(src.member);
 
   return {
-    page,
-    limit,
     search,
     groupName,
     actorUserId,
     type,
     memberCode,
-    typeRaw,
     dateFromRaw: String(src.date_from ?? "").trim(),
     dateToRaw: String(src.date_to ?? "").trim(),
-    offset: (page - 1) * limit,
+
+    trainerPage,
+    trainerLimit,
+    trainerOffset: (trainerPage - 1) * trainerLimit,
+
+    clientPage,
+    clientLimit,
+    clientOffset: (clientPage - 1) * clientLimit,
   };
 }
 
@@ -1129,11 +1151,19 @@ function resolveWindow({ dateFromRaw, dateToRaw }) {
  *     "date_to": "2026-07-20",              // optional
  *     "type": "all",                        // optional: all | trainer | client
  *     "member": "RESPYRD06",                // optional; scope to ONE network code's subtree
- *     "page": 1,                            // optional, default 1
- *     "limit": 10,                          // optional, default 10, max 50
+ *     "page": 1,                            // optional, default 1  (both lists)
+ *     "limit": 10,                          // optional, default 10, max 50 (both lists)
+ *     "trainer_page": 1,                    // optional; overrides page for trainers only
+ *     "trainer_limit": 10,                  // optional; overrides limit for trainers only
+ *     "client_page": 1,                     // optional; overrides page for clients only
+ *     "client_limit": 10,                   // optional; overrides limit for clients only
  *     "search": "",                         // optional
  *     "actor_user_id": ""                   // optional; if set, must match token
  *   }
+ *
+ * Response: trainers and clients are SEPARATE arrays, each preceded by its own
+ * pagination block (trainers_pagination / clients_pagination), so the caller never
+ * has to demultiplex one feed.
  */
 const getGroupOnboarding = async (req, res) => {
   // HIPAA: never let intermediaries cache PHI-adjacent responses.
@@ -1146,7 +1176,19 @@ const getGroupOnboarding = async (req, res) => {
   }
 
   const inputs = parseInputs(req);
-  const { page, limit, search, groupName, actorUserId, type, memberCode, offset } = inputs;
+  const {
+    search,
+    groupName,
+    actorUserId,
+    type,
+    memberCode,
+    trainerPage,
+    trainerLimit,
+    trainerOffset,
+    clientPage,
+    clientLimit,
+    clientOffset,
+  } = inputs;
 
   let actorEmail = null;
   let actorRole = null;
@@ -1330,77 +1372,64 @@ const getGroupOnboarding = async (req, res) => {
       ),
     ];
 
-    // ── 4. Build + count the feed ───────────────────────────────────────────
+    // ── 4. Define the two streams, then count + page each independently ─────
     const escapedSearch = search !== "" ? escapeLike(search) : "";
 
-    const wantProviders = type === "all" || type === "trainer";
+    // `type` only decides whether a stream is queried at all. A skipped stream
+    // returns an empty array and a zero count rather than disappearing, so the
+    // response shape never changes under the caller.
+    const wantTrainers = type === "all" || type === "trainer";
     const wantClients = type === "all" || type === "client";
 
-    const parts = [];
-
-    const providerPart =
-      wantProviders && providerEmails.length > 0
-        ? providerFeedPart(providerEmails, escapedSearch, fromDt, toDtExclusive)
+    const trainerPart =
+      wantTrainers && providerEmails.length > 0
+        ? trainerStream(providerEmails, escapedSearch, fromDt, toDtExclusive)
         : null;
 
     const clientPart =
       wantClients && networkCodes.length > 0
-        ? clientFeedPart(networkCodes, providerEmails, escapedSearch, fromDt, toDtExclusive)
+        ? clientStream(networkCodes, providerEmails, escapedSearch, fromDt, toDtExclusive)
         : null;
 
-    if (providerPart) parts.push(providerPart);
-    if (clientPart) parts.push(clientPart);
+    const [newTrainers, newClients, trainerKeys, clientKeys] = await Promise.all([
+      countStream(trainerPart),
+      countStream(clientPart),
+      fetchStreamPage(trainerPart, trainerLimit, trainerOffset),
+      fetchStreamPage(clientPart, clientLimit, clientOffset),
+    ]);
 
-    const newProviders = providerPart ? await countFeedPart(providerPart) : 0;
-    const newClients = clientPart ? await countFeedPart(clientPart) : 0;
-    const total = newProviders + newClients;
-
-    const feedRows = await fetchFeedPage(parts, limit, offset);
-
-    // ── 5. Hydrate this page only ───────────────────────────────────────────
-    const pageProviderEmails = feedRows
-      .filter((r) => r.kind === "provider")
-      .map((r) => normalizeEmail(r.key_id));
-
-    const pageProviders = pageProviderEmails
-      .map((email) => providers.find((p) => normalizeEmail(p.email ?? "") === email))
+    // ── 5. Hydrate the two pages only ───────────────────────────────────────
+    // trainerKeys are emails (the app_user_roles join key); clientKeys are profile_ids.
+    const pageProviders = trainerKeys
+      .map((key) => {
+        const email = normalizeEmail(key);
+        return providers.find((p) => normalizeEmail(p.email ?? "") === email);
+      })
       .filter(Boolean);
 
     const pageProviderCodes = [
       ...new Set(pageProviders.map((p) => normalizeCode(p.partner_code)).filter((c) => c !== "")),
     ];
 
-    const pageProfileIds = feedRows
-      .filter((r) => r.kind === "client")
-      .map((r) => String(r.key_id));
-
     const [clientCounts, testCounts, selfMap, clientRows] = await Promise.all([
       getClientCountsByCode(pageProviderCodes, providerEmails),
       getTestCountsByCode(pageProviderCodes, providerEmails),
       getSelfReadingsByEmail(pageProviders.map((p) => p.email)),
-      fetchClientsByProfileIds(pageProfileIds),
+      fetchClientsByProfileIds(clientKeys),
     ]);
 
-    const providerByEmail = new Map(
-      pageProviders.map((p) => [normalizeEmail(p.email ?? ""), p])
-    );
+    // pageProviders is already in feed order; the client hydration query is not,
+    // so re-apply clientKeys' ordering (newest onboarding first).
     const clientByProfileId = new Map(clientRows.map((r) => [String(r.profile_id), r]));
 
-    // Re-apply the feed's ordering — the hydration queries returned unordered sets.
-    const items = [];
-    for (const row of feedRows) {
-      if (row.kind === "provider") {
-        const provider = providerByEmail.get(normalizeEmail(row.key_id));
-        if (provider) {
-          items.push(formatProviderEntry(provider, clientCounts, testCounts, selfMap));
-        }
-      } else {
-        const client = clientByProfileId.get(String(row.key_id));
-        if (client) {
-          items.push(formatClientEntry(client));
-        }
-      }
-    }
+    const trainersOut = pageProviders.map((p) =>
+      formatTrainerEntry(p, clientCounts, testCounts, selfMap)
+    );
+
+    const clientsOut = clientKeys
+      .map((id) => clientByProfileId.get(String(id)))
+      .filter(Boolean)
+      .map(formatClientEntry);
 
     // ── 6. Audit the read (fire-and-forget) ─────────────────────────────────
     writeAuthLogSafe(req, {
@@ -1410,7 +1439,9 @@ const getGroupOnboarding = async (req, res) => {
       partnerCode: actorCode,
       identifier:
         "group:" + groupName + "|window:" + dateFrom + ".." + dateTo +
-        "|type:" + type + "|page:" + page + "|search:" + search +
+        "|type:" + type +
+        "|trainer_page:" + trainerPage + "|client_page:" + clientPage +
+        "|search:" + search +
         "|scope:" + scope.type + (memberCode !== "" ? ":" + memberCode : "") +
         "|masked:true",
       success: true,
@@ -1443,21 +1474,32 @@ const getGroupOnboarding = async (req, res) => {
 
       // onboarded INSIDE the window (not the group's lifetime totals)
       counts: {
-        new_trainers: newProviders,
+        new_trainers: newTrainers,
         new_clients: newClients,
-        total,
+        total: newTrainers + newClients,
       },
 
-      pagination: {
-        page,
-        limit,
-        offset,
-        total,
-        has_more: offset + limit < total,
+      // ── trainers / admins onboarded in the window (newest first) ──────────
+      trainers_pagination: {
+        page: trainerPage,
+        limit: trainerLimit,
+        offset: trainerOffset,
+        total: newTrainers,
+        has_more: trainerOffset + trainerLimit < newTrainers,
       },
 
-      // merged feed, newest onboarding first
-      items,
+      trainers: trainersOut,
+
+      // ── clients onboarded in the window (newest first, identity MASKED) ───
+      clients_pagination: {
+        page: clientPage,
+        limit: clientLimit,
+        offset: clientOffset,
+        total: newClients,
+        has_more: clientOffset + clientLimit < newClients,
+      },
+
+      clients: clientsOut,
     });
   } catch (err) {
     console.error("GET_GROUP_ONBOARDING_ERROR:", {
