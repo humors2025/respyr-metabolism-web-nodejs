@@ -290,6 +290,11 @@ const {
 
 
 const {
+  listAcceptedAgreements,
+} = require("../controllers/dietitian/api/web/list-accepted-agreements");
+
+
+const {
   invitePreview,
 } = require("../controllers/dietitian/api/web/invite-preview");
 
@@ -678,6 +683,13 @@ router.post(
   "/dietitian/api/web/list-admin-trainer-users-jwt",
   authMiddleware,
   listAdminTrainerUsersJwt
+);
+
+
+router.post(
+  "/dietitian/api/web/list-accepted-agreements",
+  authMiddleware,
+  listAcceptedAgreements
 );
 
 
