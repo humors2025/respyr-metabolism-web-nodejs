@@ -24,12 +24,25 @@ app.disable("x-powered-by");
 app.set("trust proxy", 1);
 
 // Security headers
+// app.use(
+//   helmet({
+//     crossOriginResourcePolicy: false,
+//     contentSecurityPolicy: false, // API-only backend, safer to avoid frontend/API breakage
+//   })
+// );
+
+
 app.use(
   helmet({
     crossOriginResourcePolicy: false,
     contentSecurityPolicy: false, // API-only backend, safer to avoid frontend/API breakage
+    strictTransportSecurity: {
+      maxAge: 31536000, // 1 year — VAPT-recommended value (RFC 6797)
+      includeSubDomains: true,
+    },
   })
 );
+
 
 // Prevent caching health/client/test data
 app.use((req, res, next) => {
