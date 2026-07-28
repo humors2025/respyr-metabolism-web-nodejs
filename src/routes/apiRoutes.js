@@ -333,6 +333,10 @@ const {
   getLatest72hrTests,
 } = require("../controllers/dietitian/api/web/get_latest_72hr_tests");
 
+const {
+  fetchSingleClientWorkerJobTest,
+} = require("../controllers/dietitian/api/web/fetch-single-client-worker-job-test");
+
 
 // // 🥗 Habits — selected-habits (5-habit system)
 // const {
@@ -951,6 +955,20 @@ router.get(
   serviceApiRateLimiter,
   serviceAuthMiddleware,
   getLatest72hrTests
+);
+
+// The worker's test harness: the same feed as the route above, plus a
+// single-profile mode (dietitian_id + profile_id) for re-running the generator
+// against one named client. Still live production PHI from the same tables, so
+// it carries the same credential — "test endpoint" is not a security posture.
+// In single-profile mode the requested dietitian_id must be inside the key's
+// `dietician_codes` scope, or the whole client base is addressable one profile
+// at a time. The query string is part of the signature.
+router.get(
+  "/dietitian/api/web/fetch-single-client-worker-job-test",
+  serviceApiRateLimiter,
+  serviceAuthMiddleware,
+  fetchSingleClientWorkerJobTest
 );
 
 
