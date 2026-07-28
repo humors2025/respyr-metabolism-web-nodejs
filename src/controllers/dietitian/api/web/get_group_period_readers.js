@@ -1023,6 +1023,29 @@ const getGroupPeriodReaders = async (req, res) => {
       }
     }
 
+    // ── 4b. Provider lookup maps (identity attachment for both lists) ────────
+    // by email  -> the provider row (for trainer_readers)
+    // by code   -> the provider row (for client_readers: who owns dietitian_id)
+    // member name by email -> the admin's name (for parent_admin_name)
+    const providersByEmail = new Map();
+    const providersByCode = new Map();
+    const memberNameByEmail = new Map();
+
+    for (const p of providers) {
+      if (p.email !== null && p.email !== "" && !providersByEmail.has(p.email)) {
+        providersByEmail.set(p.email, p);
+      }
+      const code = normalizeCode(p.partner_code);
+      if (code !== "" && !providersByCode.has(code)) {
+        providersByCode.set(code, p);
+      }
+    }
+    for (const m of members) {
+      if (m.email !== null && m.email !== "" && !memberNameByEmail.has(m.email)) {
+        memberNameByEmail.set(m.email, m.name);
+      }
+    }
+
     // ── 5. Trainer readers (providers with a self reading in the window) ─────
     let trainerReaders = [];
     let trainerReadings = 0;
@@ -1030,21 +1053,22 @@ const getGroupPeriodReaders = async (req, res) => {
     if (type === "all" || type === "trainers") {
       const rawTrainerReaders = await getTrainerReaders(scopeEmails, dateFrom, dateTo);
 
-      // attach provider identity (name / code / role) by email; emails masked out.
-      const byEmail = new Map();
-      for (const p of providers) {
-        if (p.email !== null && p.email !== "" && !byEmail.has(p.email)) {
-          byEmail.set(p.email, p);
-        }
-      }
-
       trainerReaders = rawTrainerReaders.map((r) => {
-        const p = byEmail.get(r.provider_email) || null;
+        const p = providersByEmail.get(r.provider_email) || null;
+
+        // the trainer's parent admin (null for admins themselves)
+        const parentEmail = p ? p.parent_admin_email : null;
+        const parentAdminName =
+          parentEmail !== null && parentEmail !== undefined
+            ? memberNameByEmail.get(normalizeEmail(parentEmail)) ?? null
+            : null;
+
         return {
           partner_code: p ? p.partner_code : null,
           name: p ? p.name : "NA",
           email: maskEmail(r.provider_email),
           role: p ? p.role : "trainer",
+          parent_admin_name: parentAdminName,
           reads: r.reads,
           first_reading_at: r.first_reading_at,
           last_reading_at: r.last_reading_at,
@@ -1077,11 +1101,16 @@ const getGroupPeriodReaders = async (req, res) => {
           identities.get(r.profile_id) ||
           { profile_name: "NA", email: null };
 
+        // the provider (trainer/admin) who owns this client's dietitian code
+        const owner = providersByCode.get(normalizeCode(r.dietitian_id)) || null;
+
         return {
           profile_id: r.profile_id,
           profile_name: idn.profile_name === "" ? "NA" : idn.profile_name,
           email: idn.email,
           dietitian_id: r.dietitian_id,
+          trainer_name: owner ? owner.name : null,
+          trainer_role: owner ? owner.role : null,
           reads: r.reads,
           first_reading_at: r.first_reading_at,
           last_reading_at: r.last_reading_at,
