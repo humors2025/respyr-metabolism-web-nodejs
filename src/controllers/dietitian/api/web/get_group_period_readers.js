@@ -505,7 +505,7 @@ async function getTrainerReaders(providerEmails, dateFrom, dateTo) {
     `
       SELECT
         LOWER(TRIM(sc.email))                              AS provider_email,
-        COUNT(DISTINCT sc.profile_id, DATE(t.date_time))   AS reads,
+        COUNT(DISTINCT sc.profile_id, DATE(t.date_time))   AS read_count,
         MIN(t.date_time)                                   AS first_reading_at,
         MAX(t.date_time)                                   AS last_reading_at
       FROM table_test_data t
@@ -525,7 +525,7 @@ async function getTrainerReaders(providerEmails, dateFrom, dateTo) {
 
   return rows.map((row) => ({
     provider_email: row.provider_email,
-    reads: toInt(row.reads),
+    reads: toInt(row.read_count),
     first_reading_at: toMysqlDateTime(row.first_reading_at),
     last_reading_at: toMysqlDateTime(row.last_reading_at),
   }));
@@ -646,7 +646,7 @@ async function fetchClientReaders(codes, providerEmails, dateFrom, dateTo, escap
       SELECT
         t.profile_id,
         UPPER(t.dietitian_id)                 AS dietitian_id,
-        COUNT(DISTINCT DATE(t.date_time))     AS reads,
+        COUNT(DISTINCT DATE(t.date_time))     AS read_count,
         MIN(t.date_time)                      AS first_reading_at,
         MAX(t.date_time)                      AS last_reading_at
       FROM table_test_data t
@@ -661,7 +661,7 @@ async function fetchClientReaders(codes, providerEmails, dateFrom, dateTo, escap
   return rows.map((row) => ({
     profile_id: row.profile_id,
     dietitian_id: row.dietitian_id,
-    reads: toInt(row.reads),
+    reads: toInt(row.read_count),
     first_reading_at: toMysqlDateTime(row.first_reading_at),
     last_reading_at: toMysqlDateTime(row.last_reading_at),
   }));
