@@ -210,6 +210,11 @@ const {
 
 
 const {
+  getGroupPeriodReaders,
+} = require("../controllers/dietitian/api/web/get_group_period_readers");
+
+
+const {
   getGroupOnboarding,
 } = require("../controllers/dietitian/api/web/get_group_onboarding");
 
@@ -781,6 +786,13 @@ router.post(
   "/dietitian/api/web/get_group_details",
   authMiddleware,
   getGroupDetails
+);
+
+
+router.post(
+  "/dietitian/api/web/get_group_period_readers",
+  authMiddleware,
+  getGroupPeriodReaders
 );
 
 
