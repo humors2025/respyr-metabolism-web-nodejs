@@ -387,6 +387,15 @@ const fetchSingleClientWorkerJobTest = async (req, res) => {
   const serviceKeyId = req.serviceClient?.keyId || null;
 
   try {
+
+  if (
+    process.env.ENABLE_API_ERROR_TEST === "true" &&
+    req.query.force_error === "1"
+  ) {
+    throw new Error("Intentional test error");
+  }
+
+
     // ── 1. Validate inputs ──────────────────────────────────────────────────
     let limit = parseIntParam(req.query.limit, "limit", DEFAULT_LIMIT);
     const cursor = parseIntParam(req.query.cursor, "cursor", 0);
