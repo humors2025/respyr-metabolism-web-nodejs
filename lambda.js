@@ -1,5 +1,5 @@
 const serverless = require("serverless-http");
-const { hydrateSecrets } = require("./src/config/secrets");
+const { hydrateSecrets } = require("./src/config/secretsManager");
 
 // ---------------------------------------------------------------------------
 // Cold-start initialization.
@@ -76,6 +76,7 @@ async function buildHandler() {
 }
 
 module.exports.handler = async (event, context) => {
+  context.callbackWaitsForEmptyEventLoop = false;
   if (!handlerPromise) {
     handlerPromise = buildHandler().catch((err) => {
       // Reset so the NEXT invocation retries hydration instead of the
