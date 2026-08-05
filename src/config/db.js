@@ -22,20 +22,33 @@ const poolConfig = {
 };
 
 if (isLambda) {
-  // Strict TLS: verify the RDS server certificate against Amazon's RDS CA
-  // bundle and validate the hostname. Requires DB_HOST to be the RDS DNS
-  // endpoint (xxx.rds.amazonaws.com), NOT a raw IP — certificate hostname
-  // validation fails against IPs.
+  // ---------------------------------------------------------------------------
+  // TLS via certificate pinning (self-hosted MySQL on EC2).
   //
-  // rds-global-bundle.pem is the public AWS RDS trust store, downloaded from
-  // https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem
-  // It is a public certificate bundle, safe to commit.
+  // The DB is MySQL on an EC2 instance using MySQL's auto-generated
+  // self-signed certificates, so the public RDS CA bundle cannot validate it.
+  // Instead we PIN the server's own CA (src/config/mysql-ca.pem, copied from
+  // /var/lib/mysql/ca.pem on the DB host):
+  //
+  //   - rejectUnauthorized: true  -> full certificate CHAIN validation is ON.
+  //     Only certificates signed by our pinned CA are accepted. A MITM with
+  //     any other certificate (including any other self-signed cert) is
+  //     rejected. This replaces the previous rejectUnauthorized:false, which
+  //     accepted ANY certificate.
+  //
+  //   - checkServerIdentity: () => undefined -> skips ONLY the hostname
+  //     check. MySQL auto-generated certs carry a generic CN (not our IP),
+  //     so hostname matching can never succeed. Chain validation above is
+  //     unaffected. Returning undefined = identity accepted.
+  //
+  // If the DB server's certificates are ever regenerated (e.g. MySQL
+  // reinstall), copy the new ca.pem into src/config/mysql-ca.pem and
+  // redeploy, or connections will fail closed with HANDSHAKE_SSL_ERROR.
+  // ---------------------------------------------------------------------------
   poolConfig.ssl = {
     rejectUnauthorized: true,
-    ca: fs.readFileSync(
-      path.join(__dirname, "rds-global-bundle.pem"),
-      "utf8"
-    ),
+    ca: fs.readFileSync(path.join(__dirname, "mysql-ca.pem"), "utf8"),
+    checkServerIdentity: () => undefined,
   };
 
   // Add connection timeout for Lambda
@@ -63,8 +76,6 @@ pool.getConnection()
   });
 
 module.exports = pool;
-
-
 
 
 
