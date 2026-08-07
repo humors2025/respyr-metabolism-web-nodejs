@@ -151,12 +151,25 @@ exports.changePassword = async (req, res) => {
       });
     }
 
+    // const dietician = rows[0];
+
+    // const isCurrentPasswordValid = await bcrypt.compare(
+    //   current_password,
+    //   dietician.password
+    // );
+
+
     const dietician = rows[0];
+
+    // PHP-era $2y$ hashes -> $2b$ so native bcrypt can verify them.
+    const storedHash = String(dietician.password || '').replace(/^\$2y\$/, '$2b$');
 
     const isCurrentPasswordValid = await bcrypt.compare(
       current_password,
-      dietician.password
+      storedHash
     );
+
+
 
     if (!isCurrentPasswordValid) {
       return res.status(401).json({
@@ -165,10 +178,18 @@ exports.changePassword = async (req, res) => {
       });
     }
 
+    // const isSamePassword = await bcrypt.compare(
+    //   new_password,
+    //   dietician.password
+    // );
+
+
     const isSamePassword = await bcrypt.compare(
       new_password,
-      dietician.password
+      storedHash
     );
+
+    
 
     if (isSamePassword) {
       return res.status(400).json({
