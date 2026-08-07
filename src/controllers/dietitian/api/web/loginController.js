@@ -438,7 +438,8 @@ exports.login = async (req, res) => {
       });
     }
 
-    const hash = String(user.password || '');
+    // const hash = String(user.password || '');
+     const hash = String(user.password || '').replace(/^\$2y\$/, '$2b$');
 
     let passwordOk = false;
 

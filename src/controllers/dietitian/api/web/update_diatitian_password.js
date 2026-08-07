@@ -209,7 +209,10 @@ exports.updateDietitianPassword = async (req, res) => {
     }
 
     // ── 3. Reject reuse of the current password ───────────────────────────────
-    const currentHash = String(user.password || "");
+    // const currentHash = String(user.password || "");
+
+ const currentHash = String(user.password || "").replace(/^\$2y\$/, "$2b$");
+
     if (currentHash !== "") {
       let same = false;
       try {
