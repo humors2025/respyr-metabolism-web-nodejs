@@ -27,7 +27,8 @@
  */
 
 const crypto = require("crypto");
-const bcrypt = require("bcryptjs");
+// const bcrypt = require("bcryptjs");
+const bcrypt = require("bcrypt");
 const pool = require("../../../../config/db");
 const otpStore = require("../../../../services/dietitianOtpStore");
 

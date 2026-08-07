@@ -59,7 +59,8 @@
 
 // changePasswordController.js
 const pool = require('../../../../config/db');
-const bcrypt = require('bcryptjs');
+// const bcrypt = require('bcryptjs');
+const bcrypt = require("bcrypt");
 
 const BCRYPT_ROUNDS = Number(process.env.BCRYPT_ROUNDS || 12);
 

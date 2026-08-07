@@ -3,7 +3,8 @@
 'use strict';
 
 const crypto = require('crypto');
-const bcrypt = require('bcryptjs');
+// const bcrypt = require('bcryptjs');
+const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const pool = require('../../../../config/db');
 
