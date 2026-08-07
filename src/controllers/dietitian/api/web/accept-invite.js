@@ -14,7 +14,8 @@
  *   5. Backend inserts PDF reference into agreement_terms_conditions table.
  */
 
-const bcrypt = require("bcryptjs");
+// const bcrypt = require("bcryptjs");
+const bcrypt = require("bcrypt");
 const pool = require("../../../../config/db");
 
 const { HeadObjectCommand } = require("@aws-sdk/client-s3");
