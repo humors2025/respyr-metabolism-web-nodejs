@@ -27,6 +27,11 @@
  *  - Response keys/shape match the PHP (ok, mode, title, actor, overview,
  *    network). mode = "super_admin_trainer_admin_overview" for a super_admin,
  *    else "trainer_admin_overview".
+ *  - network.trainers is paginated (page/limit body params, default 20, max 50,
+ *    same contract as get_group_details.js). network.trainers_pagination carries
+ *    page/limit/offset/total/has_more. Overview counts always reflect the FULL
+ *    network, never the page; per-trainer clients_count / client_invites_count
+ *    queries run only for the returned page.
  *  - Same DB tables only: table_dietician, app_user_roles, table_clients,
  *    app_user_invitations, trainer_client_invites, app_auth_logs. Nothing added
  *    or removed.
@@ -66,6 +71,11 @@ const APP_DEBUG = process.env.NODE_ENV !== "production";
 
 const VALID_ACTOR_ROLES = new Set(["super_admin", "admin", "trainer"]);
 const OVERVIEW_ROLES = new Set(["admin", "super_admin"]);
+
+// Trainers list pagination (in-memory slice of the response list; the full list
+// still drives the overview counts, same as get_group_details.js).
+const TRAINER_MAX_LIMIT = 50;
+const TRAINER_DEFAULT_LIMIT = 20;
 
 const EMPTY_CLIENT_INVITE_TOTALS = Object.freeze({
   total: 0,
@@ -408,8 +418,13 @@ async function getNetworkCodesForOverview(actor, actorEmail) {
 /**
  * PHP get_network_trainers(): active trainers in the actor's network with their
  * per-trainer clients_count and client_invites_count.
+ *
+ * Pagination: the full row set is still fetched so `total` (and therefore
+ * accepted_trainers_count / total_trainers in the overview) reflects the whole
+ * network, but the expensive per-trainer count queries run only for the rows on
+ * the requested page. Returns { total, trainers }.
  */
-async function getNetworkTrainers(actor, actorEmail) {
+async function getNetworkTrainers(actor, actorEmail, { limit, offset }) {
   const role = String(actor.role);
 
   let rows;
@@ -477,10 +492,16 @@ async function getNetworkTrainers(actor, actorEmail) {
     );
   }
 
+  const total = rows.length;
+  const safeLimit = Math.max(0, toInt(limit));
+  const safeOffset = Math.max(0, toInt(offset));
+  const pageRows = rows.slice(safeOffset, safeOffset + safeLimit);
+
   const out = [];
 
   // Sequential awaits mirror the PHP and keep the shared mysql2 pool unstressed.
-  for (const row of rows) {
+  // Counts are computed only for the page being returned.
+  for (const row of pageRows) {
     const code = getEffectiveCodeFromRow(row);
 
     out.push({
@@ -508,7 +529,7 @@ async function getNetworkTrainers(actor, actorEmail) {
     });
   }
 
-  return out;
+  return { total, trainers: out };
 }
 
 // ─── Client counts ───────────────────────────────────────────────────────────
@@ -662,7 +683,25 @@ function parseInputs(req) {
   const targetUserId = normalizeEmail(
     src.email ?? src.target_user_id ?? src.view_as_user_id
   );
-  return { actorUserId, targetUserId };
+
+  // Trainers pagination (optional; defaults keep old callers working).
+  // `page`/`limit` are primary; `trainer_page`/`trainer_limit` are accepted as
+  // aliases for symmetry with get_group_details.js.
+  let page = parseInt(src.page ?? src.trainer_page, 10);
+  if (!Number.isFinite(page) || page <= 0) page = 1;
+
+  let limit = parseInt(src.limit ?? src.trainer_limit, 10);
+  if (!Number.isFinite(limit) || limit <= 0 || limit > TRAINER_MAX_LIMIT) {
+    limit = TRAINER_DEFAULT_LIMIT;
+  }
+
+  return {
+    actorUserId,
+    targetUserId,
+    page,
+    limit,
+    offset: (page - 1) * limit,
+  };
 }
 
 // ─── Controller ──────────────────────────────────────────────────────────────
@@ -672,7 +711,11 @@ function parseInputs(req) {
  *
  * Headers: Authorization: Bearer <JWT>
  * Body:
- *   { "actor_user_id": "" }   // optional; if set, must match the token email
+ *   {
+ *     "actor_user_id": "",   // optional; if set, must match the token email
+ *     "page": 1,             // optional, default 1 (trainers list)
+ *     "limit": 20            // optional, default 20, max 50 (trainers list)
+ *   }
  */
 const trainerAdminOverview = async (req, res) => {
   // HIPAA: never let intermediaries cache PHI-adjacent responses.
@@ -684,7 +727,7 @@ const trainerAdminOverview = async (req, res) => {
     return res.status(405).json({ ok: false, error: "Method not allowed" });
   }
 
-  const { actorUserId, targetUserId } = parseInputs(req);
+  const { actorUserId, targetUserId, page, limit, offset } = parseInputs(req);
 
   let actorEmail = null;
   let actorRole = null;
@@ -796,7 +839,11 @@ const trainerAdminOverview = async (req, res) => {
 
     // ── 2. Network codes + trainer rows (scoped to the effective actor) ─────
     const networkCodes = await getNetworkCodesForOverview(effectiveActor, effectiveEmail);
-    const trainerRows = await getNetworkTrainers(effectiveActor, effectiveEmail);
+    const { total: totalTrainers, trainers: trainerRows } = await getNetworkTrainers(
+      effectiveActor,
+      effectiveEmail,
+      { limit, offset }
+    );
 
     // ── 3. Counts ────────────────────────────────────────────────────────────
     const [
@@ -815,7 +862,9 @@ const trainerAdminOverview = async (req, res) => {
       countClientInvitesForCodes(networkCodes),
     ]);
 
-    const acceptedTrainersCount = trainerRows.length;
+    // Whole-network total, NOT the page length — counts must not change when
+    // the caller pages through the list.
+    const acceptedTrainersCount = totalTrainers;
     const trainerClientsCount = Math.max(0, totalClientsInNetwork - ownClientsCount);
 
     // ── 4. Audit — success (fire-and-forget) ────────────────────────────────
@@ -878,6 +927,13 @@ const trainerAdminOverview = async (req, res) => {
 
       network: {
         codes: networkCodes,
+        trainers_pagination: {
+          page,
+          limit,
+          offset,
+          total: totalTrainers,
+          has_more: offset + limit < totalTrainers,
+        },
         trainers: trainerRows,
       },
     });
