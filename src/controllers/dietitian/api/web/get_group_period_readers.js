@@ -16,7 +16,8 @@
  *
  * It returns, for a date window and the same optional member/trainer scope:
  *   - trainer_readers : providers (admins + trainers) who took a SELF reading
- *                       in the window, each with reads (distinct days),
+ *                       in the window, paginated (trainer_page/trainer_limit,
+ *                       default 20), each with reads (distinct days),
  *                       first/last reading time
  *   - client_readers  : real client profiles (self profiles excluded) that
  *                       took a reading in the window, MASKED, paginated,
@@ -24,9 +25,11 @@
  *
  * Reading convention (identical to get_group_details / total_tests):
  *   1 reading = 1 per profile per day  ->  COUNT(DISTINCT profile_id, DATE(date_time))
- * so summing each row's `reads` reproduces the period_overview counts exactly:
- *   sum(trainer_readers[].reads) === period_overview.trainer_readings
- *   sum over ALL client readers    === period_overview.client_readings
+ * so summing `reads` over ALL rows (across pages) reproduces the
+ * period_overview counts exactly; both pre-pagination sums are returned as
+ * totals.trainer_readings / totals.client_readings:
+ *   sum over ALL trainer readers === period_overview.trainer_readings
+ *   sum over ALL client readers  === period_overview.client_readings
  *
  * Window rules (same as get_group_details period_overview):
  *   overview_date sent       -> that single day
@@ -83,9 +86,15 @@ const APP_DEBUG = process.env.NODE_ENV !== "production";
 
 const ALLOWED_ACTOR_ROLES = new Set(["admin", "super_admin"]);
 
-// client_readers pagination (trainer list is naturally small — never paginated)
+// client_readers pagination
 const MAX_LIMIT = 100;
-const DEFAULT_LIMIT = 50;
+const DEFAULT_LIMIT = 20;
+
+// trainer_readers pagination (in-memory slice; totals are still computed over
+// the full list so the reads sum keeps matching period_overview). Same limits
+// as the trainers list in get_group_details.js.
+const TRAINER_MAX_LIMIT = 50;
+const TRAINER_DEFAULT_LIMIT = 20;
 
 // VAPT: bound the scan window (same rationale as get_group_details.js).
 const MAX_OVERVIEW_RANGE_DAYS = 366;
@@ -721,6 +730,15 @@ function parseInputs(req) {
     limit = DEFAULT_LIMIT;
   }
 
+  // trainer_readers pagination (optional; defaults keep old callers working)
+  let trainerPage = parseInt(src.trainer_page, 10);
+  if (!Number.isFinite(trainerPage) || trainerPage <= 0) trainerPage = 1;
+
+  let trainerLimit = parseInt(src.trainer_limit, 10);
+  if (!Number.isFinite(trainerLimit) || trainerLimit <= 0 || trainerLimit > TRAINER_MAX_LIMIT) {
+    trainerLimit = TRAINER_DEFAULT_LIMIT;
+  }
+
   const search = typeof src.search === "string" ? src.search.trim() : "";
   const groupName = typeof src.group_name === "string" ? src.group_name.trim() : "";
 
@@ -747,6 +765,9 @@ function parseInputs(req) {
     overviewToRaw,
     type,
     offset: (page - 1) * limit,
+    trainerPage,
+    trainerLimit,
+    trainerOffset: (trainerPage - 1) * trainerLimit,
   };
 }
 
@@ -805,7 +826,9 @@ function resolveOverviewRange({ overviewDateRaw, overviewFromRaw, overviewToRaw 
  *     "overview_member": "RESPYRD06",        // optional; member/trainer scope
  *     "type": "all",                          // optional; all|trainers|clients
  *     "page": 1,                              // optional; client_readers page
- *     "limit": 50,                            // optional; default 50, max 100
+ *     "limit": 20,                            // optional; default 20, max 100
+ *     "trainer_page": 1,                      // optional; trainer_readers page
+ *     "trainer_limit": 20,                    // optional; default 20, max 50
  *     "search": "",                           // optional; filters client readers
  *     "actor_user_id": ""                     // optional; if set, must match token
  *   }
@@ -822,6 +845,7 @@ const getGroupPeriodReaders = async (req, res) => {
   const inputs = parseInputs(req);
   const {
     page, limit, search, groupName, actorUserId, overviewMember, type, offset,
+    trainerPage, trainerLimit, trainerOffset,
   } = inputs;
 
   let actorEmail = null;
@@ -1049,6 +1073,7 @@ const getGroupPeriodReaders = async (req, res) => {
     // ── 5. Trainer readers (providers with a self reading in the window) ─────
     let trainerReaders = [];
     let trainerReadings = 0;
+    let totalTrainerReaders = 0;
 
     if (type === "all" || type === "trainers") {
       const rawTrainerReaders = await getTrainerReaders(scopeEmails, dateFrom, dateTo);
@@ -1075,7 +1100,11 @@ const getGroupPeriodReaders = async (req, res) => {
         };
       });
 
+      // totals over the FULL list (so the reads sum still reproduces
+      // period_overview.trainer_readings), then slice the requested page.
       trainerReadings = trainerReaders.reduce((s, r) => s + r.reads, 0);
+      totalTrainerReaders = trainerReaders.length;
+      trainerReaders = trainerReaders.slice(trainerOffset, trainerOffset + trainerLimit);
     }
 
     // ── 6. Client readers (masked, paginated) ────────────────────────────────
@@ -1140,7 +1169,7 @@ const getGroupPeriodReaders = async (req, res) => {
       identifier:
         "group:" + groupName + "|window:" + dateFrom + ".." + dateTo +
         "|scope:" + scope.type + (overviewMember !== "" ? ":" + overviewMember : "") +
-        "|type:" + type + "|page:" + page + "|masked:true",
+        "|type:" + type + "|page:" + page + "|tpage:" + trainerPage + "|masked:true",
       success: true,
       failureReason: "Period readers viewed (client identity masked)",
     });
@@ -1165,11 +1194,18 @@ const getGroupPeriodReaders = async (req, res) => {
         trainer_readings: trainerReadings,
         client_readings: clientReadings,
         total_readings: trainerReadings + clientReadings,
-        trainer_readers: trainerReaders.length,
+        trainer_readers: totalTrainerReaders,
         client_readers: totalClientReaders,
       },
 
-      // providers (admins + trainers) who self-tested in the window
+      // providers (admins + trainers) who self-tested in the window (paginated)
+      trainer_readers_pagination: {
+        page: trainerPage,
+        limit: trainerLimit,
+        offset: trainerOffset,
+        total: totalTrainerReaders,
+        has_more: trainerOffset + trainerLimit < totalTrainerReaders,
+      },
       trainer_readers: trainerReaders,
 
       // real client profiles that tested in the window (masked, paginated)
