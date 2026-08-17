@@ -27,11 +27,15 @@
  *  - Response keys/shape match the PHP (ok, mode, title, actor, overview,
  *    network). mode = "super_admin_trainer_admin_overview" for a super_admin,
  *    else "trainer_admin_overview".
- *  - network.trainers is paginated (page/limit body params, default 20, max 50,
- *    same contract as get_group_details.js). network.trainers_pagination carries
- *    page/limit/offset/total/has_more. Overview counts always reflect the FULL
- *    network, never the page; per-trainer clients_count / client_invites_count
- *    queries run only for the returned page.
+ *  - network.trainers is paginated (page/limit body params, default 10, max 50,
+ *    same contract as get_group_details.js) and searchable (`search` body param,
+ *    alias `trainer_search`): case-insensitive substring match on
+ *    name/email/user_id/phone_no/partner_code, filtered in memory BEFORE the
+ *    page is sliced. network.trainers_pagination carries
+ *    page/limit/offset/total/has_more, where total = rows matching the search.
+ *    Overview counts always reflect the FULL network, never the page or the
+ *    search; per-trainer clients_count / client_invites_count queries run only
+ *    for the returned page.
  *  - Same DB tables only: table_dietician, app_user_roles, table_clients,
  *    app_user_invitations, trainer_client_invites, app_auth_logs. Nothing added
  *    or removed.
@@ -75,7 +79,11 @@ const OVERVIEW_ROLES = new Set(["admin", "super_admin"]);
 // Trainers list pagination (in-memory slice of the response list; the full list
 // still drives the overview counts, same as get_group_details.js).
 const TRAINER_MAX_LIMIT = 50;
-const TRAINER_DEFAULT_LIMIT = 20;
+const TRAINER_DEFAULT_LIMIT = 10;
+
+// VAPT: bound the search term — it only feeds an in-memory includes() filter
+// (never SQL); the cap just keeps hostile payloads out of logs and CPU.
+const TRAINER_MAX_SEARCH_LENGTH = 100;
 
 const EMPTY_CLIENT_INVITE_TOTALS = Object.freeze({
   total: 0,
@@ -419,12 +427,15 @@ async function getNetworkCodesForOverview(actor, actorEmail) {
  * PHP get_network_trainers(): active trainers in the actor's network with their
  * per-trainer clients_count and client_invites_count.
  *
- * Pagination: the full row set is still fetched so `total` (and therefore
- * accepted_trainers_count / total_trainers in the overview) reflects the whole
- * network, but the expensive per-trainer count queries run only for the rows on
- * the requested page. Returns { total, trainers }.
+ * Search + pagination: the full row set is still fetched so `networkTotal`
+ * (and therefore accepted_trainers_count / total_trainers in the overview)
+ * reflects the whole network; `search` then filters that set in memory
+ * (case-insensitive substring on name/email/user_id/phone_no/partner_code —
+ * never SQL) and the page is sliced from the FILTERED set, so the expensive
+ * per-trainer count queries run only for the rows being returned.
+ * Returns { networkTotal, filteredTotal, trainers }.
  */
-async function getNetworkTrainers(actor, actorEmail, { limit, offset }) {
+async function getNetworkTrainers(actor, actorEmail, { limit, offset, search }) {
   const role = String(actor.role);
 
   let rows;
@@ -492,10 +503,27 @@ async function getNetworkTrainers(actor, actorEmail, { limit, offset }) {
     );
   }
 
-  const total = rows.length;
+  const networkTotal = rows.length;
+
+  let filteredRows = rows;
+  if (search !== "") {
+    const term = search.toLowerCase();
+    filteredRows = rows.filter((row) => {
+      const code = getEffectiveCodeFromRow(row);
+      return (
+        String(row.name ?? "").toLowerCase().includes(term) ||
+        String(row.email ?? "").toLowerCase().includes(term) ||
+        String(row.user_id ?? "").toLowerCase().includes(term) ||
+        String(row.phone_no ?? "").toLowerCase().includes(term) ||
+        String(code ?? "").toLowerCase().includes(term)
+      );
+    });
+  }
+
+  const filteredTotal = filteredRows.length;
   const safeLimit = Math.max(0, toInt(limit));
   const safeOffset = Math.max(0, toInt(offset));
-  const pageRows = rows.slice(safeOffset, safeOffset + safeLimit);
+  const pageRows = filteredRows.slice(safeOffset, safeOffset + safeLimit);
 
   const out = [];
 
@@ -529,7 +557,7 @@ async function getNetworkTrainers(actor, actorEmail, { limit, offset }) {
     });
   }
 
-  return { total, trainers: out };
+  return { networkTotal, filteredTotal, trainers: out };
 }
 
 // ─── Client counts ───────────────────────────────────────────────────────────
@@ -695,12 +723,22 @@ function parseInputs(req) {
     limit = TRAINER_DEFAULT_LIMIT;
   }
 
+  // Trainers search (optional). `search` is primary; `trainer_search` is an
+  // alias for symmetry with get_group_details.js. Length-capped; only ever
+  // used for an in-memory includes() filter, never interpolated into SQL.
+  const rawSearch = src.search ?? src.trainer_search;
+  const search =
+    typeof rawSearch === "string"
+      ? rawSearch.trim().slice(0, TRAINER_MAX_SEARCH_LENGTH)
+      : "";
+
   return {
     actorUserId,
     targetUserId,
     page,
     limit,
     offset: (page - 1) * limit,
+    search,
   };
 }
 
@@ -714,7 +752,9 @@ function parseInputs(req) {
  *   {
  *     "actor_user_id": "",   // optional; if set, must match the token email
  *     "page": 1,             // optional, default 1 (trainers list)
- *     "limit": 20            // optional, default 20, max 50 (trainers list)
+ *     "limit": 10,           // optional, default 10, max 50 (trainers list)
+ *     "search": ""           // optional, filters trainers (name/email/phone/code),
+ *                            // alias: trainer_search
  *   }
  */
 const trainerAdminOverview = async (req, res) => {
@@ -727,7 +767,7 @@ const trainerAdminOverview = async (req, res) => {
     return res.status(405).json({ ok: false, error: "Method not allowed" });
   }
 
-  const { actorUserId, targetUserId, page, limit, offset } = parseInputs(req);
+  const { actorUserId, targetUserId, page, limit, offset, search } = parseInputs(req);
 
   let actorEmail = null;
   let actorRole = null;
@@ -839,10 +879,10 @@ const trainerAdminOverview = async (req, res) => {
 
     // ── 2. Network codes + trainer rows (scoped to the effective actor) ─────
     const networkCodes = await getNetworkCodesForOverview(effectiveActor, effectiveEmail);
-    const { total: totalTrainers, trainers: trainerRows } = await getNetworkTrainers(
+    const { networkTotal, filteredTotal, trainers: trainerRows } = await getNetworkTrainers(
       effectiveActor,
       effectiveEmail,
-      { limit, offset }
+      { limit, offset, search }
     );
 
     // ── 3. Counts ────────────────────────────────────────────────────────────
@@ -862,9 +902,9 @@ const trainerAdminOverview = async (req, res) => {
       countClientInvitesForCodes(networkCodes),
     ]);
 
-    // Whole-network total, NOT the page length — counts must not change when
-    // the caller pages through the list.
-    const acceptedTrainersCount = totalTrainers;
+    // Whole-network total, NOT the page length or the search-filtered count —
+    // overview counts must not change when the caller pages or searches.
+    const acceptedTrainersCount = networkTotal;
     const trainerClientsCount = Math.max(0, totalClientsInNetwork - ownClientsCount);
 
     // ── 4. Audit — success (fire-and-forget) ────────────────────────────────
@@ -931,8 +971,8 @@ const trainerAdminOverview = async (req, res) => {
           page,
           limit,
           offset,
-          total: totalTrainers,
-          has_more: offset + limit < totalTrainers,
+          total: filteredTotal,
+          has_more: offset + limit < filteredTotal,
         },
         trainers: trainerRows,
       },
