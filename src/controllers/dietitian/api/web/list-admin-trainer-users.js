@@ -18,9 +18,13 @@
  *                  + pending/expired/revoked trainer invites + rich totals.
  *  - trainer / any other role → 403.
  *  - JSON shape (keys, ordering, totals block, datetime strings) matches PHP,
- *    plus pagination: page/limit body params (default 10, max 50) slice each of
- *    the four lists in-memory; *_pagination meta blocks carry
- *    page/limit/offset/total/has_more. `totals` always reflects the full lists.
+ *    plus search + pagination: per-list search params (existing_search,
+ *    pending_search, expired_search, revoked_search; legacy `search` is the
+ *    fallback for any list without its own term) filter each list in-memory
+ *    (name/email/phone/partner_code), then page/limit body params (default 10,
+ *    max 50) slice the filtered lists; *_pagination meta blocks carry
+ *    page/limit/offset/total/has_more where `total` is the filtered count.
+ *    `totals` always reflects the full unfiltered lists.
  *
  * Hardening differences from PHP (intentional):
  *  - The PHP file is explicitly a "Temporary no-JWT version" that trusts a
@@ -68,6 +72,23 @@ const APP_DEBUG = process.env.NODE_ENV !== "production";
 const MAX_LIMIT = 50;
 const DEFAULT_LIMIT = 10;
 
+// VAPT: bound the search term — it only feeds an in-memory includes() filter
+// (never SQL), the cap just keeps hostile payloads out of logs and CPU.
+const MAX_SEARCH_LENGTH = 100;
+
+// Fields the `search` param matches against (case-insensitive substring).
+// Covers both row shapes: existing users (name/email/phone_no/partner_code/
+// user_id) and invites (name/first_name/last_name/email/phone_no/partner_code).
+const SEARCH_FIELDS = [
+  "name",
+  "first_name",
+  "last_name",
+  "email",
+  "user_id",
+  "phone_no",
+  "partner_code",
+];
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 function normalizeEmail(val) {
@@ -107,10 +128,10 @@ function nullableInt(val) {
 }
 
 /**
- * Pagination inputs (optional; defaults keep old callers working).
+ * Pagination + search inputs (optional; defaults keep old callers working).
  * Same parsing rules as get_group_details.js / trainer-admin-overview.js.
  */
-function parsePagination(req) {
+function parseInputs(req) {
   const src = req.body || {};
 
   let page = parseInt(src.page, 10);
@@ -121,7 +142,39 @@ function parsePagination(req) {
     limit = DEFAULT_LIMIT;
   }
 
-  return { page, limit, offset: (page - 1) * limit };
+  // Per-list search terms. Each list has its own param; the shared legacy
+  // `search` is the fallback when a list-specific one is empty/absent (same
+  // precedence pattern as clients_search vs search in get_group_details.js).
+  const cleanSearch = (val) =>
+    typeof val === "string" ? val.trim().slice(0, MAX_SEARCH_LENGTH) : "";
+
+  const legacySearch = cleanSearch(src.search);
+  const pick = (specific) => (specific !== "" ? specific : legacySearch);
+
+  const searches = {
+    existing: pick(cleanSearch(src.existing_search)),
+    pending:  pick(cleanSearch(src.pending_search)),
+    expired:  pick(cleanSearch(src.expired_search)),
+    revoked:  pick(cleanSearch(src.revoked_search)),
+  };
+
+  return { page, limit, offset: (page - 1) * limit, searches };
+}
+
+/**
+ * Case-insensitive substring filter over SEARCH_FIELDS. Runs in-memory on the
+ * already-built rows — never touches SQL. Empty term returns rows unchanged.
+ */
+function filterBySearch(rows, term) {
+  if (term === "") return rows;
+
+  const needle = term.toLowerCase();
+
+  return rows.filter((row) =>
+    SEARCH_FIELDS.some((field) =>
+      String(row[field] ?? "").toLowerCase().includes(needle)
+    )
+  );
 }
 
 /**
@@ -884,14 +937,22 @@ function buildTrainerTotals(existingTrainers, pendingTrainers, expiredTrainers, 
  * Headers: Authorization: Bearer <JWT>
  * Body:
  *   {
- *     "page": 1,    // optional, default 1
- *     "limit": 10   // optional, default 10, max 50
+ *     "page": 1,             // optional, default 1
+ *     "limit": 10,           // optional, default 10, max 50
+ *     "existing_search": "", // optional, filters `existing` only
+ *     "pending_search": "",  // optional, filters `pending_invites` only
+ *     "expired_search": "",  // optional, filters `expired_invites` only
+ *     "revoked_search": "",  // optional, filters `revoked_invites` only
+ *     "search": ""           // optional, fallback for any list whose
+ *                            // list-specific param is empty/absent
  *   }
  *   (actor identity comes from JWT, NOT body.actor_user_id)
  *
- * page/limit apply to each of the four response lists independently
- * (existing, pending/expired/revoked invites); each list carries its own
- * *_pagination meta block. `totals` always reflects the FULL lists.
+ * All search params match name/email/phone/partner_code (case-insensitive
+ * substring). Each list is filtered by its own term, then page/limit slice
+ * each filtered list independently; each list carries its own *_pagination
+ * meta block whose `total` is the FILTERED count. `totals` always reflects
+ * the FULL unfiltered lists.
  *
  * Returns:
  *   super_admin → { mode: "super_admin_admins", existing: [self + admins], ... }
@@ -911,7 +972,7 @@ const listAdminTrainerUsers = async (req, res) => {
     });
   }
 
-  const pagination = parsePagination(req);
+  const inputs = parseInputs(req);
 
   let actorEmail = null;
   let actorRole  = null;
@@ -955,22 +1016,26 @@ const listAdminTrainerUsers = async (req, res) => {
         getInvitesByStatus("admin", actorEmail, "revoked"),
       ]);
 
-      // Totals come from the FULL lists — they must not change while paging.
+      // Totals come from the FULL unfiltered lists — they must not change
+      // while paging or searching.
       const totals = buildAdminTotals(
         existingRows, pendingAdmins, expiredAdmins, revokedAdmins
       );
 
-      const existingPage = paginateList(existingRows, pagination);
-      const pendingPage  = paginateList(pendingAdmins, pagination);
-      const expiredPage  = paginateList(expiredAdmins, pagination);
-      const revokedPage  = paginateList(revokedAdmins, pagination);
+      // Each list is filtered by ITS OWN search term, then pagination slices
+      // the filtered result; *_pagination.total reflects the FILTERED count.
+      const existingPage = paginateList(filterBySearch(existingRows, inputs.searches.existing), inputs);
+      const pendingPage  = paginateList(filterBySearch(pendingAdmins, inputs.searches.pending), inputs);
+      const expiredPage  = paginateList(filterBySearch(expiredAdmins, inputs.searches.expired), inputs);
+      const revokedPage  = paginateList(filterBySearch(revokedAdmins, inputs.searches.revoked), inputs);
 
       writeAuthLogSafe(req, {
         eventType:     "user_list_viewed",
         userId:        actorEmail,
         role:          actorRole,
         partnerCode:   getActorEffectivePartnerCode(actor),
-        identifier:    actorEmail + "|page:" + pagination.page,
+        identifier:    actorEmail + "|page:" + inputs.page +
+                       "|search:" + Object.values(inputs.searches).join(","),
         success:       true,
         failureReason: "Super admin viewed admin list",
       });
@@ -1011,22 +1076,26 @@ const listAdminTrainerUsers = async (req, res) => {
         getInvitesByStatus("trainer", actorEmail, "revoked"),
       ]);
 
-      // Totals come from the FULL lists — they must not change while paging.
+      // Totals come from the FULL unfiltered lists — they must not change
+      // while paging or searching.
       const totals = buildTrainerTotals(
         existingTrainerRows, pendingTrainers, expiredTrainers, revokedTrainers
       );
 
-      const existingPage = paginateList(existingTrainerRows, pagination);
-      const pendingPage  = paginateList(pendingTrainers, pagination);
-      const expiredPage  = paginateList(expiredTrainers, pagination);
-      const revokedPage  = paginateList(revokedTrainers, pagination);
+      // Each list is filtered by ITS OWN search term, then pagination slices
+      // the filtered result; *_pagination.total reflects the FILTERED count.
+      const existingPage = paginateList(filterBySearch(existingTrainerRows, inputs.searches.existing), inputs);
+      const pendingPage  = paginateList(filterBySearch(pendingTrainers, inputs.searches.pending), inputs);
+      const expiredPage  = paginateList(filterBySearch(expiredTrainers, inputs.searches.expired), inputs);
+      const revokedPage  = paginateList(filterBySearch(revokedTrainers, inputs.searches.revoked), inputs);
 
       writeAuthLogSafe(req, {
         eventType:     "user_list_viewed",
         userId:        actorEmail,
         role:          actorRole,
         partnerCode:   actor.partner_code ?? null,
-        identifier:    actorEmail + "|page:" + pagination.page,
+        identifier:    actorEmail + "|page:" + inputs.page +
+                       "|search:" + Object.values(inputs.searches).join(","),
         success:       true,
         failureReason: "Admin viewed trainer list",
       });
