@@ -320,6 +320,11 @@ const {
 
 
 const {
+  removeUser,
+} = require("../controllers/dietitian/api/web/remove-user");
+
+
+const {
   referralClientList,
 } = require("../controllers/dietitian/api/web/referral-client-list");
 
@@ -918,6 +923,13 @@ router.post(
   "/dietitian/api/web/revoke-user-invite",
   authMiddleware,
   revokeUserInvite
+);
+
+
+router.post(
+  "/dietitian/api/web/remove-user",
+  authMiddleware,
+  removeUser
 );
 
 

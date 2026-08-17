@@ -17,7 +17,10 @@
  *  - admin       → self trainer row (first) + accepted trainers under them
  *                  + pending/expired/revoked trainer invites + rich totals.
  *  - trainer / any other role → 403.
- *  - JSON shape (keys, ordering, totals block, datetime strings) matches PHP.
+ *  - JSON shape (keys, ordering, totals block, datetime strings) matches PHP,
+ *    plus pagination: page/limit body params (default 10, max 50) slice each of
+ *    the four lists in-memory; *_pagination meta blocks carry
+ *    page/limit/offset/total/has_more. `totals` always reflects the full lists.
  *
  * Hardening differences from PHP (intentional):
  *  - The PHP file is explicitly a "Temporary no-JWT version" that trusts a
@@ -58,6 +61,13 @@ const SECURITY_PEPPER =
 
 const APP_DEBUG = process.env.NODE_ENV !== "production";
 
+// List pagination (in-memory slice of the response lists; the FULL lists still
+// drive the totals block, same contract as get_group_details.js /
+// trainer-admin-overview.js). One page/limit applies to each of the four lists
+// independently (existing, pending/expired/revoked invites).
+const MAX_LIMIT = 50;
+const DEFAULT_LIMIT = 10;
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 function normalizeEmail(val) {
@@ -94,6 +104,42 @@ function toMysqlDateTime(val) {
 
 function nullableInt(val) {
   return val === null || val === undefined ? null : Number(val);
+}
+
+/**
+ * Pagination inputs (optional; defaults keep old callers working).
+ * Same parsing rules as get_group_details.js / trainer-admin-overview.js.
+ */
+function parsePagination(req) {
+  const src = req.body || {};
+
+  let page = parseInt(src.page, 10);
+  if (!Number.isFinite(page) || page <= 0) page = 1;
+
+  let limit = parseInt(src.limit, 10);
+  if (!Number.isFinite(limit) || limit <= 0 || limit > MAX_LIMIT) {
+    limit = DEFAULT_LIMIT;
+  }
+
+  return { page, limit, offset: (page - 1) * limit };
+}
+
+/**
+ * In-memory slice of an already-built list. Returns the page rows plus the
+ * house-style pagination meta block ({ page, limit, offset, total, has_more }).
+ */
+function paginateList(rows, { page, limit, offset }) {
+  const total = rows.length;
+  return {
+    rows: rows.slice(offset, offset + limit),
+    meta: {
+      page,
+      limit,
+      offset,
+      total,
+      has_more: offset + limit < total,
+    },
+  };
 }
 
 function getClientIp(req) {
@@ -836,7 +882,16 @@ function buildTrainerTotals(existingTrainers, pendingTrainers, expiredTrainers, 
  * POST /dietitian/api/web/list-admin-trainer-users
  *
  * Headers: Authorization: Bearer <JWT>
- * Body   : {} (ignored — actor identity comes from JWT, NOT body.actor_user_id)
+ * Body:
+ *   {
+ *     "page": 1,    // optional, default 1
+ *     "limit": 10   // optional, default 10, max 50
+ *   }
+ *   (actor identity comes from JWT, NOT body.actor_user_id)
+ *
+ * page/limit apply to each of the four response lists independently
+ * (existing, pending/expired/revoked invites); each list carries its own
+ * *_pagination meta block. `totals` always reflects the FULL lists.
  *
  * Returns:
  *   super_admin → { mode: "super_admin_admins", existing: [self + admins], ... }
@@ -855,6 +910,8 @@ const listAdminTrainerUsers = async (req, res) => {
       error: "Method not allowed",
     });
   }
+
+  const pagination = parsePagination(req);
 
   let actorEmail = null;
   let actorRole  = null;
@@ -898,16 +955,22 @@ const listAdminTrainerUsers = async (req, res) => {
         getInvitesByStatus("admin", actorEmail, "revoked"),
       ]);
 
+      // Totals come from the FULL lists — they must not change while paging.
       const totals = buildAdminTotals(
         existingRows, pendingAdmins, expiredAdmins, revokedAdmins
       );
+
+      const existingPage = paginateList(existingRows, pagination);
+      const pendingPage  = paginateList(pendingAdmins, pagination);
+      const expiredPage  = paginateList(expiredAdmins, pagination);
+      const revokedPage  = paginateList(revokedAdmins, pagination);
 
       writeAuthLogSafe(req, {
         eventType:     "user_list_viewed",
         userId:        actorEmail,
         role:          actorRole,
         partnerCode:   getActorEffectivePartnerCode(actor),
-        identifier:    actorEmail,
+        identifier:    actorEmail + "|page:" + pagination.page,
         success:       true,
         failureReason: "Super admin viewed admin list",
       });
@@ -922,10 +985,14 @@ const listAdminTrainerUsers = async (req, res) => {
           partner_code:   getActorEffectivePartnerCode(actor),
           parent_user_id: null,
         },
-        existing:        existingRows,
-        pending_invites: pendingAdmins,
-        expired_invites: expiredAdmins,
-        revoked_invites: revokedAdmins,
+        existing:                   existingPage.rows,
+        existing_pagination:        existingPage.meta,
+        pending_invites:            pendingPage.rows,
+        pending_invites_pagination: pendingPage.meta,
+        expired_invites:            expiredPage.rows,
+        expired_invites_pagination: expiredPage.meta,
+        revoked_invites:            revokedPage.rows,
+        revoked_invites_pagination: revokedPage.meta,
         totals,
       });
     }
@@ -944,16 +1011,22 @@ const listAdminTrainerUsers = async (req, res) => {
         getInvitesByStatus("trainer", actorEmail, "revoked"),
       ]);
 
+      // Totals come from the FULL lists — they must not change while paging.
       const totals = buildTrainerTotals(
         existingTrainerRows, pendingTrainers, expiredTrainers, revokedTrainers
       );
+
+      const existingPage = paginateList(existingTrainerRows, pagination);
+      const pendingPage  = paginateList(pendingTrainers, pagination);
+      const expiredPage  = paginateList(expiredTrainers, pagination);
+      const revokedPage  = paginateList(revokedTrainers, pagination);
 
       writeAuthLogSafe(req, {
         eventType:     "user_list_viewed",
         userId:        actorEmail,
         role:          actorRole,
         partnerCode:   actor.partner_code ?? null,
-        identifier:    actorEmail,
+        identifier:    actorEmail + "|page:" + pagination.page,
         success:       true,
         failureReason: "Admin viewed trainer list",
       });
@@ -968,10 +1041,14 @@ const listAdminTrainerUsers = async (req, res) => {
           partner_code:   actor.partner_code   ?? null,
           parent_user_id: actor.parent_user_id ?? null,
         },
-        existing:        existingTrainerRows,
-        pending_invites: pendingTrainers,
-        expired_invites: expiredTrainers,
-        revoked_invites: revokedTrainers,
+        existing:                   existingPage.rows,
+        existing_pagination:        existingPage.meta,
+        pending_invites:            pendingPage.rows,
+        pending_invites_pagination: pendingPage.meta,
+        expired_invites:            expiredPage.rows,
+        expired_invites_pagination: expiredPage.meta,
+        revoked_invites:            revokedPage.rows,
+        revoked_invites_pagination: revokedPage.meta,
         totals,
       });
     }
