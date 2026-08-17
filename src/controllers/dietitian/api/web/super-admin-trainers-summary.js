@@ -30,6 +30,15 @@
  *  - Response keys/shape match the PHP (ok, mode, title, actor, scope, summary,
  *    pagination, accepted_trainers, pending_invites, expired_invites,
  *    revoked_invites). limit clamped to 1..10, page floored at 1.
+ *  - Per-bucket search (addition over the PHP): accepted_search /
+ *    pending_search / expired_search / revoked_search body params (legacy
+ *    `search` is the fallback for any bucket without its own term) filter that
+ *    bucket only, matching name/email/phone/partner_code as a case-insensitive
+ *    substring. Filtering happens in SQL via bound LIKE parameters, so
+ *    pagination stays DB-side. The self "accepted trainer" row is included
+ *    only when it matches accepted_search. `summary` counts always reflect the
+ *    FULL unfiltered buckets; the new pagination *_total fields (and the
+ *    *_has_more flags) reflect the FILTERED counts.
  *  - Same DB tables only: table_dietician, app_user_roles, app_user_invitations,
  *    table_clients, trainer_client_invites, app_auth_logs. Nothing added/removed.
  *
@@ -68,6 +77,10 @@ const APP_DEBUG = process.env.NODE_ENV !== "production";
 
 const MAX_LIMIT = 10;
 const DEFAULT_LIMIT = 10;
+
+// VAPT: bound the search term. It is only ever bound as a LIKE parameter
+// (never interpolated), the cap just keeps hostile payloads out of logs/CPU.
+const MAX_SEARCH_LENGTH = 100;
 
 // ─── Generic helpers ─────────────────────────────────────────────────────────
 
@@ -145,6 +158,70 @@ function getEffectiveCodeFromRow(row) {
     return String(row.dietician_id);
   }
   return null;
+}
+
+// ─── Search helpers ──────────────────────────────────────────────────────────
+
+/**
+ * Escape LIKE wildcards so a user-typed "%" or "_" matches literally. The
+ * result is always passed as a bound parameter, never interpolated.
+ */
+function escapeLikeTerm(term) {
+  return String(term).replace(/[\\%_]/g, (ch) => "\\" + ch);
+}
+
+/**
+ * WHERE fragment + bound params filtering the accepted-trainers query
+ * (app_user_roles aur JOIN table_dietician td) by a search term.
+ * Empty term → no-op.
+ */
+function buildAcceptedSearchClause(term) {
+  if (term === "") return { sql: "", params: [] };
+  const like = `%${escapeLikeTerm(term)}%`;
+  return {
+    sql: `
+          AND (
+            td.name LIKE ?
+            OR aur.user_id LIKE ?
+            OR td.phone_no LIKE ?
+            OR aur.partner_code LIKE ?
+            OR td.dietician_id LIKE ?
+          )`,
+    params: [like, like, like, like, like],
+  };
+}
+
+/**
+ * WHERE fragment + bound params filtering app_user_invitations by a search
+ * term (first/last/full name, email, phone, partner code). Empty term → no-op.
+ */
+function buildInviteSearchClause(term) {
+  if (term === "") return { sql: "", params: [] };
+  const like = `%${escapeLikeTerm(term)}%`;
+  return {
+    sql: `
+          AND (
+            invited_first_name LIKE ?
+            OR invited_last_name LIKE ?
+            OR CONCAT_WS(' ', invited_first_name, invited_last_name) LIKE ?
+            OR invited_email LIKE ?
+            OR invited_phone LIKE ?
+            OR partner_code LIKE ?
+          )`,
+    params: [like, like, like, like, like, like],
+  };
+}
+
+/**
+ * The self "accepted trainer" row is built in JS, not fetched by the SQL
+ * query, so accepted_search must be applied to it in-memory over the same
+ * fields the SQL clause covers. Empty term always matches.
+ */
+function selfMatchesSearch(actor, selfCode, term) {
+  if (term === "") return true;
+  const needle = term.toLowerCase();
+  return [actor.name, actor.email, actor.phone_no, selfCode, actor.dietician_id]
+    .some((val) => String(val ?? "").toLowerCase().includes(needle));
 }
 
 // ─── Audit log ───────────────────────────────────────────────────────────────
@@ -297,8 +374,12 @@ async function expireOldPendingDirectInvites(superEmail) {
  * the distinct effective codes of direct active trainers under them. Mirrors PHP
  * sas_count_direct_accepted_trainers_for_super_admin().
  */
-async function countDirectAcceptedTrainers(actor, superEmail) {
-  const selfCount = getActorEffectivePartnerCode(actor) !== null ? 1 : 0;
+async function countDirectAcceptedTrainers(actor, superEmail, searchTerm = "") {
+  const selfCode = getActorEffectivePartnerCode(actor);
+  const selfCount =
+    selfCode !== null && selfMatchesSearch(actor, selfCode, searchTerm) ? 1 : 0;
+
+  const search = buildAcceptedSearchClause(searchTerm);
 
   try {
     const [rows] = await pool.execute(
@@ -314,8 +395,9 @@ async function countDirectAcceptedTrainers(actor, superEmail) {
         WHERE aur.role = 'trainer'
           AND aur.status = 'active'
           AND LOWER(aur.parent_user_id) = LOWER(?)
+          ${search.sql}
       `,
-      [superEmail]
+      [superEmail, ...search.params]
     );
     return selfCount + toInt(rows[0]?.total);
   } catch (err) {
@@ -324,7 +406,9 @@ async function countDirectAcceptedTrainers(actor, superEmail) {
   }
 }
 
-async function countDirectTrainerInvitesByStatus(superEmail, status) {
+async function countDirectTrainerInvitesByStatus(superEmail, status, searchTerm = "") {
+  const search = buildInviteSearchClause(searchTerm);
+
   try {
     if (status === "pending") {
       const [rows] = await pool.execute(
@@ -335,8 +419,9 @@ async function countDirectTrainerInvitesByStatus(superEmail, status) {
             AND status = 'pending'
             AND expires_at > UTC_TIMESTAMP()
             AND LOWER(parent_user_id) = LOWER(?)
+            ${search.sql}
         `,
-        [superEmail]
+        [superEmail, ...search.params]
       );
       return toInt(rows[0]?.total);
     }
@@ -348,8 +433,9 @@ async function countDirectTrainerInvitesByStatus(superEmail, status) {
         WHERE invited_role = 'trainer'
           AND status = ?
           AND LOWER(parent_user_id) = LOWER(?)
+          ${search.sql}
       `,
-      [status, superEmail]
+      [status, superEmail, ...search.params]
     );
     return toInt(rows[0]?.total);
   } catch (err) {
@@ -455,14 +541,18 @@ async function buildSelfTrainerRow(actor, selfCode) {
   };
 }
 
-async function getDirectAcceptedTrainers(actor, superEmail, limit, offset) {
+async function getDirectAcceptedTrainers(actor, superEmail, limit, offset, searchTerm = "") {
   const rows = [];
 
   const selfCode = getActorEffectivePartnerCode(actor);
   const hasSelfCode = selfCode !== null && String(selfCode).trim() !== "";
 
+  // The self row participates in this bucket only when it matches the
+  // accepted_search term (empty term always matches).
+  const selfIncluded = hasSelfCode && selfMatchesSearch(actor, selfCode, searchTerm);
+
   // The super admin occupies the first accepted-trainer slot (page 1 only).
-  if (offset === 0 && hasSelfCode) {
+  if (offset === 0 && selfIncluded) {
     rows.push(await buildSelfTrainerRow(actor, selfCode));
     limit = limit - 1;
   }
@@ -473,12 +563,14 @@ async function getDirectAcceptedTrainers(actor, superEmail, limit, offset) {
 
   // Shift the DB offset because the self row consumed one slot.
   let networkOffset = offset;
-  if (hasSelfCode) {
+  if (selfIncluded) {
     networkOffset = offset === 0 ? 0 : Math.max(0, offset - 1);
   }
 
   const safeLimit = Math.max(0, toInt(limit));
   const safeOffset = Math.max(0, toInt(networkOffset));
+
+  const search = buildAcceptedSearchClause(searchTerm);
 
   const [dbRows] = await pool.execute(
     `
@@ -505,10 +597,11 @@ async function getDirectAcceptedTrainers(actor, superEmail, limit, offset) {
       WHERE aur.role = 'trainer'
         AND aur.status = 'active'
         AND LOWER(aur.parent_user_id) = LOWER(?)
+        ${search.sql}
       ORDER BY aur.created_at DESC, aur.id DESC
       LIMIT ${safeLimit} OFFSET ${safeOffset}
     `,
-    [superEmail]
+    [superEmail, ...search.params]
   );
 
   // De-dup by effective partner code; pre-seed the self code (PHP parity).
@@ -606,9 +699,11 @@ function formatInviteRow(row) {
   };
 }
 
-async function getDirectTrainerInvitesByStatus(superEmail, status, limit, offset) {
+async function getDirectTrainerInvitesByStatus(superEmail, status, limit, offset, searchTerm = "") {
   const safeLimit = Math.max(0, toInt(limit));
   const safeOffset = Math.max(0, toInt(offset));
+
+  const search = buildInviteSearchClause(searchTerm);
 
   let rows;
   if (status === "pending") {
@@ -635,10 +730,11 @@ async function getDirectTrainerInvitesByStatus(superEmail, status, limit, offset
           AND status = 'pending'
           AND expires_at > UTC_TIMESTAMP()
           AND LOWER(parent_user_id) = LOWER(?)
+          ${search.sql}
         ORDER BY created_at DESC, id DESC
         LIMIT ${safeLimit} OFFSET ${safeOffset}
       `,
-      [superEmail]
+      [superEmail, ...search.params]
     );
   } else {
     [rows] = await pool.execute(
@@ -663,10 +759,11 @@ async function getDirectTrainerInvitesByStatus(superEmail, status, limit, offset
         WHERE invited_role = 'trainer'
           AND status = ?
           AND LOWER(parent_user_id) = LOWER(?)
+          ${search.sql}
         ORDER BY updated_at DESC, id DESC
         LIMIT ${safeLimit} OFFSET ${safeOffset}
       `,
-      [status, superEmail]
+      [status, superEmail, ...search.params]
     );
   }
 
@@ -690,7 +787,23 @@ function parseInputs(req) {
   // cross-check in the controller. The JWT remains the source of truth.
   const actorUserId = normalizeEmail(src.actor_user_id);
 
-  return { page, limit, offset: (page - 1) * limit, actorUserId };
+  // Per-bucket search terms. Each bucket has its own param; the shared legacy
+  // `search` is the fallback when a bucket-specific one is empty/absent (same
+  // precedence pattern as list-admin-trainer-users.js).
+  const cleanSearch = (val) =>
+    typeof val === "string" ? val.trim().slice(0, MAX_SEARCH_LENGTH) : "";
+
+  const legacySearch = cleanSearch(src.search);
+  const pick = (specific) => (specific !== "" ? specific : legacySearch);
+
+  const searches = {
+    accepted: pick(cleanSearch(src.accepted_search)),
+    pending: pick(cleanSearch(src.pending_search)),
+    expired: pick(cleanSearch(src.expired_search)),
+    revoked: pick(cleanSearch(src.revoked_search)),
+  };
+
+  return { page, limit, offset: (page - 1) * limit, actorUserId, searches };
 }
 
 // ─── Controller ──────────────────────────────────────────────────────────────
@@ -703,8 +816,18 @@ function parseInputs(req) {
  *   {
  *     "page": 1,
  *     "limit": 10,           // optional, clamped to 1..10
- *     "actor_user_id": ""    // optional; if set, must match the token email
+ *     "actor_user_id": "",   // optional; if set, must match the token email
+ *     "accepted_search": "", // optional, filters accepted_trainers only
+ *     "pending_search": "",  // optional, filters pending_invites only
+ *     "expired_search": "",  // optional, filters expired_invites only
+ *     "revoked_search": "",  // optional, filters revoked_invites only
+ *     "search": ""           // optional, fallback for any bucket whose
+ *                            // bucket-specific param is empty/absent
  *   }
+ *
+ * All search params match name/email/phone/partner_code (case-insensitive
+ * substring). `summary` counts stay unfiltered; pagination *_total and
+ * *_has_more reflect the filtered counts.
  */
 const superAdminTrainersSummary = async (req, res) => {
   // HIPAA: never let intermediaries cache PHI-adjacent responses.
@@ -716,7 +839,7 @@ const superAdminTrainersSummary = async (req, res) => {
     return res.status(405).json({ ok: false, error: "Method not allowed" });
   }
 
-  const { page, limit, offset, actorUserId } = parseInputs(req);
+  const { page, limit, offset, actorUserId, searches } = parseInputs(req);
 
   let actorEmail = null;
   let actorRole = null;
@@ -765,6 +888,8 @@ const superAdminTrainersSummary = async (req, res) => {
     await expireOldPendingDirectInvites(actorEmail);
 
     // ── 3. Bucket totals ────────────────────────────────────────────────────
+    // `summary` always reflects the FULL unfiltered buckets — it must not
+    // change while searching.
     const [acceptedTotal, pendingTotal, expiredTotal, revokedTotal] = await Promise.all([
       countDirectAcceptedTrainers(actor, actorEmail),
       countDirectTrainerInvitesByStatus(actorEmail, "pending"),
@@ -772,15 +897,33 @@ const superAdminTrainersSummary = async (req, res) => {
       countDirectTrainerInvitesByStatus(actorEmail, "revoked"),
     ]);
 
-    // ── 4. Paginated bucket rows ────────────────────────────────────────────
+    // Filtered totals drive pagination (has_more / *_total). Only re-count the
+    // buckets that actually carry a search term; the rest reuse the full total.
+    const [acceptedFiltered, pendingFiltered, expiredFiltered, revokedFiltered] =
+      await Promise.all([
+        searches.accepted !== ""
+          ? countDirectAcceptedTrainers(actor, actorEmail, searches.accepted)
+          : acceptedTotal,
+        searches.pending !== ""
+          ? countDirectTrainerInvitesByStatus(actorEmail, "pending", searches.pending)
+          : pendingTotal,
+        searches.expired !== ""
+          ? countDirectTrainerInvitesByStatus(actorEmail, "expired", searches.expired)
+          : expiredTotal,
+        searches.revoked !== ""
+          ? countDirectTrainerInvitesByStatus(actorEmail, "revoked", searches.revoked)
+          : revokedTotal,
+      ]);
+
+    // ── 4. Paginated bucket rows (each filtered by its own search term) ─────
     // accepted-trainers list awaits sequentially internally; run the three
     // invite lists in parallel alongside it.
     const [acceptedTrainers, pendingInvites, expiredInvites, revokedInvites] =
       await Promise.all([
-        getDirectAcceptedTrainers(actor, actorEmail, limit, offset),
-        getDirectTrainerInvitesByStatus(actorEmail, "pending", limit, offset),
-        getDirectTrainerInvitesByStatus(actorEmail, "expired", limit, offset),
-        getDirectTrainerInvitesByStatus(actorEmail, "revoked", limit, offset),
+        getDirectAcceptedTrainers(actor, actorEmail, limit, offset, searches.accepted),
+        getDirectTrainerInvitesByStatus(actorEmail, "pending", limit, offset, searches.pending),
+        getDirectTrainerInvitesByStatus(actorEmail, "expired", limit, offset, searches.expired),
+        getDirectTrainerInvitesByStatus(actorEmail, "revoked", limit, offset, searches.revoked),
       ]);
 
     // ── 5. Audit — success (fire-and-forget) ────────────────────────────────
@@ -789,7 +932,9 @@ const superAdminTrainersSummary = async (req, res) => {
       userId: actorEmail,
       role: actorRole,
       partnerCode: actorCode,
-      identifier: actorEmail,
+      identifier:
+        actorEmail + "|page:" + page +
+        "|search:" + Object.values(searches).join(","),
       success: true,
       failureReason: "Super admin viewed direct trainer summary",
     });
@@ -828,10 +973,21 @@ const superAdminTrainersSummary = async (req, res) => {
         page,
         limit,
         offset,
-        accepted_has_more: offset + limit < acceptedTotal,
-        pending_has_more: offset + limit < pendingTotal,
-        expired_has_more: offset + limit < expiredTotal,
-        revoked_has_more: offset + limit < revokedTotal,
+        accepted_total: acceptedFiltered,
+        pending_total: pendingFiltered,
+        expired_total: expiredFiltered,
+        revoked_total: revokedFiltered,
+        accepted_has_more: offset + limit < acceptedFiltered,
+        pending_has_more: offset + limit < pendingFiltered,
+        expired_has_more: offset + limit < expiredFiltered,
+        revoked_has_more: offset + limit < revokedFiltered,
+      },
+
+      search: {
+        accepted_search: searches.accepted,
+        pending_search: searches.pending,
+        expired_search: searches.expired,
+        revoked_search: searches.revoked,
       },
 
       accepted_trainers: acceptedTrainers,
