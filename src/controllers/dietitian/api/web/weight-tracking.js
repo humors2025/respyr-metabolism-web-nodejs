@@ -372,6 +372,27 @@ async function fetchLatestMetabolismScore(profileId, dieticianId) {
   return Number.isNaN(n) ? null : n;
 }
 
+/**
+ * Client's fitness goal from the latest user_habits row (same source as the
+ * dashboard). Defaults to "weight_loss" when no habits row / empty goal,
+ * matching get_clients_data_total_missed_test.js.
+ */
+async function fetchFitnessGoal(profileId) {
+  const [rows] = await pool.execute(
+    `
+      SELECT goal
+      FROM user_habits
+      WHERE profile_id = ?
+      ORDER BY id DESC
+      LIMIT 1
+    `,
+    [profileId]
+  );
+
+  const raw = String(rows[0]?.goal ?? "").trim();
+  return raw !== "" ? raw : "weight_loss";
+}
+
 // ─── Input parsing ───────────────────────────────────────────────────────────
 
 function parseInputs(req) {
@@ -532,10 +553,11 @@ const weightTracking = async (req, res) => {
       });
     }
 
-    // ── 5. Fetch weight logs + latest metabolism score ──────────────────────
-    const [logs, metabolismScore] = await Promise.all([
+    // ── 5. Fetch weight logs + latest metabolism score + fitness goal ───────
+    const [logs, metabolismScore, fitnessGoal] = await Promise.all([
       fetchWeightLogs(profileId),
       fetchLatestMetabolismScore(profileId, dieticianId),
+      fetchFitnessGoal(profileId),
     ]);
 
     // ── 6. Audit the PHI read (fire-and-forget) ─────────────────────────────
@@ -555,6 +577,7 @@ const weightTracking = async (req, res) => {
         status: true,
         message: "Weight logs fetched successfully",
         metabolism_score: metabolismScore,
+        fitness_goal: fitnessGoal,
         data: logs,
         error: null,
       });
@@ -564,6 +587,7 @@ const weightTracking = async (req, res) => {
       status: false,
       message: "No weight logs found",
       metabolism_score: metabolismScore,
+      fitness_goal: fitnessGoal,
       data: [],
       error: { code: "NOT_FOUND" },
     });
@@ -598,10 +622,6 @@ const weightTracking = async (req, res) => {
 };
 
 module.exports = { weightTracking };
-
-
-
-
 
 
 
