@@ -65,16 +65,29 @@ function getCookieValue(req, cookieName) {
   return null;
 }
 
+// function clearRefreshCookieIfEnabled(res) {
+//   if (process.env.USE_REFRESH_COOKIE !== 'true') return;
+
+//   res.clearCookie('refresh_token', {
+//     httpOnly: true,
+//     secure: true,
+//     sameSite: 'strict',
+//     path: process.env.REFRESH_COOKIE_PATH || '/v1/auth/refresh-token',
+//   });
+// }
+
+
 function clearRefreshCookieIfEnabled(res) {
   if (process.env.USE_REFRESH_COOKIE !== 'true') return;
 
   res.clearCookie('refresh_token', {
     httpOnly: true,
     secure: true,
-    sameSite: 'strict',
-    path: process.env.REFRESH_COOKIE_PATH || '/v1/auth/refresh-token',
+    sameSite: process.env.REFRESH_COOKIE_SAMESITE || 'none',
+    path: process.env.REFRESH_COOKIE_PATH || '/v1/auth',
   });
 }
+
 
 async function writeAuthLogSafe(conn, req, eventType, dieticianId, success, failureReason) {
   try {
@@ -138,28 +151,37 @@ exports.logout = async (req, res) => {
     });
   }
 
-  if (typeof req.body === 'string') {
-    try {
-      req.body = JSON.parse(req.body);
-    } catch {
-      return res.status(400).json({
-        ok: false,
-        message: 'Invalid JSON body',
-      });
-    }
-  }
+  // if (typeof req.body === 'string') {
+  //   try {
+  //     req.body = JSON.parse(req.body);
+  //   } catch {
+  //     return res.status(400).json({
+  //       ok: false,
+  //       message: 'Invalid JSON body',
+  //     });
+  //   }
+  // }
 
-  const inBody = req.body && typeof req.body === 'object' ? req.body : {};
+  // const inBody = req.body && typeof req.body === 'object' ? req.body : {};
 
-  const refreshToken =
-    (typeof inBody.refresh_token === 'string' && inBody.refresh_token.trim()) ||
-    getCookieValue(req, 'refresh_token');
+  // const refreshToken =
+  //   (typeof inBody.refresh_token === 'string' && inBody.refresh_token.trim()) ||
+  //   getCookieValue(req, 'refresh_token');
+
+  const refreshToken = getCookieValue(req, 'refresh_token');
 
   if (!refreshToken) {
-    return res.status(400).json({
-      ok: false,
-      message: 'refresh_token is required',
-    });
+    // return res.status(400).json({
+    //   ok: false,
+    //   message: 'refresh_token is required',
+    // });
+
+     clearRefreshCookieIfEnabled(res);
+
+  return res.status(200).json({
+    ok: true,
+    message: 'Logged out successfully',
+  });
   }
 
   const refreshTokenHash = hashRefreshToken(refreshToken);

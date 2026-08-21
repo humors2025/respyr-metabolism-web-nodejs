@@ -97,17 +97,33 @@ function send500(res) {
   });
 }
 
-function setRefreshCookieIfEnabled(res, refreshToken) {
-  if (process.env.USE_REFRESH_COOKIE !== 'true') return;
+// function setRefreshCookieIfEnabled(res, refreshToken) {
+//   if (process.env.USE_REFRESH_COOKIE !== 'true') return;
 
-  res.cookie('refresh_token', refreshToken, {
+//   res.cookie('refresh_token', refreshToken, {
+//     httpOnly: true,
+//     secure: true,
+//     sameSite: 'strict',
+//     maxAge: JWT_REFRESH_TTL_SECONDS * 1000,
+//     path: process.env.REFRESH_COOKIE_PATH || '/v1/auth/refresh-token',
+//   });
+// }
+
+
+function setRefreshCookieIfEnabled(res, refreshToken) {
+  if (process.env.USE_REFRESH_COOKIE !== "true") return;
+
+  res.cookie("refresh_token", refreshToken, {
     httpOnly: true,
     secure: true,
-    sameSite: 'strict',
+    sameSite:
+      process.env.REFRESH_COOKIE_SAMESITE || "none",
     maxAge: JWT_REFRESH_TTL_SECONDS * 1000,
-    path: process.env.REFRESH_COOKIE_PATH || '/v1/auth/refresh-token',
+    path: process.env.REFRESH_COOKIE_PATH || "/v1/auth",
   });
 }
+
+
 
 async function writeAuthLogSafe(
   conn,
@@ -585,7 +601,7 @@ exports.login = async (req, res) => {
       token_type: 'Bearer',
       access_token: accessToken,
       expires_in: JWT_TTL,
-      refresh_token: refreshToken,
+      // refresh_token: refreshToken,
       refresh_expires_in: JWT_REFRESH_TTL_SECONDS,
     });
   } catch (error) {
