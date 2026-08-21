@@ -80,17 +80,33 @@ function getCookieValue(req, cookieName) {
   return null;
 }
 
+// function setRefreshCookieIfEnabled(res, refreshToken) {
+//   if (process.env.USE_REFRESH_COOKIE !== 'true') return;
+
+//   res.cookie('refresh_token', refreshToken, {
+//     httpOnly: true,
+//     secure: true,
+//     sameSite: 'strict',
+//     maxAge: JWT_REFRESH_TTL_SECONDS * 1000,
+//     path: process.env.REFRESH_COOKIE_PATH || '/v1/auth/refresh-token',
+//   });
+// }
+
+
 function setRefreshCookieIfEnabled(res, refreshToken) {
   if (process.env.USE_REFRESH_COOKIE !== 'true') return;
 
   res.cookie('refresh_token', refreshToken, {
     httpOnly: true,
     secure: true,
-    sameSite: 'strict',
+    sameSite: process.env.REFRESH_COOKIE_SAMESITE || 'none',
     maxAge: JWT_REFRESH_TTL_SECONDS * 1000,
-    path: process.env.REFRESH_COOKIE_PATH || '/v1/auth/refresh-token',
+    path: process.env.REFRESH_COOKIE_PATH || '/v1/auth',
   });
 }
+
+
+
 
 function buildDashboardRoute(role) {
   if (role === 'super_admin') return '/super-admin/overview';
@@ -151,12 +167,16 @@ exports.refreshToken = async (req, res) => {
 
     const inBody = req.body && typeof req.body === 'object' ? req.body : {};
 
+    // const refreshToken =
+    //   (typeof inBody.refresh_token === 'string' && inBody.refresh_token.trim()) ||
+    //   getCookieValue(req, 'refresh_token');
+
     const refreshToken =
-      (typeof inBody.refresh_token === 'string' && inBody.refresh_token.trim()) ||
-      getCookieValue(req, 'refresh_token');
+  getCookieValue(req, 'refresh_token');
 
     if (!refreshToken) {
-      return res.status(400).json({
+      // return res.status(400).json({
+       return res.status(401).json({
         ok: false,
         message: 'refresh_token is required',
       });
@@ -352,7 +372,7 @@ exports.refreshToken = async (req, res) => {
       token_type: 'Bearer',
       access_token: newAccessToken,
       expires_in: JWT_TTL,
-      refresh_token: newRefreshToken,
+      // refresh_token: newRefreshToken,
       refresh_expires_in: JWT_REFRESH_TTL_SECONDS,
     });
   } catch (error) {
