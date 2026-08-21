@@ -349,27 +349,110 @@ async function fetchWeightLogs(profileId) {
 }
 
 /**
- * Latest metabolism score for the client (most recent test in table_test_data).
- * NOTE: table_test_data uses the `dietitian_id` spelling (unlike table_clients'
- * `dietician_id`) — matched to the dashboard queries. Returns a number or null.
+ * Blob/string-safe parse of the table_test_data.test_json column.
+ * Mirrors parseJsonColumn in get_data_points_score_all_ranges_coach.js.
+ * Returns a plain object or null.
  */
-async function fetchLatestMetabolismScore(profileId, dieticianId) {
+function parseTestJson(columnValue) {
+  if (columnValue === null || columnValue === undefined) return null;
+
+  let jsonText = "";
+
+  if (Buffer.isBuffer(columnValue)) {
+    jsonText = columnValue.toString("utf8");
+  } else if (typeof columnValue === "string") {
+    jsonText = columnValue;
+  } else if (
+    columnValue &&
+    columnValue.type === "Buffer" &&
+    Array.isArray(columnValue.data)
+  ) {
+    jsonText = Buffer.from(columnValue.data).toString("utf8");
+  } else if (typeof columnValue === "object" && !Array.isArray(columnValue)) {
+    return columnValue;
+  } else {
+    return null;
+  }
+
+  jsonText = jsonText.trim();
+  if (!jsonText) return null;
+
+  try {
+    const parsed = JSON.parse(jsonText);
+    return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
+      ? parsed
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Date-wise metabolism scores for the graph, goal-aware (same source as
+ * get-data-points-score-all-ranges-coach: table_test_data.test_json):
+ *   fitness_goal === "muscle_gain"  → test_json.Muscle_Gain_Trend.value
+ *   anything else (fat_loss, ...)   → test_json.Fat_Use_Pattern_trend.value
+ * Key casing matches the stored JSON exactly — note the lowercase "trend"
+ * in Fat_Use_Pattern_trend.
+ *
+ * One score per date: the LATEST test of each date (same rule as the coach
+ * endpoint's ORDER BY date_time DESC LIMIT 1 for a selected date).
+ * Ordered newest date first, matching the weight logs. Dates whose test_json
+ * lacks a numeric value for the goal's key are skipped.
+ *
+ * NOTE: table_test_data uses the `dietitian_id` spelling (unlike table_clients'
+ * `dietician_id`).
+ *
+ * Returns [{ date: "YYYY-MM-DD", score: Number }, ...]
+ */
+async function fetchMetabolismScoresByDate(profileId, dieticianId, fitnessGoal) {
   const [rows] = await pool.execute(
     `
-      SELECT fat_loss_metabolism_score
-      FROM table_test_data
-      WHERE profile_id = ?
-        AND UPPER(TRIM(dietitian_id)) = UPPER(TRIM(?))
-      ORDER BY date_time DESC
-      LIMIT 1
+      SELECT
+        t1.test_json,
+        t1.date_time
+      FROM table_test_data t1
+      INNER JOIN (
+        SELECT
+          DATE(date_time) AS test_date,
+          MAX(date_time) AS max_date_time
+        FROM table_test_data
+        WHERE profile_id = ?
+          AND UPPER(TRIM(dietitian_id)) = UPPER(TRIM(?))
+        GROUP BY DATE(date_time)
+      ) t2
+        ON t1.date_time = t2.max_date_time
+        AND DATE(t1.date_time) = t2.test_date
+      WHERE t1.profile_id = ?
+        AND UPPER(TRIM(t1.dietitian_id)) = UPPER(TRIM(?))
+      ORDER BY t1.date_time DESC
     `,
-    [profileId, dieticianId]
+    [profileId, dieticianId, profileId, dieticianId]
   );
 
-  const raw = rows[0]?.fat_loss_metabolism_score;
-  if (raw === null || raw === undefined || raw === "") return null;
-  const n = Number(raw);
-  return Number.isNaN(n) ? null : n;
+  const trendKey =
+    String(fitnessGoal).trim().toLowerCase() === "muscle_gain"
+      ? "Muscle_Gain_Trend"
+      : "Fat_Use_Pattern_trend";
+
+  const scores = [];
+
+  for (const row of rows) {
+    const json = parseTestJson(row.test_json);
+    const rawValue = json?.[trendKey]?.value;
+
+    if (rawValue === null || rawValue === undefined || rawValue === "") continue;
+
+    const n = Number(rawValue);
+    if (Number.isNaN(n)) continue;
+
+    scores.push({
+      date: toMysqlDate(row.date_time),
+      score: n,
+    });
+  }
+
+  return scores;
 }
 
 /**
@@ -553,12 +636,17 @@ const weightTracking = async (req, res) => {
       });
     }
 
-    // ── 5. Fetch weight logs + latest metabolism score + fitness goal ───────
-    const [logs, metabolismScore, fitnessGoal] = await Promise.all([
+    // ── 5. Fetch fitness goal, then weight logs + date-wise metabolism scores ─
+    // Goal first: it decides which test_json trend key the scores come from.
+    const fitnessGoal = await fetchFitnessGoal(profileId);
+
+    const [logs, metabolismScores] = await Promise.all([
       fetchWeightLogs(profileId),
-      fetchLatestMetabolismScore(profileId, dieticianId),
-      fetchFitnessGoal(profileId),
+      fetchMetabolismScoresByDate(profileId, dieticianId, fitnessGoal),
     ]);
+
+    // Latest score = first entry (newest date first); null if no tests.
+    const metabolismScore = metabolismScores.length > 0 ? metabolismScores[0].score : null;
 
     // ── 6. Audit the PHI read (fire-and-forget) ─────────────────────────────
     writeAuthLogSafe(req, {
@@ -576,8 +664,9 @@ const weightTracking = async (req, res) => {
       return res.status(200).json({
         status: true,
         message: "Weight logs fetched successfully",
-        metabolism_score: metabolismScore,
         fitness_goal: fitnessGoal,
+        metabolism_score: metabolismScore,
+        metabolism_scores: metabolismScores,
         data: logs,
         error: null,
       });
@@ -586,8 +675,9 @@ const weightTracking = async (req, res) => {
     return res.status(404).json({
       status: false,
       message: "No weight logs found",
-      metabolism_score: metabolismScore,
       fitness_goal: fitnessGoal,
+      metabolism_score: metabolismScore,
+      metabolism_scores: metabolismScores,
       data: [],
       error: { code: "NOT_FOUND" },
     });
@@ -622,9 +712,6 @@ const weightTracking = async (req, res) => {
 };
 
 module.exports = { weightTracking };
-
-
-
 
 
 
