@@ -549,6 +549,7 @@ async function fetchWeightLogs(
         id,
         profile_id,
         weight_kg,
+        target_weight,
         weight_change_type,
         logged_by,
         log_date,
@@ -572,6 +573,8 @@ async function fetchWeightLogs(
 
     weight_kg:
       row.weight_kg,
+
+      target_weight: row.target_weight,
 
     weight_change_type:
       row.weight_change_type,
