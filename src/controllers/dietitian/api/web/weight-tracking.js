@@ -10,46 +10,10 @@
  * - admin
  * - super_admin
  * - trainer
- *
- * Authorization model:
- *
- * 1. JWT identifies the authenticated actor.
- * 2. actor_user_id from request body must match JWT identity.
- * 3. super_admin:
- *      - Can view ANY client.
- *      - Does NOT require profile_id + dietician_id ownership match.
- *      - The client's actual dietician_id is obtained from table_clients.
- *
- * 4. admin/trainer:
- *      - Must have visibility to the requested dietician_id.
- *      - profile_id + dietician_id must exist in table_clients.
- *
- * Important:
- * The dietician_id supplied by a super_admin request is treated as the
- * requested context, but it is NOT used to establish ownership.
- *
- * Example:
- *
- * {
- *   "profile_id": "profile376",
- *   "dietician_id": "RespyrD01",
- *   "actor_user_id": "connect@respyr.in"
- * }
- *
- * If profile376 actually belongs to:
- *
- *   TRNBZ7875A
- *
- * and the authenticated actor is a super_admin, the request is allowed.
- *
- * For metabolism scores, the actual client dietician_id
- * (TRNBZ7875A) is used instead of RespyrD01.
  */
 
 const crypto = require("crypto");
-
 const pool = require("../../../../config/db");
-
 const {
   normalizeCode,
   getAdminGroupPeerCodes,
@@ -85,6 +49,11 @@ function normalizeEmail(val) {
 function toInt(val) {
   const n = Number(val);
   return Number.isFinite(n) ? Math.trunc(n) : 0;
+}
+
+function toFloat(val) {
+  const n = parseFloat(val);
+  return Number.isFinite(n) ? n : null;
 }
 
 /**
@@ -214,11 +183,7 @@ async function writeAuthLogSafe(req, {
 }) {
   try {
     const ipHash = authLogHash(getClientIp(req));
-
-    const userAgentHash = authLogHash(
-      getUserAgent(req)
-    );
-
+    const userAgentHash = authLogHash(getUserAgent(req));
     const identifierHash =
       identifier !== null && identifier !== undefined
         ? authLogHash(identifier)
@@ -242,25 +207,16 @@ async function writeAuthLogSafe(req, {
       `,
       [
         String(eventType || "").slice(0, 60),
-
         userId !== null && userId !== undefined
           ? String(userId).slice(0, 191)
           : null,
-
         role ?? null,
-
         partnerCode ?? null,
-
         identifierHash,
-
         ipHash,
-
         userAgentHash,
-
         success ? 1 : 0,
-
-        failureReason !== null &&
-        failureReason !== undefined
+        failureReason !== null && failureReason !== undefined
           ? String(failureReason).slice(0, 255)
           : null,
       ]
@@ -467,26 +423,6 @@ async function getAllowedCodes(
  * This function intentionally returns the client's actual dietician_id.
  *
  * This is required for super_admin access.
- *
- * Example:
- *
- * Requested:
- *
- * profile_id   = profile376
- * dietician_id = RespyrD01
- *
- * Database:
- *
- * profile376 → TRNBZ7875A
- *
- * For super_admin:
- *
- * - profile exists
- * - access allowed
- * - actual dietician_id = TRNBZ7875A
- *
- * The actual dietician_id is then used when querying
- * table_test_data.
  */
 async function getClientByProfileId(
   profileId
@@ -537,11 +473,64 @@ async function clientPairExists(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// User Target Weight
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Fetch the user's target weight from the user_habits table.
+ * This ensures the dashboard always shows the correct target weight
+ * regardless of what's stored in individual weight logs.
+ */
+async function fetchUserTargetWeight(
+  profileId
+) {
+  try {
+    const [rows] = await pool.execute(
+      `
+        SELECT target_weight
+        FROM user_habits
+        WHERE profile_id = ?
+        ORDER BY id DESC
+        LIMIT 1
+      `,
+      [profileId]
+    );
+
+    if (rows.length > 0 && rows[0].target_weight !== null) {
+      return toFloat(rows[0].target_weight);
+    }
+
+    // Fallback: If no target_weight in user_habits,
+    // try to get it from the latest weight log (carry-forward logic)
+    const [logRows] = await pool.execute(
+      `
+        SELECT target_weight
+        FROM weight_log
+        WHERE profile_id = ?
+        ORDER BY log_date DESC, log_time DESC, id DESC
+        LIMIT 1
+      `,
+      [profileId]
+    );
+
+    if (logRows.length > 0 && logRows[0].target_weight !== null) {
+      return toFloat(logRows[0].target_weight);
+    }
+
+    return null;
+  } catch (err) {
+    console.error("fetchUserTargetWeight error:", err.message);
+    return null;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Weight logs
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function fetchWeightLogs(
-  profileId
+  profileId,
+  userTargetWeight
 ) {
   const [rows] = await pool.execute(
     `
@@ -549,7 +538,6 @@ async function fetchWeightLogs(
         id,
         profile_id,
         weight_kg,
-        target_weight,
         weight_change_type,
         logged_by,
         log_date,
@@ -567,32 +555,16 @@ async function fetchWeightLogs(
 
   return rows.map((row) => ({
     id: toInt(row.id),
-
-    profile_id:
-      row.profile_id,
-
-    weight_kg:
-      row.weight_kg,
-
-      target_weight: row.target_weight,
-
-    weight_change_type:
-      row.weight_change_type,
-
-    logged_by:
-      row.logged_by,
-
-    log_date:
-      toMysqlDate(row.log_date),
-
-    log_time:
-      row.log_time !== null &&
-      row.log_time !== undefined
-        ? String(row.log_time)
-        : null,
-
-    created_at:
-      toMysqlDateTime(row.created_at),
+    profile_id: row.profile_id,
+    weight_kg: toFloat(row.weight_kg),
+    target_weight: userTargetWeight !== null ? userTargetWeight : null, // ← Use user's target weight
+    weight_change_type: row.weight_change_type,
+    logged_by: row.logged_by,
+    log_date: toMysqlDate(row.log_date),
+    log_time: row.log_time !== null && row.log_time !== undefined
+      ? String(row.log_time)
+      : null,
+    created_at: toMysqlDateTime(row.created_at),
   }));
 }
 
@@ -661,28 +633,6 @@ function parseTestJson(columnValue) {
 
 /**
  * Fetch date-wise metabolism scores.
- *
- * IMPORTANT:
- *
- * For a super_admin request, the caller supplies:
- *
- *     dietician_id = RespyrD01
- *
- * but the client may actually belong to:
- *
- *     TRNBZ7875A
- *
- * Therefore the controller passes the client's ACTUAL
- * dietician_id into this function.
- *
- * This prevents the metabolism query from incorrectly
- * searching:
- *
- * profile376 + RespyrD01
- *
- * when the test data is actually stored under:
- *
- * profile376 + TRNBZ7875A
  */
 async function fetchMetabolismScoresByDate(
   profileId,
@@ -762,7 +712,6 @@ async function fetchMetabolismScoresByDate(
         toMysqlDate(
           row.date_time
         ),
-
       score: n,
     });
   }
@@ -849,22 +798,6 @@ function parseInputs(req) {
 
 /**
  * POST /dietitian/api/web/weight-tracking
- *
- * Example normal dietician:
- *
- * {
- *   "profile_id": "profile376",
- *   "dietician_id": "TRNBZ7875A",
- *   "actor_user_id": "viki01698@gmail.com"
- * }
- *
- * Example super_admin:
- *
- * {
- *   "profile_id": "profile376",
- *   "dietician_id": "RespyrD01",
- *   "actor_user_id": "connect@respyr.in"
- * }
  */
 const weightTracking = async (
   req,
@@ -889,15 +822,10 @@ const weightTracking = async (
   if (req.method !== "POST") {
     return res.status(405).json({
       status: false,
-
-      message:
-        "Only POST method is allowed",
-
+      message: "Only POST method is allowed",
       data: null,
-
       error: {
-        code:
-          "METHOD_NOT_ALLOWED",
+        code: "METHOD_NOT_ALLOWED",
       },
     });
   }
@@ -912,15 +840,10 @@ const weightTracking = async (
   if (parsed.invalidBody) {
     return res.status(400).json({
       status: false,
-
-      message:
-        "Invalid JSON payload",
-
+      message: "Invalid JSON payload",
       data: null,
-
       error: {
-        code:
-          "INVALID_JSON",
+        code: "INVALID_JSON",
       },
     });
   }
@@ -946,15 +869,10 @@ const weightTracking = async (
     ) {
       return res.status(422).json({
         status: false,
-
-        message:
-          "profile_id and dietician_id are required",
-
+        message: "profile_id and dietician_id are required",
         data: null,
-
         error: {
-          code:
-            "VALIDATION_ERROR",
+          code: "VALIDATION_ERROR",
         },
       });
     }
@@ -967,15 +885,10 @@ const weightTracking = async (
     ) {
       return res.status(422).json({
         status: false,
-
-        message:
-          "profile_id or dietician_id is too long",
-
+        message: "profile_id or dietician_id is too long",
         data: null,
-
         error: {
-          code:
-            "VALIDATION_ERROR",
+          code: "VALIDATION_ERROR",
         },
       });
     }
@@ -991,57 +904,30 @@ const weightTracking = async (
 
     if (resolved.error) {
       await writeAuthLogSafe(req, {
-        eventType:
-          "weight_logs_denied",
-
+        eventType: "weight_logs_denied",
         userId: null,
-
         role: null,
-
         partnerCode: null,
-
-        identifier:
-          profileId +
-          "|" +
-          dieticianId,
-
+        identifier: profileId + "|" + dieticianId,
         success: false,
-
-        failureReason:
-          resolved.error.body
-            ?.message ||
-          "actor resolution failed",
+        failureReason: resolved.error.body?.message || "actor resolution failed",
       });
 
       return res
-        .status(
-          resolved.error.status
-        )
-        .json(
-          resolved.error.body
-        );
+        .status(resolved.error.status)
+        .json(resolved.error.body);
     }
 
     const {
       actor,
     } = resolved;
 
-    actorEmail =
-      resolved.actorEmail;
-
-    actorRole =
-      String(actor.role);
-
-    actorCode =
-      normalizeCode(
-        getActorEffectiveCode(
-          actor
-        )
-      );
+    actorEmail = resolved.actorEmail;
+    actorRole = String(actor.role);
+    actorCode = normalizeCode(getActorEffectiveCode(actor));
 
     const isSuperAdmin =
-      actorRole ===
-      "super_admin";
+      actorRole === "super_admin";
 
     // ─────────────────────────────────────────────────────────────────────────
     // 2b. actor_user_id must match JWT identity
@@ -1051,58 +937,28 @@ const weightTracking = async (
       actorUserId !== "" &&
       actorUserId !== actorEmail
     ) {
-      await writeAuthLogSafe(
-        req,
-        {
-          eventType:
-            "weight_logs_denied",
-
-          userId:
-            actorEmail,
-
-          role:
-            actorRole,
-
-          partnerCode:
-            actorCode,
-
-          identifier:
-            actorUserId,
-
-          success: false,
-
-          failureReason:
-            "actor_user_id does not match token identity",
-        }
-      );
+      await writeAuthLogSafe(req, {
+        eventType: "weight_logs_denied",
+        userId: actorEmail,
+        role: actorRole,
+        partnerCode: actorCode,
+        identifier: actorUserId,
+        success: false,
+        failureReason: "actor_user_id does not match token identity",
+      });
 
       return res.status(403).json({
         status: false,
-
-        message:
-          "actor_user_id does not match the authenticated user",
-
+        message: "actor_user_id does not match the authenticated user",
         data: null,
-
         error: {
-          code:
-            "FORBIDDEN",
+          code: "FORBIDDEN",
         },
       });
     }
 
     // ─────────────────────────────────────────────────────────────────────────
     // 3. Entitlement check
-    // ─────────────────────────────────────────────────────────────────────────
-    //
-    // SUPER ADMIN:
-    //
-    //     Skip dietician visibility restriction.
-    //
-    // ADMIN / TRAINER:
-    //
-    //     dietician_id must be within allowed codes.
-    //
     // ─────────────────────────────────────────────────────────────────────────
 
     if (!isSuperAdmin) {
@@ -1119,44 +975,22 @@ const weightTracking = async (
           )
         )
       ) {
-        await writeAuthLogSafe(
-          req,
-          {
-            eventType:
-              "weight_logs_denied",
-
-            userId:
-              actorEmail,
-
-            role:
-              actorRole,
-
-            partnerCode:
-              actorCode,
-
-            identifier:
-              profileId +
-              "|" +
-              dieticianId,
-
-            success: false,
-
-            failureReason:
-              "dietician_id outside actor visibility",
-          }
-        );
+        await writeAuthLogSafe(req, {
+          eventType: "weight_logs_denied",
+          userId: actorEmail,
+          role: actorRole,
+          partnerCode: actorCode,
+          identifier: profileId + "|" + dieticianId,
+          success: false,
+          failureReason: "dietician_id outside actor visibility",
+        });
 
         return res.status(403).json({
           status: false,
-
-          message:
-            "You are not allowed to view this client's weight logs",
-
+          message: "You are not allowed to view this client's weight logs",
           data: null,
-
           error: {
-            code:
-              "FORBIDDEN",
+            code: "FORBIDDEN",
           },
         });
       }
@@ -1165,30 +999,6 @@ const weightTracking = async (
     // ─────────────────────────────────────────────────────────────────────────
     // 4. Find client
     // ─────────────────────────────────────────────────────────────────────────
-    //
-    // IMPORTANT:
-    //
-    // We always look up the client by profile_id first.
-    //
-    // This is necessary because a super_admin can access a client owned by
-    // another dietician.
-    //
-    // Example:
-    //
-    // Request:
-    //
-    //     profile_id   = profile376
-    //     dietician_id = RespyrD01
-    //
-    // Database:
-    //
-    //     profile376 → TRNBZ7875A
-    //
-    // Result:
-    //
-    //     super_admin → ALLOW
-    //
-    // ─────────────────────────────────────────────────────────────────────────
 
     const client =
       await getClientByProfileId(
@@ -1196,60 +1006,28 @@ const weightTracking = async (
       );
 
     if (!client) {
-      await writeAuthLogSafe(
-        req,
-        {
-          eventType:
-            "weight_logs_denied",
-
-          userId:
-            actorEmail,
-
-          role:
-            actorRole,
-
-          partnerCode:
-            actorCode,
-
-          identifier:
-            profileId +
-            "|" +
-            dieticianId,
-
-          success: false,
-
-          failureReason:
-            "Client not found",
-        }
-      );
+      await writeAuthLogSafe(req, {
+        eventType: "weight_logs_denied",
+        userId: actorEmail,
+        role: actorRole,
+        partnerCode: actorCode,
+        identifier: profileId + "|" + dieticianId,
+        success: false,
+        failureReason: "Client not found",
+      });
 
       return res.status(404).json({
         status: false,
-
-        message:
-          "Client not found",
-
+        message: "Client not found",
         data: null,
-
         error: {
-          code:
-            "NOT_FOUND",
+          code: "NOT_FOUND",
         },
       });
     }
 
     // ─────────────────────────────────────────────────────────────────────────
     // 5. Determine actual client dietician
-    // ─────────────────────────────────────────────────────────────────────────
-    //
-    // For super_admin:
-    //
-    //     Use actual client.dietician_id.
-    //
-    // For normal users:
-    //
-    //     The ownership check ensures requested dietician_id matches the client.
-    //
     // ─────────────────────────────────────────────────────────────────────────
 
     const actualClientDieticianId =
@@ -1261,60 +1039,28 @@ const weightTracking = async (
     if (
       actualClientDieticianId === ""
     ) {
-      await writeAuthLogSafe(
-        req,
-        {
-          eventType:
-            "weight_logs_denied",
-
-          userId:
-            actorEmail,
-
-          role:
-            actorRole,
-
-          partnerCode:
-            actorCode,
-
-          identifier:
-            profileId +
-            "|" +
-            dieticianId,
-
-          success: false,
-
-          failureReason:
-            "Client has no dietician_id",
-        }
-      );
+      await writeAuthLogSafe(req, {
+        eventType: "weight_logs_denied",
+        userId: actorEmail,
+        role: actorRole,
+        partnerCode: actorCode,
+        identifier: profileId + "|" + dieticianId,
+        success: false,
+        failureReason: "Client has no dietician_id",
+      });
 
       return res.status(404).json({
         status: false,
-
-        message:
-          "Client not found",
-
+        message: "Client not found",
         data: null,
-
         error: {
-          code:
-            "NOT_FOUND",
+          code: "NOT_FOUND",
         },
       });
     }
 
     // ─────────────────────────────────────────────────────────────────────────
     // 6. Ownership check for NON-super-admin
-    // ─────────────────────────────────────────────────────────────────────────
-    //
-    // Normal users must have:
-    //
-    //     profile376 + TRNBZ7875A
-    //
-    // as an actual ownership pair.
-    //
-    // Super_admin does NOT need this check.
-    //
     // ─────────────────────────────────────────────────────────────────────────
 
     if (!isSuperAdmin) {
@@ -1325,44 +1071,22 @@ const weightTracking = async (
         );
 
       if (!ownsClient) {
-        await writeAuthLogSafe(
-          req,
-          {
-            eventType:
-              "weight_logs_denied",
-
-            userId:
-              actorEmail,
-
-            role:
-              actorRole,
-
-            partnerCode:
-              actorCode,
-
-            identifier:
-              profileId +
-              "|" +
-              dieticianId,
-
-            success: false,
-
-            failureReason:
-              "Client not found for dietician",
-          }
-        );
+        await writeAuthLogSafe(req, {
+          eventType: "weight_logs_denied",
+          userId: actorEmail,
+          role: actorRole,
+          partnerCode: actorCode,
+          identifier: profileId + "|" + dieticianId,
+          success: false,
+          failureReason: "Client not found for dietician",
+        });
 
         return res.status(404).json({
           status: false,
-
-          message:
-            "Client not found",
-
+          message: "Client not found",
           data: null,
-
           error: {
-            code:
-              "NOT_FOUND",
+            code: "NOT_FOUND",
           },
         });
       }
@@ -1371,26 +1095,6 @@ const weightTracking = async (
     // ─────────────────────────────────────────────────────────────────────────
     // 7. Determine dietician used for data lookup
     // ─────────────────────────────────────────────────────────────────────────
-    //
-    // This is VERY IMPORTANT.
-    //
-    // Super_admin request:
-    //
-    //     dietician_id = RespyrD01
-    //
-    // But:
-    //
-    //     profile376 belongs to TRNBZ7875A
-    //
-    // Therefore metabolism data must be searched using:
-    //
-    //     TRNBZ7875A
-    //
-    // NOT:
-    //
-    //     RespyrD01
-    //
-    // ─────────────────────────────────────────────────────────────────────────
 
     const lookupDieticianId =
       isSuperAdmin
@@ -1398,13 +1102,13 @@ const weightTracking = async (
         : dieticianId;
 
     // ─────────────────────────────────────────────────────────────────────────
-    // 8. Fetch fitness goal
+    // 8. Fetch fitness goal & target weight
     // ─────────────────────────────────────────────────────────────────────────
 
-    const fitnessGoal =
-      await fetchFitnessGoal(
-        profileId
-      );
+    const [fitnessGoal, userTargetWeight] = await Promise.all([
+      fetchFitnessGoal(profileId),
+      fetchUserTargetWeight(profileId),  // ← NEW: Fetch user's target weight
+    ]);
 
     // ─────────────────────────────────────────────────────────────────────────
     // 9. Fetch weight logs + metabolism scores
@@ -1414,10 +1118,7 @@ const weightTracking = async (
       logs,
       metabolismScores,
     ] = await Promise.all([
-      fetchWeightLogs(
-        profileId
-      ),
-
+      fetchWeightLogs(profileId, userTargetWeight),  // ← Pass target weight
       fetchMetabolismScoresByDate(
         profileId,
         lookupDieticianId,
@@ -1437,146 +1138,71 @@ const weightTracking = async (
     // ─────────────────────────────────────────────────────────────────────────
 
     writeAuthLogSafe(req, {
-      eventType:
-        "weight_logs_viewed",
-
-      userId:
-        actorEmail,
-
-      role:
-        actorRole,
-
-      partnerCode:
-        actorCode,
-
-      identifier:
-        profileId +
-        "|" +
-        dieticianId +
-        "|rows:" +
-        logs.length,
-
+      eventType: "weight_logs_viewed",
+      userId: actorEmail,
+      role: actorRole,
+      partnerCode: actorCode,
+      identifier: profileId + "|" + dieticianId + "|rows:" + logs.length,
       success: true,
-
-      failureReason:
-        "Weight logs viewed",
+      failureReason: "Weight logs viewed",
     });
 
     // ─────────────────────────────────────────────────────────────────────────
     // 11. Return response
     // ─────────────────────────────────────────────────────────────────────────
 
-    if (logs.length > 0) {
-      return res.status(200).json({
-        status: true,
+    // Return user's target weight at top level for easy access
+    const responseData = {
+      status: true,
+      message: "Weight logs fetched successfully",
+      fitness_goal: fitnessGoal,
+      target_weight: userTargetWeight,  // ← NEW: Include target weight at top level
+      metabolism_score: metabolismScore,
+      metabolism_scores: metabolismScores,
+      data: logs,
+      error: null,
+    };
 
-        message:
-          "Weight logs fetched successfully",
-
-        fitness_goal:
-          fitnessGoal,
-
-        metabolism_score:
-          metabolismScore,
-
-        metabolism_scores:
-          metabolismScores,
-
-        data:
-          logs,
-
-        error: null,
-      });
+    if (logs.length === 0) {
+      responseData.status = false;
+      responseData.message = "No weight logs found";
+      responseData.error = {
+        code: "NOT_FOUND",
+      };
     }
 
-    // No logs
-    return res.status(404).json({
-      status: false,
+    return res.status(logs.length > 0 ? 200 : 404).json(responseData);
 
-      message:
-        "No weight logs found",
-
-      fitness_goal:
-        fitnessGoal,
-
-      metabolism_score:
-        metabolismScore,
-
-      metabolism_scores:
-        metabolismScores,
-
-      data: [],
-
-      error: {
-        code:
-          "NOT_FOUND",
-      },
-    });
   } catch (err) {
     // ─────────────────────────────────────────────────────────────────────────
     // Error handling
     // ─────────────────────────────────────────────────────────────────────────
 
-    console.error(
-      "WEIGHT_TRACKING_ERROR:",
-      {
-        code:
-          err?.code,
+    console.error("WEIGHT_TRACKING_ERROR:", {
+      code: err?.code,
+      errno: err?.errno,
+      sqlState: err?.sqlState,
+      message: err?.message,
+    });
 
-        errno:
-          err?.errno,
-
-        sqlState:
-          err?.sqlState,
-
-        message:
-          err?.message,
-      }
-    );
-
-    await writeAuthLogSafe(
-      req,
-      {
-        eventType:
-          "weight_logs_error",
-
-        userId:
-          actorEmail,
-
-        role:
-          actorRole,
-
-        partnerCode:
-          actorCode,
-
-        identifier:
-          profileId +
-          "|" +
-          dieticianId,
-
-        success: false,
-
-        failureReason:
-          err?.code ||
-          "internal_error",
-      }
-    );
+    await writeAuthLogSafe(req, {
+      eventType: "weight_logs_error",
+      userId: actorEmail,
+      role: actorRole,
+      partnerCode: actorCode,
+      identifier: profileId + "|" + dieticianId,
+      success: false,
+      failureReason: err?.code || "internal_error",
+    });
 
     return res.status(500).json({
       status: false,
-
-      message:
-        "Server error",
-
+      message: "Server error",
       data: null,
-
       error: {
-        code:
-          "SERVER_ERROR",
-
+        code: "SERVER_ERROR",
         ...(APP_DEBUG && {
-          details:
-            err?.message,
+          details: err?.message,
         }),
       },
     });
@@ -1590,8 +1216,6 @@ const weightTracking = async (
 module.exports = {
   weightTracking,
 };
-
-
 
 
 
