@@ -112,7 +112,7 @@ const agreementUploadUrl = async (req, res) => {
       Bucket: AGREEMENT_S3_BUCKET,
       Key: key,
       ContentType: "application/pdf",
-      CacheControl: "no-store",
+      // CacheControl: "no-store",
       Metadata: {
         invitation_id: String(invite.id),
         agreement_type: "terms_conditions_agreement",
