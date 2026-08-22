@@ -1,5 +1,5 @@
 "use strict";
-
+ 
 /**
  * weight-tracking.js
  *
@@ -11,51 +11,51 @@
  * - super_admin
  * - trainer
  */
-
+ 
 const crypto = require("crypto");
 const pool = require("../../../../config/db");
 const {
   normalizeCode,
   getAdminGroupPeerCodes,
 } = require("./admin_group_visibility");
-
+ 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
-
+ 
 const SECURITY_PEPPER =
   process.env.SECURITY_PEPPER || process.env.JWT_SECRET || "";
-
+ 
 const APP_DEBUG = process.env.NODE_ENV !== "production";
-
+ 
 const ALLOWED_ACTOR_ROLES = new Set([
   "admin",
   "super_admin",
   "trainer",
 ]);
-
+ 
 const ID_MAX_LENGTH = 64;
-
+ 
 // ─────────────────────────────────────────────────────────────────────────────
 // Generic helpers
 // ─────────────────────────────────────────────────────────────────────────────
-
+ 
 function normalizeEmail(val) {
   return typeof val === "string"
     ? val.trim().toLowerCase()
     : String(val ?? "").trim().toLowerCase();
 }
-
+ 
 function toInt(val) {
   const n = Number(val);
   return Number.isFinite(n) ? Math.trunc(n) : 0;
 }
-
+ 
 function toFloat(val) {
   const n = parseFloat(val);
   return Number.isFinite(n) ? n : null;
 }
-
+ 
 /**
  * Format MySQL DATETIME as:
  * YYYY-MM-DD HH:MM:SS
@@ -64,14 +64,14 @@ function toMysqlDateTime(val) {
   if (val === null || val === undefined) {
     return null;
   }
-
+ 
   if (val instanceof Date) {
     if (Number.isNaN(val.getTime())) {
       return null;
     }
-
+ 
     const pad = (n) => String(n).padStart(2, "0");
-
+ 
     return (
       `${val.getFullYear()}-${pad(val.getMonth() + 1)}-${pad(
         val.getDate()
@@ -81,10 +81,10 @@ function toMysqlDateTime(val) {
       )}`
     );
   }
-
+ 
   return String(val);
 }
-
+ 
 /**
  * Format MySQL DATE as:
  * YYYY-MM-DD
@@ -93,22 +93,22 @@ function toMysqlDate(val) {
   if (val === null || val === undefined) {
     return null;
   }
-
+ 
   if (val instanceof Date) {
     if (Number.isNaN(val.getTime())) {
       return null;
     }
-
+ 
     const pad = (n) => String(n).padStart(2, "0");
-
+ 
     return `${val.getFullYear()}-${pad(
       val.getMonth() + 1
     )}-${pad(val.getDate())}`;
   }
-
+ 
   return String(val);
 }
-
+ 
 /**
  * PHP effective code:
  *
@@ -126,7 +126,7 @@ function getActorEffectiveCode(actor) {
   ) {
     return String(actor.partner_code);
   }
-
+ 
   if (
     actor.dietician_id !== null &&
     actor.dietician_id !== undefined &&
@@ -134,44 +134,44 @@ function getActorEffectiveCode(actor) {
   ) {
     return String(actor.dietician_id);
   }
-
+ 
   return null;
 }
-
+ 
 function getClientIp(req) {
   const ip =
     (typeof req.ip === "string" && req.ip) ||
     req.socket?.remoteAddress ||
     req.connection?.remoteAddress ||
     "0.0.0.0";
-
+ 
   return String(ip).slice(0, 64);
 }
-
+ 
 function getUserAgent(req) {
   const ua =
     (typeof req.get === "function" && req.get("user-agent")) ||
     req.headers?.["user-agent"] ||
     "";
-
+ 
   return String(ua).slice(0, 500);
 }
-
+ 
 function authLogHash(value) {
   if (value === null || value === undefined) {
     return null;
   }
-
+ 
   return crypto
     .createHmac("sha256", SECURITY_PEPPER)
     .update(String(value).trim().toLowerCase())
     .digest("hex");
 }
-
+ 
 // ─────────────────────────────────────────────────────────────────────────────
 // Audit logging
 // ─────────────────────────────────────────────────────────────────────────────
-
+ 
 async function writeAuthLogSafe(req, {
   eventType,
   userId,
@@ -188,7 +188,7 @@ async function writeAuthLogSafe(req, {
       identifier !== null && identifier !== undefined
         ? authLogHash(identifier)
         : null;
-
+ 
     await pool.execute(
       `
         INSERT INTO app_auth_logs (
@@ -228,20 +228,20 @@ async function writeAuthLogSafe(req, {
     );
   }
 }
-
+ 
 // ─────────────────────────────────────────────────────────────────────────────
 // Actor resolution
 // ─────────────────────────────────────────────────────────────────────────────
-
+ 
 async function resolveActorFromToken(req) {
   const payload = req.user || {};
-
+ 
   const dieticianId = String(
     payload.sub ||
       payload.dietician_id ||
       ""
   ).trim();
-
+ 
   if (
     !dieticianId ||
     dieticianId.length > ID_MAX_LENGTH
@@ -260,7 +260,7 @@ async function resolveActorFromToken(req) {
       },
     };
   }
-
+ 
   const [rows] = await pool.execute(
     `
       SELECT
@@ -279,9 +279,9 @@ async function resolveActorFromToken(req) {
     `,
     [dieticianId]
   );
-
+ 
   const actor = rows[0];
-
+ 
   if (!actor) {
     return {
       error: {
@@ -297,7 +297,7 @@ async function resolveActorFromToken(req) {
       },
     };
   }
-
+ 
   if (String(actor.status) !== "active") {
     return {
       error: {
@@ -313,7 +313,7 @@ async function resolveActorFromToken(req) {
       },
     };
   }
-
+ 
   if (
     !ALLOWED_ACTOR_ROLES.has(
       String(actor.role)
@@ -333,17 +333,17 @@ async function resolveActorFromToken(req) {
       },
     };
   }
-
+ 
   return {
     actor,
     actorEmail: normalizeEmail(actor.email),
   };
 }
-
+ 
 // ─────────────────────────────────────────────────────────────────────────────
 // Authorization
 // ─────────────────────────────────────────────────────────────────────────────
-
+ 
 /**
  * Build the set of dietician codes whose clients
  * the actor may view.
@@ -361,16 +361,16 @@ async function getAllowedCodes(
   actorEmail
 ) {
   const codes = new Set();
-
+ 
   // Own code
   const own = normalizeCode(
     getActorEffectiveCode(actor)
   );
-
+ 
   if (own !== "") {
     codes.add(own);
   }
-
+ 
   // Active child trainers
   const [trainerRows] = await pool.execute(
     `
@@ -384,37 +384,37 @@ async function getAllowedCodes(
     `,
     [actorEmail]
   );
-
+ 
   for (const row of trainerRows) {
     const code = normalizeCode(
       row.partner_code
     );
-
+ 
     if (code !== "") {
       codes.add(code);
     }
   }
-
+ 
   // Admin-group peers
   const peers = await getAdminGroupPeerCodes(
     own
   );
-
+ 
   for (const code of peers) {
     const normalized = normalizeCode(code);
-
+ 
     if (normalized !== "") {
       codes.add(normalized);
     }
   }
-
+ 
   return codes;
 }
-
+ 
 // ─────────────────────────────────────────────────────────────────────────────
 // Client lookup
 // ─────────────────────────────────────────────────────────────────────────────
-
+ 
 /**
  * Get the client by profile_id.
  *
@@ -431,19 +431,21 @@ async function getClientByProfileId(
     `
       SELECT
         profile_id,
-        dietician_id
+        dietician_id,
+        weight,
+        target_weight
       FROM table_clients
       WHERE profile_id = ?
       LIMIT 1
     `,
     [profileId]
   );
-
+ 
   return rows.length > 0
     ? rows[0]
     : null;
 }
-
+ 
 /**
  * Confirm that a client belongs to the
  * requested dietician.
@@ -468,24 +470,40 @@ async function clientPairExists(
       dieticianId,
     ]
   );
-
+ 
   return rows.length > 0;
 }
-
+ 
 // ─────────────────────────────────────────────────────────────────────────────
 // Weight logs
 // ─────────────────────────────────────────────────────────────────────────────
-
+ 
 /**
- * Fetch weight logs from the database.
- * Gets target_weight directly from the weight_log table (same as app code).
- * The most recent non-zero target_weight is used as the user's current target.
+ * Resolve the client's CURRENT target weight, using the SAME precedence
+ * as the app backend (tracking_stat.service.js):
+ *
+ *   1. table_clients.target_weight  — user-set override via /profile/update
+ *                                     (highest precedence; > 0 to count)
+ *   2. weight_log.target_weight     — most recent non-zero value, written /
+ *                                     carried forward by /weight/insert
+ *   3. null                         — no target set anywhere
+ *
+ * This is why the dashboard now reflects a target_weight change no matter
+ * WHICH app flow changed it (profile update OR weight insert).
  */
-async function fetchWeightLogs(
-  profileId
+async function resolveCurrentTargetWeight(
+  profileId,
+  clientTargetWeightRaw
 ) {
-  // First, get the most recent non-zero target_weight
-  // This mimics the app's carry-forward logic
+  // 1. User-set override on table_clients (nullable DECIMAL).
+  const clientTarget = toFloat(clientTargetWeightRaw);
+ 
+  if (clientTarget !== null && clientTarget > 0) {
+    return clientTarget;
+  }
+ 
+  // 2. Most recent non-zero target_weight from weight_log
+  //    (mimics the app's carry-forward logic).
   const [targetRow] = await pool.execute(
     `
       SELECT target_weight
@@ -497,13 +515,21 @@ async function fetchWeightLogs(
     `,
     [profileId]
   );
-
-  // If no non-zero target found, use null
-  const currentTargetWeight = targetRow.length > 0 
-    ? toFloat(targetRow[0].target_weight) 
+ 
+  return targetRow.length > 0
+    ? toFloat(targetRow[0].target_weight)
     : null;
-
-  // Now fetch all logs
+}
+ 
+/**
+ * Fetch weight logs from the database.
+ * `currentTargetWeight` (already resolved with app-identical precedence)
+ * is used as the fallback for legacy rows whose target_weight is 0/NULL.
+ */
+async function fetchWeightLogs(
+  profileId,
+  currentTargetWeight
+) {
   const [rows] = await pool.execute(
     `
       SELECT
@@ -525,7 +551,7 @@ async function fetchWeightLogs(
     `,
     [profileId]
   );
-
+ 
   return rows.map((row) => {
     const logTargetWeight = toFloat(row.target_weight);
     
@@ -534,7 +560,7 @@ async function fetchWeightLogs(
     const effectiveTargetWeight = (logTargetWeight && logTargetWeight > 0) 
       ? logTargetWeight 
       : currentTargetWeight;
-
+ 
     return {
       id: toInt(row.id),
       profile_id: row.profile_id,
@@ -550,11 +576,11 @@ async function fetchWeightLogs(
     };
   });
 }
-
+ 
 // ─────────────────────────────────────────────────────────────────────────────
 // Test JSON parsing
 // ─────────────────────────────────────────────────────────────────────────────
-
+ 
 function parseTestJson(columnValue) {
   if (
     columnValue === null ||
@@ -562,9 +588,9 @@ function parseTestJson(columnValue) {
   ) {
     return null;
   }
-
+ 
   let jsonText = "";
-
+ 
   if (Buffer.isBuffer(columnValue)) {
     jsonText =
       columnValue.toString("utf8");
@@ -589,17 +615,17 @@ function parseTestJson(columnValue) {
   } else {
     return null;
   }
-
+ 
   jsonText = jsonText.trim();
-
+ 
   if (!jsonText) {
     return null;
   }
-
+ 
   try {
     const parsed =
       JSON.parse(jsonText);
-
+ 
     return typeof parsed === "object" &&
       parsed !== null &&
       !Array.isArray(parsed)
@@ -609,11 +635,11 @@ function parseTestJson(columnValue) {
     return null;
   }
 }
-
+ 
 // ─────────────────────────────────────────────────────────────────────────────
 // Metabolism scores
 // ─────────────────────────────────────────────────────────────────────────────
-
+ 
 /**
  * Fetch date-wise metabolism scores.
  */
@@ -628,7 +654,7 @@ async function fetchMetabolismScoresByDate(
         t1.test_json,
         t1.date_time
       FROM table_test_data t1
-
+ 
       INNER JOIN (
         SELECT
           DATE(date_time) AS test_date,
@@ -641,11 +667,11 @@ async function fetchMetabolismScoresByDate(
       ) t2
         ON t1.date_time = t2.max_date_time
         AND DATE(t1.date_time) = t2.test_date
-
+ 
       WHERE t1.profile_id = ?
         AND UPPER(TRIM(t1.dietitian_id)) =
             UPPER(TRIM(?))
-
+ 
       ORDER BY
         t1.date_time DESC
     `,
@@ -656,7 +682,7 @@ async function fetchMetabolismScoresByDate(
       dieticianId,
     ]
   );
-
+ 
   const trendKey =
     String(fitnessGoal)
       .trim()
@@ -664,18 +690,18 @@ async function fetchMetabolismScoresByDate(
     "muscle_gain"
       ? "Muscle_Gain_Trend"
       : "Fat_Use_Pattern_trend";
-
+ 
   const scores = [];
-
+ 
   for (const row of rows) {
     const json =
       parseTestJson(
         row.test_json
       );
-
+ 
     const rawValue =
       json?.[trendKey]?.value;
-
+ 
     if (
       rawValue === null ||
       rawValue === undefined ||
@@ -683,13 +709,13 @@ async function fetchMetabolismScoresByDate(
     ) {
       continue;
     }
-
+ 
     const n = Number(rawValue);
-
+ 
     if (Number.isNaN(n)) {
       continue;
     }
-
+ 
     scores.push({
       date:
         toMysqlDate(
@@ -698,14 +724,14 @@ async function fetchMetabolismScoresByDate(
       score: n,
     });
   }
-
+ 
   return scores;
 }
-
+ 
 // ─────────────────────────────────────────────────────────────────────────────
 // Fitness goal
 // ─────────────────────────────────────────────────────────────────────────────
-
+ 
 async function fetchFitnessGoal(
   profileId
 ) {
@@ -719,21 +745,21 @@ async function fetchFitnessGoal(
     `,
     [profileId]
   );
-
+ 
   const raw =
     String(
       rows[0]?.goal ?? ""
     ).trim();
-
+ 
   return raw !== ""
     ? raw
     : "weight_loss";
 }
-
+ 
 // ─────────────────────────────────────────────────────────────────────────────
 // Input parsing
 // ─────────────────────────────────────────────────────────────────────────────
-
+ 
 function parseInputs(req) {
   const src =
     req.body &&
@@ -741,32 +767,32 @@ function parseInputs(req) {
     !Array.isArray(req.body)
       ? req.body
       : null;
-
+ 
   if (src === null) {
     return {
       invalidBody: true,
     };
   }
-
+ 
   const profileId =
     typeof src.profile_id === "string"
       ? src.profile_id.trim()
       : String(
           src.profile_id ?? ""
         ).trim();
-
+ 
   const dieticianId =
     typeof src.dietician_id === "string"
       ? src.dietician_id.trim()
       : String(
           src.dietician_id ?? ""
         ).trim();
-
+ 
   const actorUserId =
     normalizeEmail(
       src.actor_user_id
     );
-
+ 
   return {
     invalidBody: false,
     profileId,
@@ -774,11 +800,11 @@ function parseInputs(req) {
     actorUserId,
   };
 }
-
+ 
 // ─────────────────────────────────────────────────────────────────────────────
 // Controller
 // ─────────────────────────────────────────────────────────────────────────────
-
+ 
 /**
  * POST /dietitian/api/web/weight-tracking
  */
@@ -792,16 +818,16 @@ const weightTracking = async (
     "Cache-Control",
     "no-store"
   );
-
+ 
   res.setHeader(
     "Pragma",
     "no-cache"
   );
-
+ 
   // ───────────────────────────────────────────────────────────────────────────
   // Method validation
   // ───────────────────────────────────────────────────────────────────────────
-
+ 
   if (req.method !== "POST") {
     return res.status(405).json({
       status: false,
@@ -812,14 +838,14 @@ const weightTracking = async (
       },
     });
   }
-
+ 
   // ───────────────────────────────────────────────────────────────────────────
   // Parse body
   // ───────────────────────────────────────────────────────────────────────────
-
+ 
   const parsed =
     parseInputs(req);
-
+ 
   if (parsed.invalidBody) {
     return res.status(400).json({
       status: false,
@@ -830,22 +856,22 @@ const weightTracking = async (
       },
     });
   }
-
+ 
   const {
     profileId,
     dieticianId,
     actorUserId,
   } = parsed;
-
+ 
   let actorEmail = null;
   let actorRole = null;
   let actorCode = null;
-
+ 
   try {
     // ─────────────────────────────────────────────────────────────────────────
     // 1. Validate inputs
     // ─────────────────────────────────────────────────────────────────────────
-
+ 
     if (
       profileId === "" ||
       dieticianId === ""
@@ -859,7 +885,7 @@ const weightTracking = async (
         },
       });
     }
-
+ 
     if (
       profileId.length >
         ID_MAX_LENGTH ||
@@ -875,16 +901,16 @@ const weightTracking = async (
         },
       });
     }
-
+ 
     // ─────────────────────────────────────────────────────────────────────────
     // 2. Resolve actor from JWT
     // ─────────────────────────────────────────────────────────────────────────
-
+ 
     const resolved =
       await resolveActorFromToken(
         req
       );
-
+ 
     if (resolved.error) {
       await writeAuthLogSafe(req, {
         eventType: "weight_logs_denied",
@@ -895,27 +921,27 @@ const weightTracking = async (
         success: false,
         failureReason: resolved.error.body?.message || "actor resolution failed",
       });
-
+ 
       return res
         .status(resolved.error.status)
         .json(resolved.error.body);
     }
-
+ 
     const {
       actor,
     } = resolved;
-
+ 
     actorEmail = resolved.actorEmail;
     actorRole = String(actor.role);
     actorCode = normalizeCode(getActorEffectiveCode(actor));
-
+ 
     const isSuperAdmin =
       actorRole === "super_admin";
-
+ 
     // ─────────────────────────────────────────────────────────────────────────
     // 2b. actor_user_id must match JWT identity
     // ─────────────────────────────────────────────────────────────────────────
-
+ 
     if (
       actorUserId !== "" &&
       actorUserId !== actorEmail
@@ -929,7 +955,7 @@ const weightTracking = async (
         success: false,
         failureReason: "actor_user_id does not match token identity",
       });
-
+ 
       return res.status(403).json({
         status: false,
         message: "actor_user_id does not match the authenticated user",
@@ -939,18 +965,18 @@ const weightTracking = async (
         },
       });
     }
-
+ 
     // ─────────────────────────────────────────────────────────────────────────
     // 3. Entitlement check
     // ─────────────────────────────────────────────────────────────────────────
-
+ 
     if (!isSuperAdmin) {
       const allowedCodes =
         await getAllowedCodes(
           actor,
           actorEmail
         );
-
+ 
       if (
         !allowedCodes.has(
           normalizeCode(
@@ -967,7 +993,7 @@ const weightTracking = async (
           success: false,
           failureReason: "dietician_id outside actor visibility",
         });
-
+ 
         return res.status(403).json({
           status: false,
           message: "You are not allowed to view this client's weight logs",
@@ -978,16 +1004,16 @@ const weightTracking = async (
         });
       }
     }
-
+ 
     // ─────────────────────────────────────────────────────────────────────────
     // 4. Find client
     // ─────────────────────────────────────────────────────────────────────────
-
+ 
     const client =
       await getClientByProfileId(
         profileId
       );
-
+ 
     if (!client) {
       await writeAuthLogSafe(req, {
         eventType: "weight_logs_denied",
@@ -998,7 +1024,7 @@ const weightTracking = async (
         success: false,
         failureReason: "Client not found",
       });
-
+ 
       return res.status(404).json({
         status: false,
         message: "Client not found",
@@ -1008,17 +1034,17 @@ const weightTracking = async (
         },
       });
     }
-
+ 
     // ─────────────────────────────────────────────────────────────────────────
     // 5. Determine actual client dietician
     // ─────────────────────────────────────────────────────────────────────────
-
+ 
     const actualClientDieticianId =
       String(
         client.dietician_id ??
           ""
       ).trim();
-
+ 
     if (
       actualClientDieticianId === ""
     ) {
@@ -1031,7 +1057,7 @@ const weightTracking = async (
         success: false,
         failureReason: "Client has no dietician_id",
       });
-
+ 
       return res.status(404).json({
         status: false,
         message: "Client not found",
@@ -1041,18 +1067,18 @@ const weightTracking = async (
         },
       });
     }
-
+ 
     // ─────────────────────────────────────────────────────────────────────────
     // 6. Ownership check for NON-super-admin
     // ─────────────────────────────────────────────────────────────────────────
-
+ 
     if (!isSuperAdmin) {
       const ownsClient =
         await clientPairExists(
           profileId,
           dieticianId
         );
-
+ 
       if (!ownsClient) {
         await writeAuthLogSafe(req, {
           eventType: "weight_logs_denied",
@@ -1063,7 +1089,7 @@ const weightTracking = async (
           success: false,
           failureReason: "Client not found for dietician",
         });
-
+ 
         return res.status(404).json({
           status: false,
           message: "Client not found",
@@ -1074,52 +1100,65 @@ const weightTracking = async (
         });
       }
     }
-
+ 
     // ─────────────────────────────────────────────────────────────────────────
     // 7. Determine dietician used for data lookup
     // ─────────────────────────────────────────────────────────────────────────
-
+ 
     const lookupDieticianId =
       isSuperAdmin
         ? actualClientDieticianId
         : dieticianId;
-
+ 
     // ─────────────────────────────────────────────────────────────────────────
     // 8. Fetch fitness goal
     // ─────────────────────────────────────────────────────────────────────────
-
+ 
     const fitnessGoal =
       await fetchFitnessGoal(
         profileId
       );
-
+ 
     // ─────────────────────────────────────────────────────────────────────────
     // 9. Fetch weight logs + metabolism scores
     // ─────────────────────────────────────────────────────────────────────────
-
+ 
+    // Current target weight, resolved ONCE with app-identical precedence:
+    // table_clients.target_weight (profile-update override) → latest
+    // non-zero weight_log.target_weight → null.
+    // `client` was fetched in step 4 and now carries target_weight.
+    const currentTargetWeight =
+      await resolveCurrentTargetWeight(
+        profileId,
+        client.target_weight
+      );
+ 
     const [
       logs,
       metabolismScores,
     ] = await Promise.all([
-      fetchWeightLogs(profileId),  // ← Uses weight_log.target_weight column
+      fetchWeightLogs(
+        profileId,
+        currentTargetWeight
+      ),
       fetchMetabolismScoresByDate(
         profileId,
         lookupDieticianId,
         fitnessGoal
       ),
     ]);
-
+ 
     // Latest score = first entry because
     // results are ordered newest first.
     const metabolismScore =
       metabolismScores.length > 0
         ? metabolismScores[0].score
         : null;
-
+ 
     // ─────────────────────────────────────────────────────────────────────────
     // 10. Audit successful PHI read
     // ─────────────────────────────────────────────────────────────────────────
-
+ 
     writeAuthLogSafe(req, {
       eventType: "weight_logs_viewed",
       userId: actorEmail,
@@ -1129,42 +1168,23 @@ const weightTracking = async (
       success: true,
       failureReason: "Weight logs viewed",
     });
-
+ 
     // ─────────────────────────────────────────────────────────────────────────
-    // 11. Get current target weight (most recent non-zero value)
+    // 11. Return response
     // ─────────────────────────────────────────────────────────────────────────
-
-    const [targetRow] = await pool.execute(
-      `
-        SELECT target_weight
-        FROM weight_log
-        WHERE profile_id = ?
-          AND (target_weight IS NOT NULL AND target_weight != 0)
-        ORDER BY log_date DESC, log_time DESC, id DESC
-        LIMIT 1
-      `,
-      [profileId]
-    );
-
-    const currentTargetWeight = targetRow.length > 0 
-      ? toFloat(targetRow[0].target_weight) 
-      : null;
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // 12. Return response
-    // ─────────────────────────────────────────────────────────────────────────
-
+ 
     const responseData = {
       status: true,
       message: "Weight logs fetched successfully",
       fitness_goal: fitnessGoal,
-      target_weight: currentTargetWeight,  // ← Current target weight from weight_log
+      current_weight: toFloat(client.weight),  // ← table_clients.weight — overwritten on every app weight log
+      target_weight: currentTargetWeight,  // ← table_clients override → weight_log fallback
       metabolism_score: metabolismScore,
       metabolism_scores: metabolismScores,
       data: logs,
       error: null,
     };
-
+ 
     if (logs.length === 0) {
       responseData.status = false;
       responseData.message = "No weight logs found";
@@ -1172,21 +1192,21 @@ const weightTracking = async (
         code: "NOT_FOUND",
       };
     }
-
+ 
     return res.status(logs.length > 0 ? 200 : 404).json(responseData);
-
+ 
   } catch (err) {
     // ─────────────────────────────────────────────────────────────────────────
     // Error handling
     // ─────────────────────────────────────────────────────────────────────────
-
+ 
     console.error("WEIGHT_TRACKING_ERROR:", {
       code: err?.code,
       errno: err?.errno,
       sqlState: err?.sqlState,
       message: err?.message,
     });
-
+ 
     await writeAuthLogSafe(req, {
       eventType: "weight_logs_error",
       userId: actorEmail,
@@ -1196,7 +1216,7 @@ const weightTracking = async (
       success: false,
       failureReason: err?.code || "internal_error",
     });
-
+ 
     return res.status(500).json({
       status: false,
       message: "Server error",
@@ -1210,14 +1230,1246 @@ const weightTracking = async (
     });
   }
 };
-
+ 
 // ─────────────────────────────────────────────────────────────────────────────
 // Export
 // ─────────────────────────────────────────────────────────────────────────────
-
+ 
 module.exports = {
   weightTracking,
 };
+ 
+ 
+
+
+
+
+
+
+
+
+
+
+// "use strict";
+
+// /**
+//  * weight-tracking.js
+//  *
+//  * Endpoint:
+//  * POST /dietitian/api/web/weight-tracking
+//  *
+//  * Authorization:
+//  * - admin
+//  * - super_admin
+//  * - trainer
+//  */
+
+// const crypto = require("crypto");
+// const pool = require("../../../../config/db");
+// const {
+//   normalizeCode,
+//   getAdminGroupPeerCodes,
+// } = require("./admin_group_visibility");
+
+// // ─────────────────────────────────────────────────────────────────────────────
+// // Constants
+// // ─────────────────────────────────────────────────────────────────────────────
+
+// const SECURITY_PEPPER =
+//   process.env.SECURITY_PEPPER || process.env.JWT_SECRET || "";
+
+// const APP_DEBUG = process.env.NODE_ENV !== "production";
+
+// const ALLOWED_ACTOR_ROLES = new Set([
+//   "admin",
+//   "super_admin",
+//   "trainer",
+// ]);
+
+// const ID_MAX_LENGTH = 64;
+
+// // ─────────────────────────────────────────────────────────────────────────────
+// // Generic helpers
+// // ─────────────────────────────────────────────────────────────────────────────
+
+// function normalizeEmail(val) {
+//   return typeof val === "string"
+//     ? val.trim().toLowerCase()
+//     : String(val ?? "").trim().toLowerCase();
+// }
+
+// function toInt(val) {
+//   const n = Number(val);
+//   return Number.isFinite(n) ? Math.trunc(n) : 0;
+// }
+
+// function toFloat(val) {
+//   const n = parseFloat(val);
+//   return Number.isFinite(n) ? n : null;
+// }
+
+// /**
+//  * Format MySQL DATETIME as:
+//  * YYYY-MM-DD HH:MM:SS
+//  */
+// function toMysqlDateTime(val) {
+//   if (val === null || val === undefined) {
+//     return null;
+//   }
+
+//   if (val instanceof Date) {
+//     if (Number.isNaN(val.getTime())) {
+//       return null;
+//     }
+
+//     const pad = (n) => String(n).padStart(2, "0");
+
+//     return (
+//       `${val.getFullYear()}-${pad(val.getMonth() + 1)}-${pad(
+//         val.getDate()
+//       )} ` +
+//       `${pad(val.getHours())}:${pad(val.getMinutes())}:${pad(
+//         val.getSeconds()
+//       )}`
+//     );
+//   }
+
+//   return String(val);
+// }
+
+// /**
+//  * Format MySQL DATE as:
+//  * YYYY-MM-DD
+//  */
+// function toMysqlDate(val) {
+//   if (val === null || val === undefined) {
+//     return null;
+//   }
+
+//   if (val instanceof Date) {
+//     if (Number.isNaN(val.getTime())) {
+//       return null;
+//     }
+
+//     const pad = (n) => String(n).padStart(2, "0");
+
+//     return `${val.getFullYear()}-${pad(
+//       val.getMonth() + 1
+//     )}-${pad(val.getDate())}`;
+//   }
+
+//   return String(val);
+// }
+
+// /**
+//  * PHP effective code:
+//  *
+//  * partner_code
+//  *     ↓
+//  * dietician_id
+//  *     ↓
+//  * null
+//  */
+// function getActorEffectiveCode(actor) {
+//   if (
+//     actor.partner_code !== null &&
+//     actor.partner_code !== undefined &&
+//     String(actor.partner_code).trim() !== ""
+//   ) {
+//     return String(actor.partner_code);
+//   }
+
+//   if (
+//     actor.dietician_id !== null &&
+//     actor.dietician_id !== undefined &&
+//     String(actor.dietician_id).trim() !== ""
+//   ) {
+//     return String(actor.dietician_id);
+//   }
+
+//   return null;
+// }
+
+// function getClientIp(req) {
+//   const ip =
+//     (typeof req.ip === "string" && req.ip) ||
+//     req.socket?.remoteAddress ||
+//     req.connection?.remoteAddress ||
+//     "0.0.0.0";
+
+//   return String(ip).slice(0, 64);
+// }
+
+// function getUserAgent(req) {
+//   const ua =
+//     (typeof req.get === "function" && req.get("user-agent")) ||
+//     req.headers?.["user-agent"] ||
+//     "";
+
+//   return String(ua).slice(0, 500);
+// }
+
+// function authLogHash(value) {
+//   if (value === null || value === undefined) {
+//     return null;
+//   }
+
+//   return crypto
+//     .createHmac("sha256", SECURITY_PEPPER)
+//     .update(String(value).trim().toLowerCase())
+//     .digest("hex");
+// }
+
+// // ─────────────────────────────────────────────────────────────────────────────
+// // Audit logging
+// // ─────────────────────────────────────────────────────────────────────────────
+
+// async function writeAuthLogSafe(req, {
+//   eventType,
+//   userId,
+//   role,
+//   partnerCode,
+//   identifier,
+//   success,
+//   failureReason,
+// }) {
+//   try {
+//     const ipHash = authLogHash(getClientIp(req));
+//     const userAgentHash = authLogHash(getUserAgent(req));
+//     const identifierHash =
+//       identifier !== null && identifier !== undefined
+//         ? authLogHash(identifier)
+//         : null;
+
+//     await pool.execute(
+//       `
+//         INSERT INTO app_auth_logs (
+//           event_type,
+//           user_id,
+//           role,
+//           partner_code,
+//           identifier_hash,
+//           ip_hash,
+//           user_agent_hash,
+//           session_id_hash,
+//           success,
+//           failure_reason
+//         )
+//         VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
+//       `,
+//       [
+//         String(eventType || "").slice(0, 60),
+//         userId !== null && userId !== undefined
+//           ? String(userId).slice(0, 191)
+//           : null,
+//         role ?? null,
+//         partnerCode ?? null,
+//         identifierHash,
+//         ipHash,
+//         userAgentHash,
+//         success ? 1 : 0,
+//         failureReason !== null && failureReason !== undefined
+//           ? String(failureReason).slice(0, 255)
+//           : null,
+//       ]
+//     );
+//   } catch (err) {
+//     console.error(
+//       "WEIGHT_TRACKING_AUDIT_FAILED:",
+//       err?.code || err?.message
+//     );
+//   }
+// }
+
+// // ─────────────────────────────────────────────────────────────────────────────
+// // Actor resolution
+// // ─────────────────────────────────────────────────────────────────────────────
+
+// async function resolveActorFromToken(req) {
+//   const payload = req.user || {};
+
+//   const dieticianId = String(
+//     payload.sub ||
+//       payload.dietician_id ||
+//       ""
+//   ).trim();
+
+//   if (
+//     !dieticianId ||
+//     dieticianId.length > ID_MAX_LENGTH
+//   ) {
+//     return {
+//       error: {
+//         status: 401,
+//         body: {
+//           status: false,
+//           message: "Invalid token user",
+//           data: null,
+//           error: {
+//             code: "UNAUTHENTICATED",
+//           },
+//         },
+//       },
+//     };
+//   }
+
+//   const [rows] = await pool.execute(
+//     `
+//       SELECT
+//         td.dietician_id,
+//         td.name,
+//         td.email,
+//         aur.role,
+//         aur.partner_code,
+//         aur.parent_user_id,
+//         aur.status
+//       FROM table_dietician td
+//       INNER JOIN app_user_roles aur
+//         ON LOWER(aur.user_id) = LOWER(td.email)
+//       WHERE td.dietician_id = ?
+//       LIMIT 1
+//     `,
+//     [dieticianId]
+//   );
+
+//   const actor = rows[0];
+
+//   if (!actor) {
+//     return {
+//       error: {
+//         status: 403,
+//         body: {
+//           status: false,
+//           message: "Actor user not found",
+//           data: null,
+//           error: {
+//             code: "FORBIDDEN",
+//           },
+//         },
+//       },
+//     };
+//   }
+
+//   if (String(actor.status) !== "active") {
+//     return {
+//       error: {
+//         status: 403,
+//         body: {
+//           status: false,
+//           message: "Actor account is not active",
+//           data: null,
+//           error: {
+//             code: "FORBIDDEN",
+//           },
+//         },
+//       },
+//     };
+//   }
+
+//   if (
+//     !ALLOWED_ACTOR_ROLES.has(
+//       String(actor.role)
+//     )
+//   ) {
+//     return {
+//       error: {
+//         status: 403,
+//         body: {
+//           status: false,
+//           message: "Not allowed to access weight logs",
+//           data: null,
+//           error: {
+//             code: "FORBIDDEN",
+//           },
+//         },
+//       },
+//     };
+//   }
+
+//   return {
+//     actor,
+//     actorEmail: normalizeEmail(actor.email),
+//   };
+// }
+
+// // ─────────────────────────────────────────────────────────────────────────────
+// // Authorization
+// // ─────────────────────────────────────────────────────────────────────────────
+
+// /**
+//  * Build the set of dietician codes whose clients
+//  * the actor may view.
+//  *
+//  * Includes:
+//  *
+//  * - own effective code
+//  * - active child trainers
+//  * - admin-group peers
+//  *
+//  * super_admin does not need this list.
+//  */
+// async function getAllowedCodes(
+//   actor,
+//   actorEmail
+// ) {
+//   const codes = new Set();
+
+//   // Own code
+//   const own = normalizeCode(
+//     getActorEffectiveCode(actor)
+//   );
+
+//   if (own !== "") {
+//     codes.add(own);
+//   }
+
+//   // Active child trainers
+//   const [trainerRows] = await pool.execute(
+//     `
+//       SELECT partner_code
+//       FROM app_user_roles
+//       WHERE role = 'trainer'
+//         AND status = 'active'
+//         AND partner_code IS NOT NULL
+//         AND partner_code <> ''
+//         AND LOWER(parent_user_id) = LOWER(?)
+//     `,
+//     [actorEmail]
+//   );
+
+//   for (const row of trainerRows) {
+//     const code = normalizeCode(
+//       row.partner_code
+//     );
+
+//     if (code !== "") {
+//       codes.add(code);
+//     }
+//   }
+
+//   // Admin-group peers
+//   const peers = await getAdminGroupPeerCodes(
+//     own
+//   );
+
+//   for (const code of peers) {
+//     const normalized = normalizeCode(code);
+
+//     if (normalized !== "") {
+//       codes.add(normalized);
+//     }
+//   }
+
+//   return codes;
+// }
+
+// // ─────────────────────────────────────────────────────────────────────────────
+// // Client lookup
+// // ─────────────────────────────────────────────────────────────────────────────
+
+// /**
+//  * Get the client by profile_id.
+//  *
+//  * IMPORTANT:
+//  *
+//  * This function intentionally returns the client's actual dietician_id.
+//  *
+//  * This is required for super_admin access.
+//  */
+// async function getClientByProfileId(
+//   profileId
+// ) {
+//   const [rows] = await pool.execute(
+//     `
+//       SELECT
+//         profile_id,
+//         dietician_id
+//       FROM table_clients
+//       WHERE profile_id = ?
+//       LIMIT 1
+//     `,
+//     [profileId]
+//   );
+
+//   return rows.length > 0
+//     ? rows[0]
+//     : null;
+// }
+
+// /**
+//  * Confirm that a client belongs to the
+//  * requested dietician.
+//  *
+//  * Used ONLY for non-super-admin users.
+//  */
+// async function clientPairExists(
+//   profileId,
+//   dieticianId
+// ) {
+//   const [rows] = await pool.execute(
+//     `
+//       SELECT 1 AS hit
+//       FROM table_clients
+//       WHERE profile_id = ?
+//         AND UPPER(TRIM(dietician_id)) =
+//             UPPER(TRIM(?))
+//       LIMIT 1
+//     `,
+//     [
+//       profileId,
+//       dieticianId,
+//     ]
+//   );
+
+//   return rows.length > 0;
+// }
+
+// // ─────────────────────────────────────────────────────────────────────────────
+// // Weight logs
+// // ─────────────────────────────────────────────────────────────────────────────
+
+// /**
+//  * Fetch weight logs from the database.
+//  * Gets target_weight directly from the weight_log table (same as app code).
+//  * The most recent non-zero target_weight is used as the user's current target.
+//  */
+// async function fetchWeightLogs(
+//   profileId
+// ) {
+//   // First, get the most recent non-zero target_weight
+//   // This mimics the app's carry-forward logic
+//   const [targetRow] = await pool.execute(
+//     `
+//       SELECT target_weight
+//       FROM weight_log
+//       WHERE profile_id = ?
+//         AND (target_weight IS NOT NULL AND target_weight != 0)
+//       ORDER BY log_date DESC, log_time DESC, id DESC
+//       LIMIT 1
+//     `,
+//     [profileId]
+//   );
+
+//   // If no non-zero target found, use null
+//   const currentTargetWeight = targetRow.length > 0 
+//     ? toFloat(targetRow[0].target_weight) 
+//     : null;
+
+//   // Now fetch all logs
+//   const [rows] = await pool.execute(
+//     `
+//       SELECT
+//         id,
+//         profile_id,
+//         weight_kg,
+//         target_weight,
+//         weight_change_type,
+//         logged_by,
+//         log_date,
+//         log_time,
+//         created_at
+//       FROM weight_log
+//       WHERE profile_id = ?
+//       ORDER BY
+//         log_date DESC,
+//         log_time DESC,
+//         id DESC
+//     `,
+//     [profileId]
+//   );
+
+//   return rows.map((row) => {
+//     const logTargetWeight = toFloat(row.target_weight);
+    
+//     // For each log, use the log's target_weight if it's non-zero,
+//     // otherwise use the current target weight (carry-forward logic)
+//     const effectiveTargetWeight = (logTargetWeight && logTargetWeight > 0) 
+//       ? logTargetWeight 
+//       : currentTargetWeight;
+
+//     return {
+//       id: toInt(row.id),
+//       profile_id: row.profile_id,
+//       weight_kg: toFloat(row.weight_kg),
+//       target_weight: effectiveTargetWeight,  // Use the effective target weight
+//       weight_change_type: row.weight_change_type,
+//       logged_by: row.logged_by,
+//       log_date: toMysqlDate(row.log_date),
+//       log_time: row.log_time !== null && row.log_time !== undefined
+//         ? String(row.log_time)
+//         : null,
+//       created_at: toMysqlDateTime(row.created_at),
+//     };
+//   });
+// }
+
+// // ─────────────────────────────────────────────────────────────────────────────
+// // Test JSON parsing
+// // ─────────────────────────────────────────────────────────────────────────────
+
+// function parseTestJson(columnValue) {
+//   if (
+//     columnValue === null ||
+//     columnValue === undefined
+//   ) {
+//     return null;
+//   }
+
+//   let jsonText = "";
+
+//   if (Buffer.isBuffer(columnValue)) {
+//     jsonText =
+//       columnValue.toString("utf8");
+//   } else if (
+//     typeof columnValue === "string"
+//   ) {
+//     jsonText = columnValue;
+//   } else if (
+//     columnValue &&
+//     columnValue.type === "Buffer" &&
+//     Array.isArray(columnValue.data)
+//   ) {
+//     jsonText =
+//       Buffer.from(
+//         columnValue.data
+//       ).toString("utf8");
+//   } else if (
+//     typeof columnValue === "object" &&
+//     !Array.isArray(columnValue)
+//   ) {
+//     return columnValue;
+//   } else {
+//     return null;
+//   }
+
+//   jsonText = jsonText.trim();
+
+//   if (!jsonText) {
+//     return null;
+//   }
+
+//   try {
+//     const parsed =
+//       JSON.parse(jsonText);
+
+//     return typeof parsed === "object" &&
+//       parsed !== null &&
+//       !Array.isArray(parsed)
+//       ? parsed
+//       : null;
+//   } catch {
+//     return null;
+//   }
+// }
+
+// // ─────────────────────────────────────────────────────────────────────────────
+// // Metabolism scores
+// // ─────────────────────────────────────────────────────────────────────────────
+
+// /**
+//  * Fetch date-wise metabolism scores.
+//  */
+// async function fetchMetabolismScoresByDate(
+//   profileId,
+//   dieticianId,
+//   fitnessGoal
+// ) {
+//   const [rows] = await pool.execute(
+//     `
+//       SELECT
+//         t1.test_json,
+//         t1.date_time
+//       FROM table_test_data t1
+
+//       INNER JOIN (
+//         SELECT
+//           DATE(date_time) AS test_date,
+//           MAX(date_time) AS max_date_time
+//         FROM table_test_data
+//         WHERE profile_id = ?
+//           AND UPPER(TRIM(dietitian_id)) =
+//               UPPER(TRIM(?))
+//         GROUP BY DATE(date_time)
+//       ) t2
+//         ON t1.date_time = t2.max_date_time
+//         AND DATE(t1.date_time) = t2.test_date
+
+//       WHERE t1.profile_id = ?
+//         AND UPPER(TRIM(t1.dietitian_id)) =
+//             UPPER(TRIM(?))
+
+//       ORDER BY
+//         t1.date_time DESC
+//     `,
+//     [
+//       profileId,
+//       dieticianId,
+//       profileId,
+//       dieticianId,
+//     ]
+//   );
+
+//   const trendKey =
+//     String(fitnessGoal)
+//       .trim()
+//       .toLowerCase() ===
+//     "muscle_gain"
+//       ? "Muscle_Gain_Trend"
+//       : "Fat_Use_Pattern_trend";
+
+//   const scores = [];
+
+//   for (const row of rows) {
+//     const json =
+//       parseTestJson(
+//         row.test_json
+//       );
+
+//     const rawValue =
+//       json?.[trendKey]?.value;
+
+//     if (
+//       rawValue === null ||
+//       rawValue === undefined ||
+//       rawValue === ""
+//     ) {
+//       continue;
+//     }
+
+//     const n = Number(rawValue);
+
+//     if (Number.isNaN(n)) {
+//       continue;
+//     }
+
+//     scores.push({
+//       date:
+//         toMysqlDate(
+//           row.date_time
+//         ),
+//       score: n,
+//     });
+//   }
+
+//   return scores;
+// }
+
+// // ─────────────────────────────────────────────────────────────────────────────
+// // Fitness goal
+// // ─────────────────────────────────────────────────────────────────────────────
+
+// async function fetchFitnessGoal(
+//   profileId
+// ) {
+//   const [rows] = await pool.execute(
+//     `
+//       SELECT goal
+//       FROM user_habits
+//       WHERE profile_id = ?
+//       ORDER BY id DESC
+//       LIMIT 1
+//     `,
+//     [profileId]
+//   );
+
+//   const raw =
+//     String(
+//       rows[0]?.goal ?? ""
+//     ).trim();
+
+//   return raw !== ""
+//     ? raw
+//     : "weight_loss";
+// }
+
+// // ─────────────────────────────────────────────────────────────────────────────
+// // Input parsing
+// // ─────────────────────────────────────────────────────────────────────────────
+
+// function parseInputs(req) {
+//   const src =
+//     req.body &&
+//     typeof req.body === "object" &&
+//     !Array.isArray(req.body)
+//       ? req.body
+//       : null;
+
+//   if (src === null) {
+//     return {
+//       invalidBody: true,
+//     };
+//   }
+
+//   const profileId =
+//     typeof src.profile_id === "string"
+//       ? src.profile_id.trim()
+//       : String(
+//           src.profile_id ?? ""
+//         ).trim();
+
+//   const dieticianId =
+//     typeof src.dietician_id === "string"
+//       ? src.dietician_id.trim()
+//       : String(
+//           src.dietician_id ?? ""
+//         ).trim();
+
+//   const actorUserId =
+//     normalizeEmail(
+//       src.actor_user_id
+//     );
+
+//   return {
+//     invalidBody: false,
+//     profileId,
+//     dieticianId,
+//     actorUserId,
+//   };
+// }
+
+// // ─────────────────────────────────────────────────────────────────────────────
+// // Controller
+// // ─────────────────────────────────────────────────────────────────────────────
+
+// /**
+//  * POST /dietitian/api/web/weight-tracking
+//  */
+// const weightTracking = async (
+//   req,
+//   res
+// ) => {
+//   // HIPAA:
+//   // Prevent intermediaries from caching PHI.
+//   res.setHeader(
+//     "Cache-Control",
+//     "no-store"
+//   );
+
+//   res.setHeader(
+//     "Pragma",
+//     "no-cache"
+//   );
+
+//   // ───────────────────────────────────────────────────────────────────────────
+//   // Method validation
+//   // ───────────────────────────────────────────────────────────────────────────
+
+//   if (req.method !== "POST") {
+//     return res.status(405).json({
+//       status: false,
+//       message: "Only POST method is allowed",
+//       data: null,
+//       error: {
+//         code: "METHOD_NOT_ALLOWED",
+//       },
+//     });
+//   }
+
+//   // ───────────────────────────────────────────────────────────────────────────
+//   // Parse body
+//   // ───────────────────────────────────────────────────────────────────────────
+
+//   const parsed =
+//     parseInputs(req);
+
+//   if (parsed.invalidBody) {
+//     return res.status(400).json({
+//       status: false,
+//       message: "Invalid JSON payload",
+//       data: null,
+//       error: {
+//         code: "INVALID_JSON",
+//       },
+//     });
+//   }
+
+//   const {
+//     profileId,
+//     dieticianId,
+//     actorUserId,
+//   } = parsed;
+
+//   let actorEmail = null;
+//   let actorRole = null;
+//   let actorCode = null;
+
+//   try {
+//     // ─────────────────────────────────────────────────────────────────────────
+//     // 1. Validate inputs
+//     // ─────────────────────────────────────────────────────────────────────────
+
+//     if (
+//       profileId === "" ||
+//       dieticianId === ""
+//     ) {
+//       return res.status(422).json({
+//         status: false,
+//         message: "profile_id and dietician_id are required",
+//         data: null,
+//         error: {
+//           code: "VALIDATION_ERROR",
+//         },
+//       });
+//     }
+
+//     if (
+//       profileId.length >
+//         ID_MAX_LENGTH ||
+//       dieticianId.length >
+//         ID_MAX_LENGTH
+//     ) {
+//       return res.status(422).json({
+//         status: false,
+//         message: "profile_id or dietician_id is too long",
+//         data: null,
+//         error: {
+//           code: "VALIDATION_ERROR",
+//         },
+//       });
+//     }
+
+//     // ─────────────────────────────────────────────────────────────────────────
+//     // 2. Resolve actor from JWT
+//     // ─────────────────────────────────────────────────────────────────────────
+
+//     const resolved =
+//       await resolveActorFromToken(
+//         req
+//       );
+
+//     if (resolved.error) {
+//       await writeAuthLogSafe(req, {
+//         eventType: "weight_logs_denied",
+//         userId: null,
+//         role: null,
+//         partnerCode: null,
+//         identifier: profileId + "|" + dieticianId,
+//         success: false,
+//         failureReason: resolved.error.body?.message || "actor resolution failed",
+//       });
+
+//       return res
+//         .status(resolved.error.status)
+//         .json(resolved.error.body);
+//     }
+
+//     const {
+//       actor,
+//     } = resolved;
+
+//     actorEmail = resolved.actorEmail;
+//     actorRole = String(actor.role);
+//     actorCode = normalizeCode(getActorEffectiveCode(actor));
+
+//     const isSuperAdmin =
+//       actorRole === "super_admin";
+
+//     // ─────────────────────────────────────────────────────────────────────────
+//     // 2b. actor_user_id must match JWT identity
+//     // ─────────────────────────────────────────────────────────────────────────
+
+//     if (
+//       actorUserId !== "" &&
+//       actorUserId !== actorEmail
+//     ) {
+//       await writeAuthLogSafe(req, {
+//         eventType: "weight_logs_denied",
+//         userId: actorEmail,
+//         role: actorRole,
+//         partnerCode: actorCode,
+//         identifier: actorUserId,
+//         success: false,
+//         failureReason: "actor_user_id does not match token identity",
+//       });
+
+//       return res.status(403).json({
+//         status: false,
+//         message: "actor_user_id does not match the authenticated user",
+//         data: null,
+//         error: {
+//           code: "FORBIDDEN",
+//         },
+//       });
+//     }
+
+//     // ─────────────────────────────────────────────────────────────────────────
+//     // 3. Entitlement check
+//     // ─────────────────────────────────────────────────────────────────────────
+
+//     if (!isSuperAdmin) {
+//       const allowedCodes =
+//         await getAllowedCodes(
+//           actor,
+//           actorEmail
+//         );
+
+//       if (
+//         !allowedCodes.has(
+//           normalizeCode(
+//             dieticianId
+//           )
+//         )
+//       ) {
+//         await writeAuthLogSafe(req, {
+//           eventType: "weight_logs_denied",
+//           userId: actorEmail,
+//           role: actorRole,
+//           partnerCode: actorCode,
+//           identifier: profileId + "|" + dieticianId,
+//           success: false,
+//           failureReason: "dietician_id outside actor visibility",
+//         });
+
+//         return res.status(403).json({
+//           status: false,
+//           message: "You are not allowed to view this client's weight logs",
+//           data: null,
+//           error: {
+//             code: "FORBIDDEN",
+//           },
+//         });
+//       }
+//     }
+
+//     // ─────────────────────────────────────────────────────────────────────────
+//     // 4. Find client
+//     // ─────────────────────────────────────────────────────────────────────────
+
+//     const client =
+//       await getClientByProfileId(
+//         profileId
+//       );
+
+//     if (!client) {
+//       await writeAuthLogSafe(req, {
+//         eventType: "weight_logs_denied",
+//         userId: actorEmail,
+//         role: actorRole,
+//         partnerCode: actorCode,
+//         identifier: profileId + "|" + dieticianId,
+//         success: false,
+//         failureReason: "Client not found",
+//       });
+
+//       return res.status(404).json({
+//         status: false,
+//         message: "Client not found",
+//         data: null,
+//         error: {
+//           code: "NOT_FOUND",
+//         },
+//       });
+//     }
+
+//     // ─────────────────────────────────────────────────────────────────────────
+//     // 5. Determine actual client dietician
+//     // ─────────────────────────────────────────────────────────────────────────
+
+//     const actualClientDieticianId =
+//       String(
+//         client.dietician_id ??
+//           ""
+//       ).trim();
+
+//     if (
+//       actualClientDieticianId === ""
+//     ) {
+//       await writeAuthLogSafe(req, {
+//         eventType: "weight_logs_denied",
+//         userId: actorEmail,
+//         role: actorRole,
+//         partnerCode: actorCode,
+//         identifier: profileId + "|" + dieticianId,
+//         success: false,
+//         failureReason: "Client has no dietician_id",
+//       });
+
+//       return res.status(404).json({
+//         status: false,
+//         message: "Client not found",
+//         data: null,
+//         error: {
+//           code: "NOT_FOUND",
+//         },
+//       });
+//     }
+
+//     // ─────────────────────────────────────────────────────────────────────────
+//     // 6. Ownership check for NON-super-admin
+//     // ─────────────────────────────────────────────────────────────────────────
+
+//     if (!isSuperAdmin) {
+//       const ownsClient =
+//         await clientPairExists(
+//           profileId,
+//           dieticianId
+//         );
+
+//       if (!ownsClient) {
+//         await writeAuthLogSafe(req, {
+//           eventType: "weight_logs_denied",
+//           userId: actorEmail,
+//           role: actorRole,
+//           partnerCode: actorCode,
+//           identifier: profileId + "|" + dieticianId,
+//           success: false,
+//           failureReason: "Client not found for dietician",
+//         });
+
+//         return res.status(404).json({
+//           status: false,
+//           message: "Client not found",
+//           data: null,
+//           error: {
+//             code: "NOT_FOUND",
+//           },
+//         });
+//       }
+//     }
+
+//     // ─────────────────────────────────────────────────────────────────────────
+//     // 7. Determine dietician used for data lookup
+//     // ─────────────────────────────────────────────────────────────────────────
+
+//     const lookupDieticianId =
+//       isSuperAdmin
+//         ? actualClientDieticianId
+//         : dieticianId;
+
+//     // ─────────────────────────────────────────────────────────────────────────
+//     // 8. Fetch fitness goal
+//     // ─────────────────────────────────────────────────────────────────────────
+
+//     const fitnessGoal =
+//       await fetchFitnessGoal(
+//         profileId
+//       );
+
+//     // ─────────────────────────────────────────────────────────────────────────
+//     // 9. Fetch weight logs + metabolism scores
+//     // ─────────────────────────────────────────────────────────────────────────
+
+//     const [
+//       logs,
+//       metabolismScores,
+//     ] = await Promise.all([
+//       fetchWeightLogs(profileId),  // ← Uses weight_log.target_weight column
+//       fetchMetabolismScoresByDate(
+//         profileId,
+//         lookupDieticianId,
+//         fitnessGoal
+//       ),
+//     ]);
+
+//     // Latest score = first entry because
+//     // results are ordered newest first.
+//     const metabolismScore =
+//       metabolismScores.length > 0
+//         ? metabolismScores[0].score
+//         : null;
+
+//     // ─────────────────────────────────────────────────────────────────────────
+//     // 10. Audit successful PHI read
+//     // ─────────────────────────────────────────────────────────────────────────
+
+//     writeAuthLogSafe(req, {
+//       eventType: "weight_logs_viewed",
+//       userId: actorEmail,
+//       role: actorRole,
+//       partnerCode: actorCode,
+//       identifier: profileId + "|" + dieticianId + "|rows:" + logs.length,
+//       success: true,
+//       failureReason: "Weight logs viewed",
+//     });
+
+//     // ─────────────────────────────────────────────────────────────────────────
+//     // 11. Get current target weight (most recent non-zero value)
+//     // ─────────────────────────────────────────────────────────────────────────
+
+//     const [targetRow] = await pool.execute(
+//       `
+//         SELECT target_weight
+//         FROM weight_log
+//         WHERE profile_id = ?
+//           AND (target_weight IS NOT NULL AND target_weight != 0)
+//         ORDER BY log_date DESC, log_time DESC, id DESC
+//         LIMIT 1
+//       `,
+//       [profileId]
+//     );
+
+//     const currentTargetWeight = targetRow.length > 0 
+//       ? toFloat(targetRow[0].target_weight) 
+//       : null;
+
+//     // ─────────────────────────────────────────────────────────────────────────
+//     // 12. Return response
+//     // ─────────────────────────────────────────────────────────────────────────
+
+//     const responseData = {
+//       status: true,
+//       message: "Weight logs fetched successfully",
+//       fitness_goal: fitnessGoal,
+//       target_weight: currentTargetWeight,  // ← Current target weight from weight_log
+//       metabolism_score: metabolismScore,
+//       metabolism_scores: metabolismScores,
+//       data: logs,
+//       error: null,
+//     };
+
+//     if (logs.length === 0) {
+//       responseData.status = false;
+//       responseData.message = "No weight logs found";
+//       responseData.error = {
+//         code: "NOT_FOUND",
+//       };
+//     }
+
+//     return res.status(logs.length > 0 ? 200 : 404).json(responseData);
+
+//   } catch (err) {
+//     // ─────────────────────────────────────────────────────────────────────────
+//     // Error handling
+//     // ─────────────────────────────────────────────────────────────────────────
+
+//     console.error("WEIGHT_TRACKING_ERROR:", {
+//       code: err?.code,
+//       errno: err?.errno,
+//       sqlState: err?.sqlState,
+//       message: err?.message,
+//     });
+
+//     await writeAuthLogSafe(req, {
+//       eventType: "weight_logs_error",
+//       userId: actorEmail,
+//       role: actorRole,
+//       partnerCode: actorCode,
+//       identifier: profileId + "|" + dieticianId,
+//       success: false,
+//       failureReason: err?.code || "internal_error",
+//     });
+
+//     return res.status(500).json({
+//       status: false,
+//       message: "Server error",
+//       data: null,
+//       error: {
+//         code: "SERVER_ERROR",
+//         ...(APP_DEBUG && {
+//           details: err?.message,
+//         }),
+//       },
+//     });
+//   }
+// };
+
+// // ─────────────────────────────────────────────────────────────────────────────
+// // Export
+// // ─────────────────────────────────────────────────────────────────────────────
+
+// module.exports = {
+//   weightTracking,
+// };
 
 
 
