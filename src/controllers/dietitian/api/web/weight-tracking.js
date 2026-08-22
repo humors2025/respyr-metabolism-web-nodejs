@@ -473,71 +473,44 @@ async function clientPairExists(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// User Target Weight
-// ─────────────────────────────────────────────────────────────────────────────
-
-/**
- * Fetch the user's target weight from the user_habits table.
- * This ensures the dashboard always shows the correct target weight
- * regardless of what's stored in individual weight logs.
- */
-async function fetchUserTargetWeight(
-  profileId
-) {
-  try {
-    const [rows] = await pool.execute(
-      `
-        SELECT target_weight
-        FROM user_habits
-        WHERE profile_id = ?
-        ORDER BY id DESC
-        LIMIT 1
-      `,
-      [profileId]
-    );
-
-    if (rows.length > 0 && rows[0].target_weight !== null) {
-      return toFloat(rows[0].target_weight);
-    }
-
-    // Fallback: If no target_weight in user_habits,
-    // try to get it from the latest weight log (carry-forward logic)
-    const [logRows] = await pool.execute(
-      `
-        SELECT target_weight
-        FROM weight_log
-        WHERE profile_id = ?
-        ORDER BY log_date DESC, log_time DESC, id DESC
-        LIMIT 1
-      `,
-      [profileId]
-    );
-
-    if (logRows.length > 0 && logRows[0].target_weight !== null) {
-      return toFloat(logRows[0].target_weight);
-    }
-
-    return null;
-  } catch (err) {
-    console.error("fetchUserTargetWeight error:", err.message);
-    return null;
-  }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
 // Weight logs
 // ─────────────────────────────────────────────────────────────────────────────
 
+/**
+ * Fetch weight logs from the database.
+ * Gets target_weight directly from the weight_log table (same as app code).
+ * The most recent non-zero target_weight is used as the user's current target.
+ */
 async function fetchWeightLogs(
-  profileId,
-  userTargetWeight
+  profileId
 ) {
+  // First, get the most recent non-zero target_weight
+  // This mimics the app's carry-forward logic
+  const [targetRow] = await pool.execute(
+    `
+      SELECT target_weight
+      FROM weight_log
+      WHERE profile_id = ?
+        AND (target_weight IS NOT NULL AND target_weight != 0)
+      ORDER BY log_date DESC, log_time DESC, id DESC
+      LIMIT 1
+    `,
+    [profileId]
+  );
+
+  // If no non-zero target found, use null
+  const currentTargetWeight = targetRow.length > 0 
+    ? toFloat(targetRow[0].target_weight) 
+    : null;
+
+  // Now fetch all logs
   const [rows] = await pool.execute(
     `
       SELECT
         id,
         profile_id,
         weight_kg,
+        target_weight,
         weight_change_type,
         logged_by,
         log_date,
@@ -553,19 +526,29 @@ async function fetchWeightLogs(
     [profileId]
   );
 
-  return rows.map((row) => ({
-    id: toInt(row.id),
-    profile_id: row.profile_id,
-    weight_kg: toFloat(row.weight_kg),
-    target_weight: userTargetWeight !== null ? userTargetWeight : null, // ← Use user's target weight
-    weight_change_type: row.weight_change_type,
-    logged_by: row.logged_by,
-    log_date: toMysqlDate(row.log_date),
-    log_time: row.log_time !== null && row.log_time !== undefined
-      ? String(row.log_time)
-      : null,
-    created_at: toMysqlDateTime(row.created_at),
-  }));
+  return rows.map((row) => {
+    const logTargetWeight = toFloat(row.target_weight);
+    
+    // For each log, use the log's target_weight if it's non-zero,
+    // otherwise use the current target weight (carry-forward logic)
+    const effectiveTargetWeight = (logTargetWeight && logTargetWeight > 0) 
+      ? logTargetWeight 
+      : currentTargetWeight;
+
+    return {
+      id: toInt(row.id),
+      profile_id: row.profile_id,
+      weight_kg: toFloat(row.weight_kg),
+      target_weight: effectiveTargetWeight,  // Use the effective target weight
+      weight_change_type: row.weight_change_type,
+      logged_by: row.logged_by,
+      log_date: toMysqlDate(row.log_date),
+      log_time: row.log_time !== null && row.log_time !== undefined
+        ? String(row.log_time)
+        : null,
+      created_at: toMysqlDateTime(row.created_at),
+    };
+  });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1102,13 +1085,13 @@ const weightTracking = async (
         : dieticianId;
 
     // ─────────────────────────────────────────────────────────────────────────
-    // 8. Fetch fitness goal & target weight
+    // 8. Fetch fitness goal
     // ─────────────────────────────────────────────────────────────────────────
 
-    const [fitnessGoal, userTargetWeight] = await Promise.all([
-      fetchFitnessGoal(profileId),
-      fetchUserTargetWeight(profileId),  // ← NEW: Fetch user's target weight
-    ]);
+    const fitnessGoal =
+      await fetchFitnessGoal(
+        profileId
+      );
 
     // ─────────────────────────────────────────────────────────────────────────
     // 9. Fetch weight logs + metabolism scores
@@ -1118,7 +1101,7 @@ const weightTracking = async (
       logs,
       metabolismScores,
     ] = await Promise.all([
-      fetchWeightLogs(profileId, userTargetWeight),  // ← Pass target weight
+      fetchWeightLogs(profileId),  // ← Uses weight_log.target_weight column
       fetchMetabolismScoresByDate(
         profileId,
         lookupDieticianId,
@@ -1148,15 +1131,34 @@ const weightTracking = async (
     });
 
     // ─────────────────────────────────────────────────────────────────────────
-    // 11. Return response
+    // 11. Get current target weight (most recent non-zero value)
     // ─────────────────────────────────────────────────────────────────────────
 
-    // Return user's target weight at top level for easy access
+    const [targetRow] = await pool.execute(
+      `
+        SELECT target_weight
+        FROM weight_log
+        WHERE profile_id = ?
+          AND (target_weight IS NOT NULL AND target_weight != 0)
+        ORDER BY log_date DESC, log_time DESC, id DESC
+        LIMIT 1
+      `,
+      [profileId]
+    );
+
+    const currentTargetWeight = targetRow.length > 0 
+      ? toFloat(targetRow[0].target_weight) 
+      : null;
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 12. Return response
+    // ─────────────────────────────────────────────────────────────────────────
+
     const responseData = {
       status: true,
       message: "Weight logs fetched successfully",
       fitness_goal: fitnessGoal,
-      target_weight: userTargetWeight,  // ← NEW: Include target weight at top level
+      target_weight: currentTargetWeight,  // ← Current target weight from weight_log
       metabolism_score: metabolismScore,
       metabolism_scores: metabolismScores,
       data: logs,
@@ -1216,7 +1218,6 @@ const weightTracking = async (
 module.exports = {
   weightTracking,
 };
-
 
 
 
