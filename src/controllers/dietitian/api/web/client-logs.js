@@ -54,7 +54,8 @@ const ALLOWED_EVENTS = new Set([
 ]);
 
 const MAX_EVENTS_PER_REQUEST = 20;
-const MAX_META_BYTES = 200; // page + meta must fit failure_reason varchar(255)
+const MAX_META_BYTES = 400; // incoming meta may carry user_email (extracted
+// out before storage); stored page+meta stays well under failure_reason's 255
 
 function capStr(v, max) {
   if (typeof v !== "string") return null;
@@ -114,6 +115,20 @@ async function clientLogs(req, res) {
     }
 
     for (const ev of accepted) {
+      // Pull the (client-supplied) user email out of meta -> user_id column.
+      // NOTE: this endpoint is public, so this email is telemetry-grade
+      // identification, not authenticated proof. Light format validation only.
+      let userEmail = null;
+      let metaObj = ev.meta ? JSON.parse(ev.meta) : null;
+      if (metaObj && typeof metaObj.user_email === "string") {
+        const e = metaObj.user_email.trim().toLowerCase();
+        if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e) && e.length <= 191) {
+          userEmail = e;
+        }
+        delete metaObj.user_email; // keep failure_reason small
+        if (Object.keys(metaObj).length === 0) metaObj = null;
+      }
+
       // 1) CloudWatch: structured JSON line (searchable via Logs Insights:
       //    filter @message like /client_event/).
       console.log(
@@ -121,7 +136,8 @@ async function clientLogs(req, res) {
           log_type: "client_event",
           event_name: ev.event_name,
           page: ev.page,
-          meta: ev.meta ? JSON.parse(ev.meta) : null,
+          user_email: userEmail,
+          meta: metaObj,
           client_ts: ev.client_ts,
           server_ts: new Date().toISOString(),
         })
@@ -132,12 +148,12 @@ async function clientLogs(req, res) {
       //    failure_reason carries page+meta as a compact details string.
       const details = JSON.stringify({
         page: ev.page || undefined,
-        meta: ev.meta ? JSON.parse(ev.meta) : undefined,
+        meta: metaObj || undefined,
       });
 
       await writeAuthLogSafe(req, {
         eventType: ev.event_name,
-        userId: null,
+        userId: userEmail,
         role: null,
         partnerCode: null,
         identifier: null,
