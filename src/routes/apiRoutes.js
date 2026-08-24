@@ -300,6 +300,11 @@ const {
 
 
 const {
+  clientLogs,
+} = require("../controllers/dietitian/api/web/client-logs");
+
+
+const {
   invitePreview,
 } = require("../controllers/dietitian/api/web/invite-preview");
 
@@ -704,6 +709,12 @@ router.post(
   "/dietitian/api/web/list-accepted-agreements",
   authMiddleware,
   listAcceptedAgreements
+);
+
+
+router.post(
+  ["/dietitian/api/web/client-logs", "/client-logs"],
+  clientLogs
 );
 
 
