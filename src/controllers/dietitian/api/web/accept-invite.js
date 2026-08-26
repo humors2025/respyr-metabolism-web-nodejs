@@ -223,18 +223,54 @@ const acceptInvite = async (req, res) => {
       ? body.agreement_s3_key.trim()
       : "";
 
+  // const agreementPdfName =
+  //   typeof body.agreement_pdf_name === "string"
+  //     ? body.agreement_pdf_name.trim().slice(0, 255)
+  //     : "";
+
+  // if (token === "") {
+  //   return await sendFail(
+  //     400,
+  //     { ok: false, message: "Invite token is required" },
+  //     "missing_token"
+  //   );
+  // }
+
+
   const agreementPdfName =
     typeof body.agreement_pdf_name === "string"
       ? body.agreement_pdf_name.trim().slice(0, 255)
       : "";
 
+  // Alert-only email hint sent by the frontend (email shown on the invite
+  // card). NEVER trusted for auth or DB writes — only used to fill the
+  // onboarding-failure alert when the invite row hasn't been looked up yet.
+  const alertEmailHint =
+    typeof body.alert_email === "string" &&
+    EMAIL_REGEX.test(body.alert_email.trim())
+      ? normalizeEmail(body.alert_email).slice(0, EMAIL_MAX_LENGTH)
+      : "";
+
+  // Request metadata for alerts — tells you bot vs. real browser user.
+  const alertRequestMeta = {
+    ip:
+      (req.headers["x-forwarded-for"] || "").split(",")[0].trim() ||
+      req.socket?.remoteAddress ||
+      null,
+    user_agent: (req.headers["user-agent"] || "").slice(0, 255) || null,
+    referer: (req.headers["referer"] || "").slice(0, 255) || null,
+  };
+
   if (token === "") {
     return await sendFail(
       400,
       { ok: false, message: "Invite token is required" },
-      "missing_token"
+      "missing_token",
+      { identifier: alertEmailHint || null, extra: alertRequestMeta }
     );
   }
+
+
 
   if (password === "" || confirmPassword === "") {
     return await sendFail(

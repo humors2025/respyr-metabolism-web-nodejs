@@ -533,54 +533,153 @@ exports.login = async (req, res) => {
       parent_user_id: parentUserId,
     };
 
-    const now = Math.floor(Date.now() / 1000);
+    // const now = Math.floor(Date.now() / 1000);
 
-    const accessPayload = { 
-      iss: JWT_ISS,
-      aud: JWT_AUD,
-      iat: now,
-      nbf: now,
-      exp: now + JWT_TTL,
+    // const accessPayload = { 
+    //   iss: JWT_ISS,
+    //   aud: JWT_AUD,
+    //   iat: now,
+    //   nbf: now,
+    //   exp: now + JWT_TTL,
 
-      sub: String(user.dietician_id),
-      dietician_id: String(user.dietician_id),
-      user_id: String(user.email).toLowerCase(),
+    //   sub: String(user.dietician_id),
+    //   dietician_id: String(user.dietician_id),
+    //   user_id: String(user.email).toLowerCase(),
 
-      role,
-      partner_code: partnerCode,
-      parent_user_id: parentUserId,
-      dashboard_route: dashboardRoute,
+    //   role,
+    //   partner_code: partnerCode,
+    //   parent_user_id: parentUserId,
+    //   dashboard_route: dashboardRoute,
 
-      dietician: dieticianPayload,
-    };
+    //   dietician: dieticianPayload,
+    // };
 
-    const accessToken = makeJwt(accessPayload);
+    // const accessToken = makeJwt(accessPayload);
 
-    /*
-    |--------------------------------------------------------------------------
-    | Create refresh token
-    |--------------------------------------------------------------------------
-    | Refresh token is opaque/random.
-    | DB stores only SHA-256 hash, never plain token.
-    |--------------------------------------------------------------------------
-    */
+    // /*
+    // |--------------------------------------------------------------------------
+    // | Create refresh token
+    // |--------------------------------------------------------------------------
+    // | Refresh token is opaque/random.
+    // | DB stores only SHA-256 hash, never plain token.
+    // |--------------------------------------------------------------------------
+    // */
 
-    const refreshToken = createRefreshToken();
-    const refreshTokenHash = hashRefreshToken(refreshToken);
-    const refreshExpiresAt = getRefreshExpiresAt();
+    // const refreshToken = createRefreshToken();
+    // const refreshTokenHash = hashRefreshToken(refreshToken);
+    // const refreshExpiresAt = getRefreshExpiresAt();
 
-    await conn.execute(
-      `INSERT INTO dietician_refresh_tokens
-         (dietician_id, token_hash, expires_at, ip_address, user_agent)
-       VALUES (?, ?, ?, ?, ?)`,
-      [
-        String(user.dietician_id),
-        refreshTokenHash,
-        refreshExpiresAt,
-        getClientIp(req),
-        getUserAgent(req),
-      ]
-    );
+    // await conn.execute(
+    //   `INSERT INTO dietician_refresh_tokens
+    //      (dietician_id, token_hash, expires_at, ip_address, user_agent)
+    //    VALUES (?, ?, ?, ?, ?)`,
+    //   [
+    //     String(user.dietician_id),
+    //     refreshTokenHash,
+    //     refreshExpiresAt,
+    //     getClientIp(req),
+    //     getUserAgent(req),
+    //   ]
+    // );
+
+
+
+const now = Math.floor(Date.now() / 1000);
+
+/*
+|--------------------------------------------------------------------------
+| Create refresh token / server-side session
+|--------------------------------------------------------------------------
+| Refresh token is opaque/random.
+| DB stores only SHA-256 hash, never plain token.
+|
+| IMPORTANT:
+| dietician_refresh_tokens.id is used as the server-side
+| session identifier (sid) for the access JWT.
+|--------------------------------------------------------------------------
+*/
+
+const refreshToken = createRefreshToken();
+const refreshTokenHash = hashRefreshToken(refreshToken);
+const refreshExpiresAt = getRefreshExpiresAt();
+
+const [refreshInsertResult] = await conn.execute(
+  `INSERT INTO dietician_refresh_tokens
+     (
+       dietician_id,
+       token_hash,
+       expires_at,
+       ip_address,
+       user_agent
+     )
+   VALUES (?, ?, ?, ?, ?)`,
+  [
+    String(user.dietician_id),
+    refreshTokenHash,
+    refreshExpiresAt,
+    getClientIp(req),
+    getUserAgent(req),
+  ]
+);
+
+/*
+|--------------------------------------------------------------------------
+| Get server-side session ID
+|--------------------------------------------------------------------------
+*/
+
+const sessionId = String(refreshInsertResult.insertId);
+
+if (
+  !refreshInsertResult.insertId ||
+  !Number.isSafeInteger(Number(refreshInsertResult.insertId)) ||
+  Number(refreshInsertResult.insertId) <= 0
+) {
+  console.error('SESSION_CREATION_FAILED: Invalid refresh token row id');
+
+  return send500(res);
+}
+
+/*
+|--------------------------------------------------------------------------
+| Create access token
+|--------------------------------------------------------------------------
+| The JWT is now linked to the server-side session using sid.
+|--------------------------------------------------------------------------
+*/
+
+const accessPayload = {
+  iss: JWT_ISS,
+  aud: JWT_AUD,
+  iat: now,
+  nbf: now,
+  exp: now + JWT_TTL,
+
+  sub: String(user.dietician_id),
+
+  /*
+  |--------------------------------------------------------------------------
+  | Server-side session identifier
+  |--------------------------------------------------------------------------
+  */
+
+  sid: sessionId,
+
+  dietician_id: String(user.dietician_id),
+  user_id: String(user.email).toLowerCase(),
+
+  role,
+  partner_code: partnerCode,
+  parent_user_id: parentUserId,
+  dashboard_route: dashboardRoute,
+
+  dietician: dieticianPayload,
+};
+
+const accessToken = makeJwt(accessPayload);
+
+
+
 
     await writeAuthLogSafe(
       conn,
