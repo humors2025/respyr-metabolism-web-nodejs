@@ -21,6 +21,10 @@ const {
   escapeHtml,
 } = require("../../../../utils/securityValidation");
 
+const {
+  reserveEmailResendSlot,
+} = require("../../../../utils/emailResendRateGuard");
+
 // ─── Constants ───────────────────────────────────────────────────────────────
 
 const SECURITY_PEPPER =
@@ -60,7 +64,7 @@ const ALLOWED_ACTOR_ROLES =
   new Set([
     "super_admin",
     "admin",
-    "trainer",
+    // "trainer",
   ]);
 
 const RESENDABLE_STATUSES =
@@ -935,18 +939,47 @@ const superAdminResendTrainers =
         body.actor_user_id
       );
 
-    const inviteId =
-      Number.parseInt(
-        body.invite_id,
-        10
-      );
+    // const inviteId =
+    //   Number.parseInt(
+    //     body.invite_id,
+    //     10
+    //   );
 
-    if (
-      !Number.isInteger(
-        inviteId
-      ) ||
-      inviteId <= 0
-    ) {
+    // if (
+    //   !Number.isInteger(
+    //     inviteId
+    //   ) ||
+    //   inviteId <= 0
+    // ) {
+
+const rawInviteId =
+  body.invite_id;
+
+const inviteId =
+  typeof rawInviteId ===
+    "number"
+    ? rawInviteId
+    : /^\d+$/.test(
+        String(
+          rawInviteId ?? ""
+        ).trim()
+      )
+      ? Number(
+          String(
+            rawInviteId
+          ).trim()
+        )
+      : NaN;
+
+if (
+  !Number.isSafeInteger(
+    inviteId
+  ) ||
+  inviteId <= 0
+) {
+
+
+
       return res
         .status(422)
         .json({
@@ -1335,25 +1368,192 @@ const superAdminResendTrainers =
           });
       }
 
+      // /*
+      // |--------------------------------------------------------------------------
+      // | Release DB lock before external email call
+      // |--------------------------------------------------------------------------
+      // */
+
+      // await conn
+      //   .commit();
+
+      // conn.release();
+
+      // conn =
+      //   null;
+
+      // /*
+      // |--------------------------------------------------------------------------
+      // | 4. Generate fresh invite token
+      // |--------------------------------------------------------------------------
+      // */
+
+
+
       /*
-      |--------------------------------------------------------------------------
-      | Release DB lock before external email call
-      |--------------------------------------------------------------------------
-      */
+|--------------------------------------------------------------------------
+| 4. Email-bombing protection
+|--------------------------------------------------------------------------
+|
+| Rate limiting happens before the external Resend API call.
+|
+| The reservation is made inside the existing transaction so concurrent
+| Lambda/Burp requests cannot all pass at the same time.
+|--------------------------------------------------------------------------
+*/
 
-      await conn
-        .commit();
+const invitedEmail =
+  normalizeEmail(
+    invite.invited_email
+  );
 
-      conn.release();
+const rateLimit =
+  await reserveEmailResendSlot(
+    conn,
+    {
+      targetEmail:
+        invitedEmail,
 
-      conn =
-        null;
+      actorUserId:
+        actorEmail,
+    }
+  );
 
-      /*
-      |--------------------------------------------------------------------------
-      | 4. Generate fresh invite token
-      |--------------------------------------------------------------------------
-      */
+/*
+|--------------------------------------------------------------------------
+| Rate limit exceeded
+|--------------------------------------------------------------------------
+*/
+
+if (
+  !rateLimit.allowed
+) {
+  /*
+  |--------------------------------------------------------------------------
+  | Rollback the transaction
+  |--------------------------------------------------------------------------
+  */
+
+  await conn
+    .rollback();
+
+  conn.release();
+
+  conn =
+    null;
+
+  const retryAfterSeconds =
+    Math.max(
+      1,
+      Number(
+        rateLimit.retryAfterSeconds
+      ) || 1
+    );
+
+  /*
+  |--------------------------------------------------------------------------
+  | Standard rate-limit response header
+  |--------------------------------------------------------------------------
+  */
+
+  res.setHeader(
+    "Retry-After",
+    String(
+      retryAfterSeconds
+    )
+  );
+
+  /*
+  |--------------------------------------------------------------------------
+  | Audit blocked resend attempt
+  |--------------------------------------------------------------------------
+  */
+
+  await writeAuthLogSafe(
+    req,
+    {
+      eventType:
+        eventFor(
+          "resend_rate_limited"
+        ),
+
+      userId:
+        actorEmail,
+
+      role:
+        actorRole,
+
+      partnerCode:
+        actorCode,
+
+      identifier:
+        invitedEmail,
+
+      success:
+        false,
+
+      failureReason:
+        rateLimit.reason ||
+        "email_resend_rate_limited",
+    }
+  );
+
+  /*
+  |--------------------------------------------------------------------------
+  | Return HTTP 429
+  |--------------------------------------------------------------------------
+  */
+
+  return res
+    .status(429)
+    .json({
+      ok:
+        false,
+
+      message:
+        rateLimit.reason ===
+        "recipient_cooldown"
+          ? "Please wait before resending this invitation."
+          : "Too many invitation resend requests. Please try again later.",
+
+      retry_after_seconds:
+        retryAfterSeconds,
+
+      rate_limit_reason:
+        rateLimit.reason,
+    });
+}
+
+/*
+|--------------------------------------------------------------------------
+| Commit reserved rate-limit slot
+|--------------------------------------------------------------------------
+|
+| The slot is committed BEFORE calling Resend.
+|
+| Request 1:
+|   reserve -> commit -> email
+|
+| Concurrent Request 2:
+|   sees the reservation -> 429 -> no email
+|--------------------------------------------------------------------------
+*/
+
+await conn
+  .commit();
+
+conn.release();
+
+conn =
+  null;
+
+/*
+|--------------------------------------------------------------------------
+| 5. Generate fresh invite token
+|--------------------------------------------------------------------------
+*/
+
+
 
       const rawToken =
         crypto
@@ -1387,10 +1587,10 @@ const superAdminResendTrainers =
       |--------------------------------------------------------------------------
       */
 
-      const invitedEmail =
-        normalizeEmail(
-          invite.invited_email
-        );
+      // const invitedEmail =
+      //   normalizeEmail(
+      //     invite.invited_email
+      //   );
 
       const invitedRole =
         String(

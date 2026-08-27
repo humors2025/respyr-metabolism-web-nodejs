@@ -50,6 +50,11 @@ const {
   escapeHtml,
 } = require("../../../../utils/securityValidation");
 
+
+const {
+  reserveEmailResendSlot,
+} = require("../../../../utils/emailResendRateGuard");
+
 // ─── Constants ───────────────────────────────────────────────────────────────
 
 const SECURITY_PEPPER =
@@ -89,7 +94,7 @@ const ALLOWED_ACTOR_ROLES =
   new Set([
     "super_admin",
     "admin",
-    "trainer",
+    // "trainer",
   ]);
 
 // ─── Generic Helpers ─────────────────────────────────────────────────────────
@@ -979,18 +984,46 @@ const resendUserInvite =
         body.actor_user_id
       );
 
-    const inviteId =
-      Number.parseInt(
-        body.invite_id,
-        10
-      );
+    // const inviteId =
+    //   Number.parseInt(
+    //     body.invite_id,
+    //     10
+    //   );
 
-    if (
-      !Number.isInteger(
-        inviteId
-      ) ||
-      inviteId <= 0
-    ) {
+    // if (
+    //   !Number.isInteger(
+    //     inviteId
+    //   ) ||
+    //   inviteId <= 0
+    // ) {
+
+const rawInviteId =
+  body.invite_id;
+
+const inviteId =
+  typeof rawInviteId ===
+    "number"
+    ? rawInviteId
+    : /^\d+$/.test(
+        String(
+          rawInviteId ?? ""
+        ).trim()
+      )
+      ? Number(
+          String(
+            rawInviteId
+          ).trim()
+        )
+      : NaN;
+
+if (
+  !Number.isSafeInteger(
+    inviteId
+  ) ||
+  inviteId <= 0
+) {
+
+
       return res
         .status(422)
         .json({
@@ -1335,25 +1368,208 @@ const resendUserInvite =
           });
       }
 
+      // /*
+      // |--------------------------------------------------------------------------
+      // | Release lock before slow email network request
+      // |--------------------------------------------------------------------------
+      // */
+
+      // await conn
+      //   .commit();
+
+      // conn.release();
+
+      // conn =
+      //   null;
+
+      // /*
+      // |--------------------------------------------------------------------------
+      // | 3. Generate fresh token/link/expiry
+      // |--------------------------------------------------------------------------
+      // */
+
+
+
       /*
-      |--------------------------------------------------------------------------
-      | Release lock before slow email network request
-      |--------------------------------------------------------------------------
-      */
+|--------------------------------------------------------------------------
+| 3. Email-bombing protection
+|--------------------------------------------------------------------------
+|
+| IMPORTANT:
+|
+| - Rate limiting happens BEFORE calling the Resend API.
+| - The rate-limit reservation happens inside the existing DB transaction.
+| - The existing otp_verifications table is reused.
+| - No new table is required.
+| - SELECT ... FOR UPDATE inside emailResendRateGuard prevents parallel
+|   Lambda/Burp requests from all passing the limit simultaneously.
+|--------------------------------------------------------------------------
+*/
 
-      await conn
-        .commit();
+const invitedEmail =
+  normalizeEmail(
+    invite.invited_email
+  );
 
-      conn.release();
+const rateLimit =
+  await reserveEmailResendSlot(
+    conn,
+    {
+      targetEmail:
+        invitedEmail,
 
-      conn =
-        null;
+      actorUserId:
+        actorEmail,
+    }
+  );
 
-      /*
-      |--------------------------------------------------------------------------
-      | 3. Generate fresh token/link/expiry
-      |--------------------------------------------------------------------------
-      */
+/*
+|--------------------------------------------------------------------------
+| Rate limit exceeded
+|--------------------------------------------------------------------------
+*/
+
+if (
+  !rateLimit.allowed
+) {
+  /*
+  |--------------------------------------------------------------------------
+  | Roll back
+  |--------------------------------------------------------------------------
+  |
+  | Because reserveEmailResendSlot() executes inside the same transaction,
+  | a blocked request must rollback before releasing the connection.
+  |--------------------------------------------------------------------------
+  */
+
+  await conn
+    .rollback();
+
+  conn.release();
+
+  conn =
+    null;
+
+  const retryAfterSeconds =
+    Math.max(
+      1,
+      Number(
+        rateLimit.retryAfterSeconds
+      ) || 1
+    );
+
+  /*
+  |--------------------------------------------------------------------------
+  | Standard Retry-After header
+  |--------------------------------------------------------------------------
+  */
+
+  res.setHeader(
+    "Retry-After",
+    String(
+      retryAfterSeconds
+    )
+  );
+
+  /*
+  |--------------------------------------------------------------------------
+  | Audit blocked resend
+  |--------------------------------------------------------------------------
+  */
+
+  await writeAuthLogSafe(
+    req,
+    {
+      eventType:
+        "user_invite_resend_rate_limited",
+
+      userId:
+        actorEmail,
+
+      role:
+        actorRole,
+
+      partnerCode:
+      actorCode,
+        // actor.partner_code ??
+        // null,
+
+      identifier:
+        invitedEmail,
+
+      success:
+        false,
+
+      failureReason:
+        rateLimit.reason ||
+        "email_resend_rate_limited",
+    }
+  );
+
+  /*
+  |--------------------------------------------------------------------------
+  | Return HTTP 429
+  |--------------------------------------------------------------------------
+  */
+
+  return res
+    .status(429)
+    .json({
+      ok:
+        false,
+
+      message:
+        rateLimit.reason ===
+        "recipient_cooldown"
+          ? "Please wait before resending this invitation."
+          : "Too many invitation resend requests. Please try again later.",
+
+      retry_after_seconds:
+        retryAfterSeconds,
+
+      rate_limit_reason:
+        rateLimit.reason,
+    });
+}
+
+/*
+|--------------------------------------------------------------------------
+| Commit rate-limit reservation
+|--------------------------------------------------------------------------
+|
+| IMPORTANT:
+|
+| We commit the reservation BEFORE calling Resend.
+|
+| This means:
+|
+| Request 1
+|   -> reserves slot
+|   -> commits
+|   -> calls Resend
+|
+| Request 2 at the same time
+|   -> sees Request 1 reservation
+|   -> gets blocked
+|
+| Therefore parallel Burp Intruder requests cannot all send emails.
+|--------------------------------------------------------------------------
+*/
+
+await conn
+  .commit();
+
+conn.release();
+
+conn =
+  null;
+
+/*
+|--------------------------------------------------------------------------
+| 4. Generate fresh token/link/expiry
+|--------------------------------------------------------------------------
+*/
+
 
       const rawToken =
         crypto
@@ -1387,10 +1603,10 @@ const resendUserInvite =
       |--------------------------------------------------------------------------
       */
 
-      const invitedEmail =
-        normalizeEmail(
-          invite.invited_email
-        );
+      // const invitedEmail =
+      //   normalizeEmail(
+      //     invite.invited_email
+      //   );
 
       const invitedRole =
         String(
