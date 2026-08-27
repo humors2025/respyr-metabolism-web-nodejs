@@ -3,62 +3,72 @@
 /**
  * emailResendRateGuard.js
  *
- * Durable Email Bombing / resend abuse protection.
+ * Email Bombing / resend abuse protection.
  *
- * IMPORTANT:
- * - Reuses the EXISTING `otp_verifications` table.
- * - No new DB table is required.
- * - No DB schema change is required.
- * - Works across multiple AWS Lambda instances because state is stored in MySQL.
+ * Reuses the EXISTING `otp_verifications` MySQL table.
  *
- * Existing otp_verifications columns used:
- *
- * email
- *   -> HMAC marker, NOT the real email address
- *
- * otp_code
- *   -> HMAC digest used as an internal marker
- *
- * purpose
- *   -> email_resend_target
- *   -> email_resend_actor
- *
- * attempts
- *   -> number of resend attempts in the current window
- *
- * created_at
- *   -> start of the rate-limit window
- *
- * verified_at
- *   -> time of the latest allowed resend
- *
- * expires_at
- *   -> end of the current rate-limit window
+ * No new DB table is required.
+ * No DB schema change is required.
  *
  * DEFAULT POLICY
- * ---------------------------------------------------------
+ * --------------------------------------------------------------------------
+ *
  * Same recipient:
- *   - minimum 60 seconds between resend emails
- *   - maximum 3 resend emails per hour
+ *   - Minimum 60 seconds between resend emails
+ *   - Maximum 3 resend attempts per 1-hour window
  *
  * Same authenticated actor:
- *   - maximum 30 resend emails per hour
+ *   - Maximum 30 resend attempts per 1-hour window
  *
- * All values can be overridden using Lambda environment variables.
+ * The values can optionally be overridden using environment variables:
+ *
+ * EMAIL_RESEND_COOLDOWN_SECONDS
+ * EMAIL_RESEND_WINDOW_SECONDS
+ * EMAIL_RESEND_TARGET_MAX_PER_WINDOW
+ * EMAIL_RESEND_ACTOR_MAX_PER_WINDOW
+ *
+ * IMPORTANT:
+ *
+ * This utility expects the controller to already have an ACTIVE
+ * MySQL transaction.
+ *
+ * The utility does NOT commit or rollback.
+ *
+ * Transaction management stays with the controller.
  */
 
 const crypto = require("crypto");
 
-const TABLE = "otp_verifications";
+/* ============================================================================
+ * Constants
+ * ============================================================================
+ */
 
-const PURPOSE_TARGET = "email_resend_target";
-const PURPOSE_ACTOR = "email_resend_actor";
+const TABLE =
+  "otp_verifications";
 
-const TARGET_PREFIX = "ert:";
-const ACTOR_PREFIX = "era:";
+const PURPOSE_TARGET =
+  "email_resend_target";
 
-// otp_verifications.email is varchar(100)
-const EMAIL_COLUMN_MAX = 100;
+const PURPOSE_ACTOR =
+  "email_resend_actor";
+
+const TARGET_PREFIX =
+  "ert:";
+
+const ACTOR_PREFIX =
+  "era:";
+
+/**
+ * otp_verifications.email is VARCHAR(100).
+ *
+ * Prefix = 4 chars
+ * SHA-256 hex digest = 64 chars
+ *
+ * Total = 68 chars
+ */
+const EMAIL_COLUMN_MAX =
+  100;
 
 
 /* ============================================================================
@@ -66,70 +76,142 @@ const EMAIL_COLUMN_MAX = 100;
  * ============================================================================
  */
 
-function intEnv(name, fallback, min, max) {
-  const parsed = Number.parseInt(
-    process.env[name],
-    10
-  );
+/**
+ * Safely read an integer environment variable.
+ */
+function intEnv(
+  name,
+  fallback,
+  min,
+  max
+) {
+  const parsed =
+    Number.parseInt(
+      process.env[name],
+      10
+    );
 
-  if (!Number.isFinite(parsed)) {
+  if (
+    !Number.isFinite(
+      parsed
+    )
+  ) {
     return fallback;
   }
 
   return Math.min(
     max,
-    Math.max(min, parsed)
+    Math.max(
+      min,
+      parsed
+    )
   );
 }
 
 
-const POLICY = Object.freeze({
+/**
+ * Email resend security policy.
+ */
+const POLICY =
+  Object.freeze({
 
-  // Same recipient cannot receive another resend before this cooldown.
-  cooldownSeconds: intEnv(
-    "EMAIL_RESEND_COOLDOWN_SECONDS",
-    60,
-    10,
-    3600
-  ),
+    /*
+    |--------------------------------------------------------------------------
+    | Recipient cooldown
+    |--------------------------------------------------------------------------
+    |
+    | Default:
+    |
+    | Same recipient cannot receive another resend for 60 seconds.
+    |--------------------------------------------------------------------------
+    */
 
-  // Fixed rate-limit window.
-  windowSeconds: intEnv(
-    "EMAIL_RESEND_WINDOW_SECONDS",
-    60 * 60,
-    60,
-    24 * 60 * 60
-  ),
+    cooldownSeconds:
+      intEnv(
+        "EMAIL_RESEND_COOLDOWN_SECONDS",
+        60,
+        10,
+        3600
+      ),
 
-  // Maximum resend emails to one recipient during the window.
-  targetMaxPerWindow: intEnv(
-    "EMAIL_RESEND_TARGET_MAX_PER_WINDOW",
-    3,
-    1,
-    100
-  ),
 
-  // Maximum total resend emails one authenticated actor may trigger.
-  actorMaxPerWindow: intEnv(
-    "EMAIL_RESEND_ACTOR_MAX_PER_WINDOW",
-    30,
-    1,
-    1000
-  ),
+    /*
+    |--------------------------------------------------------------------------
+    | Rate-limit window
+    |--------------------------------------------------------------------------
+    |
+    | Default:
+    |
+    | 1 hour
+    |--------------------------------------------------------------------------
+    */
 
-});
+    windowSeconds:
+      intEnv(
+        "EMAIL_RESEND_WINDOW_SECONDS",
+        60 * 60,
+        60,
+        24 * 60 * 60
+      ),
+
+
+    /*
+    |--------------------------------------------------------------------------
+    | Recipient maximum
+    |--------------------------------------------------------------------------
+    |
+    | Default:
+    |
+    | Maximum 3 resend attempts per recipient during the current window.
+    |--------------------------------------------------------------------------
+    */
+
+    targetMaxPerWindow:
+      intEnv(
+        "EMAIL_RESEND_TARGET_MAX_PER_WINDOW",
+        3,
+        1,
+        100
+      ),
+
+
+    /*
+    |--------------------------------------------------------------------------
+    | Actor maximum
+    |--------------------------------------------------------------------------
+    |
+    | Default:
+    |
+    | Maximum 30 resend attempts by one authenticated actor during the
+    | current window.
+    |--------------------------------------------------------------------------
+    */
+
+    actorMaxPerWindow:
+      intEnv(
+        "EMAIL_RESEND_ACTOR_MAX_PER_WINDOW",
+        30,
+        1,
+        1000
+      ),
+
+  });
 
 
 /* ============================================================================
- * Helpers
+ * Generic helpers
  * ============================================================================
  */
 
-function normalize(value) {
+/**
+ * Normalize email / actor identifiers.
+ */
+function normalize(
+  value
+) {
   return String(
-    value == null
-      ? ""
-      : value
+    value ??
+    ""
   )
     .trim()
     .toLowerCase();
@@ -137,12 +219,12 @@ function normalize(value) {
 
 
 /**
- * We already have SECURITY_PEPPER / JWT_SECRET in the project.
+ * Get cryptographic pepper.
  *
- * lambda.js hydrates secrets from AWS Secrets Manager before loading
- * the application, so this will be available in production.
+ * SECURITY_PEPPER is preferred.
+ * JWT_SECRET is used as fallback.
  *
- * We intentionally fail closed if neither secret exists.
+ * We fail closed if neither exists.
  */
 function getSecurityPepper() {
 
@@ -151,13 +233,13 @@ function getSecurityPepper() {
     process.env.JWT_SECRET ||
     "";
 
-  if (!pepper) {
-
+  if (
+    !pepper
+  ) {
     throw new Error(
       "EMAIL_RESEND_RATE_GUARD_CONFIG_ERROR: " +
       "SECURITY_PEPPER/JWT_SECRET is not configured"
     );
-
   }
 
   return pepper;
@@ -165,64 +247,99 @@ function getSecurityPepper() {
 
 
 /**
- * HMAC-SHA256 prevents the real email address from being stored
- * in the rate-limit row.
+ * HMAC-SHA256 identifier.
+ *
+ * The actual recipient email / actor email is not stored in the rate-limit
+ * record.
  */
-function hmac(value) {
-
+function hmac(
+  value
+) {
   return crypto
     .createHmac(
       "sha256",
       getSecurityPepper()
     )
     .update(
-      String(value),
+      String(
+        value
+      ),
       "utf8"
     )
-    .digest("hex");
-
+    .digest(
+      "hex"
+    );
 }
 
 
 /**
- * Example:
+ * Create anonymous database marker.
  *
- * recipient:
- * ert:4f7894f1....
+ * Example recipient:
  *
- * actor:
- * era:2198a337....
+ * ert:abcdef....
  *
- * 4-char prefix + 64-char hash = 68 characters,
- * safely inside varchar(100).
+ * Example actor:
+ *
+ * era:abcdef....
  */
-function marker(prefix, value) {
+function marker(
+  prefix,
+  value
+) {
 
   const normalized =
-    normalize(value);
+    normalize(
+      value
+    );
 
-  if (!normalized) {
+  if (
+    !normalized
+  ) {
     return "";
   }
 
-  const digest =
-    hmac(normalized);
-
   const result =
-    `${prefix}${digest}`;
+    `${prefix}${hmac(normalized)}`;
 
   if (
     result.length >
     EMAIL_COLUMN_MAX
   ) {
-
     throw new Error(
       "EMAIL_RESEND_RATE_GUARD_MARKER_TOO_LONG"
     );
-
   }
 
   return result;
+}
+
+
+/**
+ * Convert a DB duration safely to a positive integer.
+ */
+function positiveSeconds(
+  value,
+  fallback = 1
+) {
+
+  const number =
+    Math.ceil(
+      Number(
+        value
+      )
+    );
+
+  if (
+    Number.isFinite(
+      number
+    ) &&
+    number > 0
+  ) {
+    return number;
+  }
+
+  return fallback;
 }
 
 
@@ -232,25 +349,16 @@ function marker(prefix, value) {
  */
 
 /**
- * Ensure one rate-limit counter exists.
+ * Ensure a rate-limit row exists.
  *
- * otp_verifications already contains:
+ * Existing DB constraint:
  *
- * UNIQUE KEY unique_email_purpose (email, purpose)
+ * UNIQUE(email, purpose)
  *
- * Because of that, two simultaneous Lambda requests cannot create two
- * independent counters for the same recipient.
+ * means only one recipient/actor counter can exist for each purpose.
  *
- * Request A:
- *
- * INSERT -> succeeds
- *
- * Request B:
- *
- * INSERT -> duplicate key
- *        -> existing row reused
- *
- * MySQL handles the concurrency for us.
+ * This also provides protection when multiple Lambda instances try to create
+ * the same counter simultaneously.
  */
 async function ensureCounterRow(
   db,
@@ -272,6 +380,7 @@ async function ensureCounterRow(
         created_at,
         verified_at
       )
+
       VALUES
       (
         ?,
@@ -279,11 +388,14 @@ async function ensureCounterRow(
         ?,
         0,
         0,
+
         DATE_ADD(
-          NOW(),
+          UTC_TIMESTAMP(),
           INTERVAL ? SECOND
         ),
-        NOW(),
+
+        UTC_TIMESTAMP(),
+
         NULL
       )
 
@@ -294,32 +406,42 @@ async function ensureCounterRow(
       keyMarker,
       digest,
       purpose,
-      POLICY.windowSeconds
+      POLICY.windowSeconds,
     ]
   );
-
 }
 
 
 /* ============================================================================
- * Counter locking
+ * Counter lock
  * ============================================================================
  */
 
 /**
- * Load the counter using SELECT ... FOR UPDATE.
+ * Read + lock counter.
  *
- * This is the important concurrency protection.
+ * SELECT ... FOR UPDATE is the main concurrency control.
  *
- * If Burp fires 10 requests simultaneously:
+ * Example:
  *
- * Request 1 locks row
- * Request 2 waits
- * Request 3 waits
- * Request 4 waits
- * ...
+ * Burp sends several requests at the same time.
  *
- * Therefore they cannot all observe attempts = 0.
+ * Request 1:
+ *   obtains the row lock
+ *
+ * Request 2:
+ *   waits
+ *
+ * Request 3:
+ *   waits
+ *
+ * Request 1:
+ *   increments counter + commits
+ *
+ * Request 2:
+ *   sees updated counter/cooldown
+ *
+ * Therefore simultaneous requests cannot all see attempts = 0.
  */
 async function lockCounterRow(
   db,
@@ -337,29 +459,47 @@ async function lockCounterRow(
           expires_at,
           verified_at,
 
-          (
-            expires_at <= NOW()
-          ) AS window_expired,
+          CASE
+
+            WHEN expires_at <=
+                 UTC_TIMESTAMP()
+
+            THEN 1
+
+            ELSE 0
+
+          END
+          AS window_expired,
+
 
           GREATEST(
             0,
+
             TIMESTAMPDIFF(
               SECOND,
-              NOW(),
+
+              UTC_TIMESTAMP(),
+
               expires_at
             )
-          ) AS window_remaining_seconds,
+          )
+          AS window_remaining_seconds,
+
 
           CASE
 
             WHEN verified_at IS NULL
+
             THEN 0
 
             ELSE GREATEST(
               0,
+
               TIMESTAMPDIFF(
                 SECOND,
-                NOW(),
+
+                UTC_TIMESTAMP(),
+
                 DATE_ADD(
                   verified_at,
                   INTERVAL ? SECOND
@@ -367,12 +507,14 @@ async function lockCounterRow(
               )
             )
 
-          END AS cooldown_remaining_seconds
+          END
+          AS cooldown_remaining_seconds
 
         FROM ${TABLE}
 
         WHERE
           email = ?
+
           AND purpose = ?
 
         LIMIT 1
@@ -382,20 +524,18 @@ async function lockCounterRow(
       [
         POLICY.cooldownSeconds,
         keyMarker,
-        purpose
+        purpose,
       ]
     );
 
 
   if (
     !rows ||
-    !rows.length
+    rows.length === 0
   ) {
-
     throw new Error(
       "EMAIL_RESEND_RATE_GUARD_COUNTER_NOT_FOUND"
     );
-
   }
 
 
@@ -403,10 +543,12 @@ async function lockCounterRow(
     rows[0];
 
 
-  /**
-   * If the one-hour window has finished,
-   * reset the counter.
-   */
+  /*
+  |--------------------------------------------------------------------------
+  | Reset expired window
+  |--------------------------------------------------------------------------
+  */
+
   if (
     Number(
       row.window_expired
@@ -419,14 +561,20 @@ async function lockCounterRow(
 
         SET
           otp_code = ?,
+
           is_verified = 0,
+
           attempts = 0,
-          created_at = NOW(),
-          verified_at = NULL,
+
+          created_at =
+            UTC_TIMESTAMP(),
+
+          verified_at =
+            NULL,
 
           expires_at =
             DATE_ADD(
-              NOW(),
+              UTC_TIMESTAMP(),
               INTERVAL ? SECOND
             )
 
@@ -437,37 +585,52 @@ async function lockCounterRow(
       [
         digest,
         POLICY.windowSeconds,
-        Number(row.id)
+        Number(
+          row.id
+        ),
       ]
     );
 
 
+    /*
+    |--------------------------------------------------------------------------
+    | Reflect the reset locally
+    |--------------------------------------------------------------------------
+    */
+
     row = {
       ...row,
 
-      attempts: 0,
+      attempts:
+        0,
 
-      verified_at: null,
+      verified_at:
+        null,
 
-      window_expired: 0,
+      window_expired:
+        0,
 
       window_remaining_seconds:
         POLICY.windowSeconds,
 
       cooldown_remaining_seconds:
-        0
+        0,
     };
 
   }
 
 
   return row;
-
 }
 
 
+/* ============================================================================
+ * Counter preparation
+ * ============================================================================
+ */
+
 /**
- * Creates the row when needed and then locks it.
+ * Ensure + lock a particular counter.
  */
 async function prepareCounter(
   db,
@@ -475,9 +638,27 @@ async function prepareCounter(
   purpose
 ) {
 
-  // Remove ert: or era:
+  /*
+  |--------------------------------------------------------------------------
+  | Strip marker prefix
+  |--------------------------------------------------------------------------
+  |
+  | ert: = 4 chars
+  | era: = 4 chars
+  |--------------------------------------------------------------------------
+  */
+
   const digest =
-    keyMarker.slice(4);
+    keyMarker.slice(
+      4
+    );
+
+
+  /*
+  |--------------------------------------------------------------------------
+  | Ensure counter exists
+  |--------------------------------------------------------------------------
+  */
 
   await ensureCounterRow(
     db,
@@ -486,56 +667,36 @@ async function prepareCounter(
     purpose
   );
 
+
+  /*
+  |--------------------------------------------------------------------------
+  | Lock counter
+  |--------------------------------------------------------------------------
+  */
+
   return lockCounterRow(
     db,
     keyMarker,
     digest,
     purpose
   );
-
-}
-
-
-/**
- * Convert MySQL numbers safely.
- */
-function positiveSeconds(
-  value,
-  fallback = 1
-) {
-
-  const number =
-    Math.ceil(
-      Number(value)
-    );
-
-  if (
-    Number.isFinite(number) &&
-    number > 0
-  ) {
-
-    return number;
-
-  }
-
-  return fallback;
 }
 
 
 /* ============================================================================
- * Main rate-limit function
+ * Main Email Bombing rate-limit function
  * ============================================================================
  */
 
 /**
- * Atomically checks and reserves one email resend slot.
+ * Atomically check and reserve one email resend slot.
  *
  * IMPORTANT:
  *
- * This function MUST be called while the controller already has
- * an active MySQL transaction.
+ * `db` must be a mysql2 connection that already has an ACTIVE transaction.
  *
- * Correct usage:
+ *
+ * Example:
  *
  * await conn.beginTransaction();
  *
@@ -543,12 +704,14 @@ function positiveSeconds(
  *   await reserveEmailResendSlot(
  *     conn,
  *     {
- *       targetEmail: invitationEmail,
- *       actorUserId: actorEmail
+ *       targetEmail: recipientEmail,
+ *       actorUserId: actorEmail,
  *     }
  *   );
  *
+ *
  * if (!rateLimit.allowed) {
+ *
  *   await conn.rollback();
  *
  *   return res
@@ -556,30 +719,31 @@ function positiveSeconds(
  *     .json(...);
  * }
  *
+ *
  * await conn.commit();
  *
- * // Only AFTER commit:
  * await sendEmail(...);
  *
  *
- * WHY THE SLOT IS RESERVED BEFORE SEND
- * -------------------------------------
+ * This utility does NOT:
  *
- * If the external email provider fails, we still consume the attempt.
+ * - commit
+ * - rollback
+ * - send email
+ * - send HTTP responses
  *
- * Otherwise an attacker could deliberately generate provider failures
- * and obtain unlimited retry attempts.
+ * Those responsibilities stay with the controller.
  */
 async function reserveEmailResendSlot(
   db,
   {
     targetEmail,
-    actorUserId
+    actorUserId,
   }
 ) {
 
   /* --------------------------------------------------------------------------
-   * Validate DB connection
+   * Validate connection
    * --------------------------------------------------------------------------
    */
 
@@ -588,11 +752,9 @@ async function reserveEmailResendSlot(
     typeof db.execute !==
       "function"
   ) {
-
     throw new TypeError(
       "A transactional MySQL connection is required"
     );
-
   }
 
 
@@ -612,26 +774,26 @@ async function reserveEmailResendSlot(
     );
 
 
-  if (!target) {
-
+  if (
+    !target
+  ) {
     throw new TypeError(
       "targetEmail is required for email resend rate limiting"
     );
-
   }
 
 
-  if (!actor) {
-
+  if (
+    !actor
+  ) {
     throw new TypeError(
       "actorUserId is required for email resend rate limiting"
     );
-
   }
 
 
   /* --------------------------------------------------------------------------
-   * Generate anonymous DB identifiers
+   * Generate anonymous keys
    * --------------------------------------------------------------------------
    */
 
@@ -650,19 +812,24 @@ async function reserveEmailResendSlot(
 
 
   /* ==========================================================================
-   * RECIPIENT RATE LIMIT
+   * Recipient protection
    * ==========================================================================
-   *
-   * Lock recipient FIRST.
-   *
-   * Every request follows this same locking order:
-   *
-   * recipient
-   *    ↓
-   * actor
-   *
-   * This reduces transaction deadlock risk.
    */
+
+  /*
+  |--------------------------------------------------------------------------
+  | Lock recipient FIRST
+  |--------------------------------------------------------------------------
+  |
+  | All requests follow the same lock order:
+  |
+  | recipient
+  |    ↓
+  | actor
+  |
+  | This helps reduce DB deadlock risk.
+  |--------------------------------------------------------------------------
+  */
 
   const targetRow =
     await prepareCounter(
@@ -673,7 +840,7 @@ async function reserveEmailResendSlot(
 
 
   /* --------------------------------------------------------------------------
-   * Check 60-second recipient cooldown
+   * Recipient cooldown
    * --------------------------------------------------------------------------
    */
 
@@ -688,10 +855,10 @@ async function reserveEmailResendSlot(
   if (
     cooldownRemaining > 0
   ) {
-
     return {
 
-      allowed: false,
+      allowed:
+        false,
 
       reason:
         "recipient_cooldown",
@@ -700,15 +867,14 @@ async function reserveEmailResendSlot(
         cooldownRemaining,
 
       policy:
-        POLICY
+        POLICY,
 
     };
-
   }
 
 
   /* --------------------------------------------------------------------------
-   * Check maximum recipient resends per window
+   * Recipient window limit
    * --------------------------------------------------------------------------
    */
 
@@ -722,10 +888,10 @@ async function reserveEmailResendSlot(
     targetAttempts >=
     POLICY.targetMaxPerWindow
   ) {
-
     return {
 
-      allowed: false,
+      allowed:
+        false,
 
       reason:
         "recipient_window_limit",
@@ -739,15 +905,14 @@ async function reserveEmailResendSlot(
         ),
 
       policy:
-        POLICY
+        POLICY,
 
     };
-
   }
 
 
   /* ==========================================================================
-   * ACTOR RATE LIMIT
+   * Actor protection
    * ==========================================================================
    */
 
@@ -759,6 +924,11 @@ async function reserveEmailResendSlot(
     );
 
 
+  /* --------------------------------------------------------------------------
+   * Actor window limit
+   * --------------------------------------------------------------------------
+   */
+
   const actorAttempts =
     Number(
       actorRow.attempts
@@ -769,10 +939,10 @@ async function reserveEmailResendSlot(
     actorAttempts >=
     POLICY.actorMaxPerWindow
   ) {
-
     return {
 
-      allowed: false,
+      allowed:
+        false,
 
       reason:
         "actor_window_limit",
@@ -786,27 +956,25 @@ async function reserveEmailResendSlot(
         ),
 
       policy:
-        POLICY
+        POLICY,
 
     };
-
   }
 
 
   /* ==========================================================================
-   * RESERVE THE EMAIL SLOT
+   * Reserve allowed resend
    * ==========================================================================
-   *
-   * Both checks passed.
-   *
-   * Increment both counters while the rows are still locked.
    */
 
-
-  /* --------------------------------------------------------------------------
-   * Recipient counter
-   * --------------------------------------------------------------------------
-   */
+  /*
+  |--------------------------------------------------------------------------
+  | Recipient counter
+  |--------------------------------------------------------------------------
+  |
+  | verified_at is reused as the most recent allowed resend reservation time.
+  |--------------------------------------------------------------------------
+  */
 
   await db.execute(
     `
@@ -817,7 +985,7 @@ async function reserveEmailResendSlot(
           attempts + 1,
 
         verified_at =
-          NOW()
+          UTC_TIMESTAMP()
 
       WHERE id = ?
 
@@ -826,15 +994,16 @@ async function reserveEmailResendSlot(
     [
       Number(
         targetRow.id
-      )
+      ),
     ]
   );
 
 
-  /* --------------------------------------------------------------------------
-   * Actor counter
-   * --------------------------------------------------------------------------
-   */
+  /*
+  |--------------------------------------------------------------------------
+  | Actor counter
+  |--------------------------------------------------------------------------
+  */
 
   await db.execute(
     `
@@ -845,7 +1014,7 @@ async function reserveEmailResendSlot(
           attempts + 1,
 
         verified_at =
-          NOW()
+          UTC_TIMESTAMP()
 
       WHERE id = ?
 
@@ -854,7 +1023,7 @@ async function reserveEmailResendSlot(
     [
       Number(
         actorRow.id
-      )
+      ),
     ]
   );
 
@@ -876,10 +1045,9 @@ async function reserveEmailResendSlot(
       0,
 
     policy:
-      POLICY
+      POLICY,
 
   };
-
 }
 
 
@@ -896,6 +1064,6 @@ module.exports = {
 
   PURPOSE_ACTOR,
 
-  reserveEmailResendSlot
+  reserveEmailResendSlot,
 
 };
