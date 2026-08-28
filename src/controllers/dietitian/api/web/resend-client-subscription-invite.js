@@ -54,6 +54,9 @@
 
 const pool = require("../../../../config/db");
 const csi  = require("./client-subscription-action-common");
+const {
+  reserveEmailResendSlot,
+} = require("../../../../utils/emailResendRateGuard");
 
 const {
   ApiError,
@@ -176,7 +179,134 @@ const resendClientSubscriptionInvite = async (req, res) => {
       throw new ApiError(409, "Cancelled subscription cannot be resent. Create a new invite.");
     }
 
-    // ── 6. Regenerate the redeem code + expiry, flip state to pending ────────
+
+// ── 6. Email-bombing protection ──────────────────────────────────────────
+//
+// IMPORTANT:
+// - Runs BEFORE a new redeem code is generated.
+// - Runs BEFORE the Resend email API is called.
+// - Uses the existing DB transaction.
+// - Uses the existing otp_verifications table.
+// - No new DB table is required.
+// - Protects the same recipient across all resend endpoints.
+//
+
+const targetEmail =
+  csi.email(
+    sub.client_email
+  );
+
+const rateLimit =
+  await reserveEmailResendSlot(
+    conn,
+    {
+      targetEmail:
+        targetEmail,
+
+      actorUserId:
+        actorEmail,
+    }
+  );
+
+// ── Rate limit exceeded ───────────────────────────────────────────────────
+
+if (
+  !rateLimit.allowed
+) {
+  /*
+  |--------------------------------------------------------------------------
+  | Roll back transaction
+  |--------------------------------------------------------------------------
+  |
+  | This also rolls back any legacy subscription row that may have been
+  | created earlier in this request.
+  |--------------------------------------------------------------------------
+  */
+
+  await conn.rollback();
+
+  inTransaction =
+    false;
+
+  const retryAfterSeconds =
+    Math.max(
+      1,
+      Number(
+        rateLimit.retryAfterSeconds
+      ) || 1
+    );
+
+  /*
+  |--------------------------------------------------------------------------
+  | Standard HTTP rate-limit header
+  |--------------------------------------------------------------------------
+  */
+
+  res.setHeader(
+    "Retry-After",
+    String(
+      retryAfterSeconds
+    )
+  );
+
+  /*
+  |--------------------------------------------------------------------------
+  | Audit blocked request
+  |--------------------------------------------------------------------------
+  */
+
+  await csi.audit(
+    pool,
+    req,
+
+    "client_subscription_invite_resend_rate_limited",
+
+    actorEmail,
+    actorRole,
+    csi.effectiveCode(
+      actor
+    ),
+
+    targetEmail,
+
+    false,
+
+    rateLimit.reason ||
+      "email_resend_rate_limited"
+  );
+
+  /*
+  |--------------------------------------------------------------------------
+  | HTTP 429
+  |--------------------------------------------------------------------------
+  */
+
+  return res
+    .status(429)
+    .json({
+      status:
+        false,
+
+      ok:
+        false,
+
+      message:
+        rateLimit.reason ===
+        "recipient_cooldown"
+          ? "Please wait before resending this client invitation."
+          : "Too many invitation resend requests. Please try again later.",
+
+      retry_after_seconds:
+        retryAfterSeconds,
+
+      rate_limit_reason:
+        rateLimit.reason,
+    });
+}
+
+
+
+    // ── 7. Regenerate the redeem code + expiry, flip state to pending ────────
     const newRedeemCode = await csi.uniqueRedeemCode(conn);
     const newExpiresAt = csi.redeemCodeExpiry();
 
