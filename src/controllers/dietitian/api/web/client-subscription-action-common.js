@@ -12,22 +12,13 @@
  * -------
  * Shared helpers for the client-subscription invite actions
  * (resend-client-subscription-invite, revoke-client-subscription-invite, ...).
- * This is the Node port of the PHP `csi_*` helper library. Every PHP function
- * has a 1:1 equivalent here (see the @phpparity tag on each export).
- *
- * Faithful-to-PHP behaviour:
- *  - csi_send_email() posts a Resend **template** payload
- *    (`template: { id, variables }`) — NOT inline HTML.
- *  - csi_get_subscription_for_update() resolves by subscription_id, then
- *    redeem_code, then the latest row for invite_id (source_invite_id).
- *  - csi_create_subscription_from_legacy_invite() copies legacy invite state
- *    through to the new subscription row.
  *
  * VAPT/HIPAA hardening:
  *  - Token-bound identity.
  *  - Every query is fully parameterized.
  *  - Redeem codes use crypto.randomInt.
  *  - Audit PHI/PII is HMAC-SHA256 hashed.
+ *  - Email addresses are validated server-side.
  *  - HTML/template output values are escaped before entering Resend.
  *  - Legacy DB values are treated as untrusted.
  */
@@ -37,10 +28,13 @@ const axios = require("axios");
 const pool = require("../../../../config/db");
 
 const {
+  validateEmailAddress,
   escapeHtml,
 } = require("../../../../utils/securityValidation");
 
-// ─── Constants ────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Constants
+// ─────────────────────────────────────────────────────────────────────────────
 
 const SECURITY_PEPPER =
   process.env.SECURITY_PEPPER ||
@@ -50,13 +44,14 @@ const SECURITY_PEPPER =
 const APP_DEBUG =
   process.env.NODE_ENV !== "production";
 
-const CLIENT_REDEEM_CODE_EXPIRY_DAYS = Math.max(
-  1,
-  parseInt(
-    process.env.CLIENT_REDEEM_CODE_EXPIRY_DAYS,
-    10
-  ) || 30
-);
+const CLIENT_REDEEM_CODE_EXPIRY_DAYS =
+  Math.max(
+    1,
+    parseInt(
+      process.env.CLIENT_REDEEM_CODE_EXPIRY_DAYS,
+      10
+    ) || 30
+  );
 
 const RESEND_API_KEY =
   process.env.RESEND_API_KEY || "";
@@ -84,7 +79,9 @@ const IST_OFFSET_MS =
   60 *
   1000;
 
-// ─── ApiError ────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// ApiError
+// ─────────────────────────────────────────────────────────────────────────────
 
 class ApiError extends Error {
   constructor(
@@ -112,7 +109,9 @@ class ApiError extends Error {
   }
 }
 
-// ─── Scalar Helpers ──────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Scalar Helpers
+// ─────────────────────────────────────────────────────────────────────────────
 
 function clean(value) {
   return String(
@@ -145,10 +144,23 @@ function code(value) {
     .toUpperCase();
 }
 
+/**
+ * Strict server-side email validation.
+ *
+ * Old implementation:
+ *
+ * /^[^\s@]+@[^\s@]+\.[^\s@]+$/
+ *
+ * was too permissive and could accept unexpected values such as:
+ *
+ * <script>@example.com
+ * {{7*7}}@example.com
+ */
 function isValidEmail(value) {
-  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(
-    value
-  );
+  return validateEmailAddress(
+    value,
+    "email"
+  ).ok;
 }
 
 function toInt(value) {
@@ -259,7 +271,9 @@ function effectiveCode(row) {
   return null;
 }
 
-// ─── Actor Resolution ────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Actor Resolution
+// ─────────────────────────────────────────────────────────────────────────────
 
 async function resolveActorFromToken(
   db,
@@ -408,7 +422,9 @@ async function resolveActorFromToken(
   };
 }
 
-// ─── Allowed Codes ───────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Allowed Codes
+// ─────────────────────────────────────────────────────────────────────────────
 
 async function allowedCodes(
   db,
@@ -593,7 +609,9 @@ async function allowedCodes(
   ];
 }
 
-// ─── Code Access Helpers ─────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Code Access Helpers
+// ─────────────────────────────────────────────────────────────────────────────
 
 function canAccessCode(
   allowed,
@@ -633,7 +651,9 @@ function canAccessRow(
   );
 }
 
-// ─── Target Lookups ──────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Target Lookups
+// ─────────────────────────────────────────────────────────────────────────────
 
 async function getSubscriptionForUpdate(
   db,
@@ -774,7 +794,9 @@ async function getLegacyInviteForUpdate(
   );
 }
 
-// ─── State Helpers ───────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// State Helpers
+// ─────────────────────────────────────────────────────────────────────────────
 
 function subscriptionIsAccepted(
   sub
@@ -845,7 +867,9 @@ function legacyInviteIsAccepted(
   return false;
 }
 
-// ─── Redeem Code Generation ─────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Redeem Code Generation
+// ─────────────────────────────────────────────────────────────────────────────
 
 function randomCode() {
   const alphabet =
@@ -910,7 +934,9 @@ async function uniqueRedeemCode(
   );
 }
 
-// ─── Legacy Subscription Creation ────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Legacy Subscription Creation
+// ─────────────────────────────────────────────────────────────────────────────
 
 async function createSubscriptionFromLegacyInvite(
   db,
@@ -1122,7 +1148,9 @@ async function createSubscriptionFromLegacyInvite(
   );
 }
 
-// ─── Source Invite Update ────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Source Invite Update
+// ─────────────────────────────────────────────────────────────────────────────
 
 async function updateSourceInvite(
   db,
@@ -1170,7 +1198,9 @@ async function updateSourceInvite(
   );
 }
 
-// ─── Trainer Name Hydration ──────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Trainer Name Hydration
+// ─────────────────────────────────────────────────────────────────────────────
 
 async function hydrateTrainerName(
   db,
@@ -1206,23 +1236,20 @@ async function hydrateTrainerName(
   return sub;
 }
 
-// ─── Email via Resend ────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Email via Resend
+// ─────────────────────────────────────────────────────────────────────────────
 
 /**
  * Sends client-subscription invitation email.
  *
  * IMPORTANT:
  *
- * Values in `sub` may come from current or legacy DB records.
- * Therefore all plain-text values are treated as untrusted and HTML-escaped
- * immediately before entering the Resend HTML template.
+ * `sub` can contain data loaded from legacy database rows.
+ * Therefore:
  *
- * Returns:
- * {
- *   success,
- *   resend_email_id,
- *   error
- * }
+ * 1. Destination email is validated again.
+ * 2. Plain-text template variables are HTML escaped.
  */
 async function sendEmail(sub) {
   if (
@@ -1241,20 +1268,18 @@ async function sendEmail(sub) {
 
   /*
   |--------------------------------------------------------------------------
-  | Validate destination email
+  | Strict destination email validation
   |--------------------------------------------------------------------------
   */
 
-  const clientEmail =
-    email(
-      sub.client_email
+  const clientEmailResult =
+    validateEmailAddress(
+      sub.client_email,
+      "client_email"
     );
 
   if (
-    clientEmail === "" ||
-    !isValidEmail(
-      clientEmail
-    )
+    !clientEmailResult.ok
   ) {
     return {
       success: false,
@@ -1267,20 +1292,12 @@ async function sendEmail(sub) {
     };
   }
 
+  const clientEmail =
+    clientEmailResult.value;
+
   /*
   |--------------------------------------------------------------------------
   | HTML Injection defense
-  |--------------------------------------------------------------------------
-  |
-  | Example legacy value:
-  |
-  | <h1>HTML INJECTION</h1>
-  |
-  | becomes:
-  |
-  | &lt;h1&gt;HTML INJECTION&lt;/h1&gt;
-  |
-  | before it reaches the Resend template.
   |--------------------------------------------------------------------------
   */
 
@@ -1342,10 +1359,6 @@ async function sendEmail(sub) {
   /*
   |--------------------------------------------------------------------------
   | Extra template variables
-  |--------------------------------------------------------------------------
-  |
-  | Numbers/booleans retain their type.
-  | Text is HTML-escaped.
   |--------------------------------------------------------------------------
   */
 
@@ -1496,12 +1509,6 @@ async function sendEmail(sub) {
     const decoded =
       response.data;
 
-    /*
-    |--------------------------------------------------------------------------
-    | Success
-    |--------------------------------------------------------------------------
-    */
-
     if (
       httpCode >= 200 &&
       httpCode < 300 &&
@@ -1519,12 +1526,6 @@ async function sendEmail(sub) {
           null,
       };
     }
-
-    /*
-    |--------------------------------------------------------------------------
-    | Provider failure
-    |--------------------------------------------------------------------------
-    */
 
     const bodyStr =
       typeof decoded ===
@@ -1548,12 +1549,6 @@ async function sendEmail(sub) {
           : `Resend API error: HTTP ${httpCode}`,
     };
   } catch (err) {
-    /*
-    |--------------------------------------------------------------------------
-    | Network failure
-    |--------------------------------------------------------------------------
-    */
-
     return {
       success:
         false,
@@ -1573,7 +1568,9 @@ async function sendEmail(sub) {
   }
 }
 
-// ─── Audit Helpers ───────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Audit Helpers
+// ─────────────────────────────────────────────────────────────────────────────
 
 function getClientIp(req) {
   const ip =
@@ -1651,7 +1648,9 @@ function auditHash(value) {
     );
 }
 
-// ─── Audit Log ───────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Audit Log
+// ─────────────────────────────────────────────────────────────────────────────
 
 async function audit(
   db,
@@ -1764,7 +1763,9 @@ async function audit(
   }
 }
 
-// ─── Exports ─────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Exports
+// ─────────────────────────────────────────────────────────────────────────────
 
 module.exports = {
   // constants
@@ -1816,8 +1817,6 @@ module.exports = {
   sendEmail,
   audit,
 };
-
-
 
 
 

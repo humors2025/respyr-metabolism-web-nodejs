@@ -1,73 +1,15 @@
 "use strict";
 
-/**
- * admin-invite-trainer.js
- *
- * Converted from: admin-invite-trainer.php
- * Platform      : Respyr Dietitian API (api.respyr.ai)
- * Security      : VAPT-hardened, HIPAA-aligned
- *
- * Endpoint   : POST /dietitian/api/web/admin-invite-trainer
- * Auth       : Bearer JWT (authMiddleware must run before this handler)
- * Authorized : admin only
- *
- * Behaviour parity with PHP:
- *  - Resolves the acting admin, requires the admin to have a partner_code
- *    (the PHP "Admin partner code is missing" 403 guard — an admin is a real,
- *    linked role).
- *  - Creates a `pending` row in app_user_invitations with a hashed token, a
- *    unique trainer partner_code (TRN + 7 chars), and a UTC expiry.
- *  - Sends a templated invite email via Resend.
- *  - On email failure, marks the invitation revoked and returns 502.
- *  - On success, marks the invitation as sent and returns 201 with the same
- *    JSON shape as the PHP file.
- *
- * Hardening differences from PHP (intentional):
- *  - Actor identity is taken from the verified JWT — never from
- *    req.body.actor_user_id. The PHP version trusted a body-supplied
- *    `actor_user_id`, which is a privilege-escalation vector.
- *  - Token is generated with crypto.randomBytes(32) and stored as a SHA-256
- *    HMAC keyed by SECURITY_PEPPER (falling back to JWT_SECRET). The raw
- *    token never touches the database.
- *  - Partner code uniqueness check uses a parameterized query and retries
- *    a bounded number of times before failing closed.
- *  - All audit log writes use a fail-safe wrapper that hashes PHI/PII.
- *
- * VAPT Controls applied:
- *  - Token-bound authorization (JWT → DB re-check on every call). A stale,
- *    demoted, or partner-code-less admin cannot invite.
- *  - Fully parameterized queries — zero string interpolation.
- *  - Strict input validation: email format/length validation, centralized
- *    Unicode human-name allowlist, and phone normalization/length validation.
- *  - HTML output encoding is applied to untrusted text before insertion into
- *    the Resend HTML template.
- *  - Cache-Control: no-store, Pragma: no-cache on every response.
- *  - Internal error details suppressed in production responses.
- *  - Email-sending uses HTTPS to Resend, with a hard timeout and no body
- *    echoed back to the client on success.
- *
- * HIPAA Controls applied:
- *  - Minimum-necessary data: only the columns needed are selected/inserted.
- *  - PHI (email, IP, UA) in audit logs is HMAC-SHA256 hashed with
- *    SECURITY_PEPPER. Raw PHI never lands in app_auth_logs.
- *  - Structured server-side logs contain only error metadata, never row data.
- *  - Access is bound to an authenticated admin JWT, verified against
- *    app_user_roles before any invite is created or any email is sent.
- *
- * NOTE: No DB tables are added or removed vs. the PHP — same table_dietician,
- * app_user_roles, app_user_invitations, app_auth_logs.
- */
-
 const crypto = require("crypto");
 const axios = require("axios");
 const pool = require("../../../../config/db");
 
 const {
   validateHumanName,
+  validateEmailAddress,
+  validatePhoneNumber,
   escapeHtml,
 } = require("../../../../utils/securityValidation");
-
-// ─── Constants ───────────────────────────────────────────────────────────────
 
 const SECURITY_PEPPER =
   process.env.SECURITY_PEPPER || process.env.JWT_SECRET || "";
@@ -107,17 +49,18 @@ const PARTNER_CODE_MAX_ATTEMPTS = 10;
 const PARTNER_CODE_ALPHABET =
   "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 
-const EMAIL_MAX_LENGTH = 254;
-const PHONE_MAX_LENGTH = 20;
-
-// ─── Helpers ─────────────────────────────────────────────────────────────────
-
+/**
+ * Normalize an email string.
+ */
 function normalizeEmail(val) {
   return typeof val === "string"
     ? val.trim().toLowerCase()
     : "";
 }
 
+/**
+ * Get client IP.
+ */
 function getClientIp(req) {
   const ip =
     (typeof req.ip === "string" && req.ip) ||
@@ -128,6 +71,9 @@ function getClientIp(req) {
   return String(ip).slice(0, 64);
 }
 
+/**
+ * Get browser/client user agent.
+ */
 function getUserAgent(req) {
   const ua =
     (typeof req.get === "function" &&
@@ -138,6 +84,9 @@ function getUserAgent(req) {
   return String(ua).slice(0, 500);
 }
 
+/**
+ * Hash values before storing them in security/audit logs.
+ */
 function authLogHash(value) {
   if (
     value === null ||
@@ -160,7 +109,7 @@ function authLogHash(value) {
 }
 
 /**
- * SHA-256 HMAC keyed by SECURITY_PEPPER.
+ * Secure HMAC used for invite token/email hashing.
  */
 function secureHash(value) {
   return crypto
@@ -173,7 +122,7 @@ function secureHash(value) {
 }
 
 /**
- * Format UTC date as MySQL DATETIME.
+ * Convert a JS Date to MySQL UTC DATETIME format.
  */
 function toUtcMysqlDateTime(date) {
   const pad = (n) =>
@@ -189,8 +138,9 @@ function toUtcMysqlDateTime(date) {
   );
 }
 
-// ─── Audit Logging ───────────────────────────────────────────────────────────
-
+/**
+ * Fail-safe authentication/audit logging.
+ */
 async function writeAuthLogSafe(
   req,
   {
@@ -268,8 +218,9 @@ async function writeAuthLogSafe(
   }
 }
 
-// ─── Actor Resolution ────────────────────────────────────────────────────────
-
+/**
+ * Resolve authenticated actor from verified JWT + database.
+ */
 async function resolveActorFromToken(
   req,
   requiredRole = "admin"
@@ -439,12 +390,19 @@ async function resolveActorFromToken(
   };
 }
 
-// ─── Input Validation ────────────────────────────────────────────────────────
-
+/**
+ * Validate invitation request.
+ *
+ * IMPORTANT:
+ * This is SERVER-SIDE validation.
+ *
+ * Malicious input must be rejected rather than cleaned.
+ */
 function validateInviteInput(body) {
   if (
     !body ||
-    typeof body !== "object"
+    typeof body !== "object" ||
+    Array.isArray(body)
   ) {
     return {
       ok: false,
@@ -454,21 +412,9 @@ function validateInviteInput(body) {
     };
   }
 
-  /*
-  |--------------------------------------------------------------------------
-  | Human names
-  |--------------------------------------------------------------------------
-  |
-  | Rejects:
-  |
-  | <h1>HTML Injection</h1>
-  | <script>alert(1)</script>
-  | {{7*7}}
-  | ${7*7}
-  | HTML attributes/tags
-  |--------------------------------------------------------------------------
-  */
-
+  /**
+   * First name
+   */
   const firstNameResult =
     validateHumanName(
       body.first_name,
@@ -486,6 +432,9 @@ function validateInviteInput(body) {
     };
   }
 
+  /**
+   * Last name
+   */
   const lastNameResult =
     validateHumanName(
       body.last_name,
@@ -509,82 +458,65 @@ function validateInviteInput(body) {
   const lastName =
     lastNameResult.value;
 
-  /*
-  |--------------------------------------------------------------------------
-  | Email
-  |--------------------------------------------------------------------------
-  */
-
-  const email =
-    normalizeEmail(
-      body.email
+  /**
+   * Email
+   *
+   * Rejects values such as:
+   *
+   * <script>@example.com
+   * {{7*7}}@example.com
+   * test<>@example.com
+   */
+  const emailResult =
+    validateEmailAddress(
+      body.email,
+      "email"
     );
 
   if (
-    !email ||
-    email.length >
-      EMAIL_MAX_LENGTH
+    !emailResult.ok
   ) {
     return {
       ok: false,
       status: 400,
       message:
-        "email is required",
+        emailResult.message,
     };
   }
 
-  const emailRegex =
-    /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  const email =
+    emailResult.value;
+
+  /**
+   * Phone
+   *
+   * IMPORTANT:
+   * Validate first.
+   *
+   * Do NOT silently remove malicious characters.
+   */
+  const phoneResult =
+    validatePhoneNumber(
+      body.phone,
+      "phone",
+      {
+        required: false,
+      }
+    );
 
   if (
-    !emailRegex.test(email)
+    !phoneResult.ok
   ) {
     return {
       ok: false,
       status: 400,
       message:
-        "Invalid email format",
+        phoneResult.message,
     };
   }
 
-  /*
-  |--------------------------------------------------------------------------
-  | Phone
-  |--------------------------------------------------------------------------
-  */
-
-  const phoneRaw =
-    body.phone === null ||
-    body.phone === undefined
-      ? ""
-      : String(
-          body.phone
-        ).trim();
-
-  let phone = "";
-
-  if (
-    phoneRaw !== ""
-  ) {
-    phone =
-      phoneRaw.replace(
-        /[^\d+]/g,
-        ""
-      );
-
-    if (
-      phone.length === 0 ||
-      phone.length >
-        PHONE_MAX_LENGTH
-    ) {
-      return {
-        ok: false,
-        status: 400,
-        message:
-          "Invalid phone number",
-      };
-    }
-  }
+  const phone =
+    phoneResult.value;
 
   return {
     ok: true,
@@ -603,17 +535,12 @@ function validateInviteInput(body) {
   };
 }
 
-// ─── Pre-flight Checks ───────────────────────────────────────────────────────
-
+/**
+ * Ensure user/invitation does not already exist.
+ */
 async function ensureInviteCanBeCreated(
   email
 ) {
-  /*
-  |--------------------------------------------------------------------------
-  | Existing user
-  |--------------------------------------------------------------------------
-  */
-
   const [roleRows] =
     await pool.execute(
       `
@@ -641,12 +568,6 @@ async function ensureInviteCanBeCreated(
         "A user with this email already exists",
     };
   }
-
-  /*
-  |--------------------------------------------------------------------------
-  | Existing pending invite
-  |--------------------------------------------------------------------------
-  */
 
   const [inviteRows] =
     await pool.execute(
@@ -686,8 +607,9 @@ async function ensureInviteCanBeCreated(
   };
 }
 
-// ─── Partner Code Generation ─────────────────────────────────────────────────
-
+/**
+ * Generate random portion of trainer partner code.
+ */
 function randomPartnerCodeSuffix() {
   let out = "";
 
@@ -712,6 +634,9 @@ function randomPartnerCodeSuffix() {
   return out;
 }
 
+/**
+ * Generate unique trainer partner code.
+ */
 async function generateUniquePartnerCode() {
   for (
     let attempt = 0;
@@ -762,8 +687,9 @@ async function generateUniquePartnerCode() {
   );
 }
 
-// ─── Invitation Row Helpers ──────────────────────────────────────────────────
-
+/**
+ * Create invitation record.
+ */
 async function createPendingInvite({
   email,
   firstName,
@@ -836,6 +762,9 @@ async function createPendingInvite({
   );
 }
 
+/**
+ * Revoke failed invitation.
+ */
 async function markInviteRevoked(
   invitationId
 ) {
@@ -845,8 +774,7 @@ async function markInviteRevoked(
         UPDATE app_user_invitations
 
         SET
-          status =
-            'revoked',
+          status = 'revoked',
 
           updated_at =
             UTC_TIMESTAMP()
@@ -868,6 +796,9 @@ async function markInviteRevoked(
   }
 }
 
+/**
+ * Mark invitation email as sent.
+ */
 async function markInviteSent(
   invitationId
 ) {
@@ -876,8 +807,7 @@ async function markInviteSent(
       UPDATE app_user_invitations
 
       SET
-        status =
-          'pending',
+        status = 'pending',
 
         sent_at =
           UTC_TIMESTAMP(),
@@ -895,8 +825,9 @@ async function markInviteSent(
   );
 }
 
-// ─── Email via Resend ────────────────────────────────────────────────────────
-
+/**
+ * Send invitation using Resend template.
+ */
 async function sendResendTemplateEmail(
   toEmail,
   subject,
@@ -923,10 +854,9 @@ async function sendResendTemplateEmail(
           from:
             RESEND_FROM_EMAIL,
 
-          to:
-            [
-              toEmail,
-            ],
+          to: [
+            toEmail,
+          ],
 
           subject,
 
@@ -1032,16 +962,14 @@ async function sendResendTemplateEmail(
   }
 }
 
-// ─── Controller ──────────────────────────────────────────────────────────────
-
+/**
+ * POST /dietitian/api/web/admin-invite-trainer
+ */
 const adminInviteTrainer =
   async (req, res) => {
-    /*
-    |--------------------------------------------------------------------------
-    | Prevent caching
-    |--------------------------------------------------------------------------
-    */
-
+    /**
+     * Never cache sensitive responses.
+     */
     res.setHeader(
       "Cache-Control",
       "no-store"
@@ -1052,12 +980,9 @@ const adminInviteTrainer =
       "no-cache"
     );
 
-    /*
-    |--------------------------------------------------------------------------
-    | Method check
-    |--------------------------------------------------------------------------
-    */
-
+    /**
+     * POST only.
+     */
     if (
       req.method !== "POST"
     ) {
@@ -1081,12 +1006,9 @@ const adminInviteTrainer =
       null;
 
     try {
-      /*
-      |--------------------------------------------------------------------------
-      | 1. Resolve authenticated admin
-      |--------------------------------------------------------------------------
-      */
-
+      /**
+       * Resolve authenticated admin from JWT + DB.
+       */
       const resolved =
         await resolveActorFromToken(
           req,
@@ -1115,8 +1037,7 @@ const adminInviteTrainer =
               normalizeEmail(
                 req.user?.email ||
                   req.user?.user_id ||
-                  req.user?.dietician
-                    ?.email ||
+                  req.user?.dietician?.email ||
                   req.user?.sub ||
                   ""
               ),
@@ -1133,8 +1054,7 @@ const adminInviteTrainer =
 
         return res
           .status(
-            resolved.error
-              .status
+            resolved.error.status
           )
           .json(
             resolved.error.body
@@ -1148,27 +1068,22 @@ const adminInviteTrainer =
       actorEmail =
         resolved.actorEmail;
 
-      /*
-      |--------------------------------------------------------------------------
-      | 2. Cross-check optional actor_user_id
-      |--------------------------------------------------------------------------
-      */
-
+      /**
+       * actor_user_id is kept for frontend compatibility,
+       * but it cannot select another account.
+       */
       const bodyActorUserId =
         normalizeEmail(
           req.body &&
           typeof req.body ===
             "object"
-            ? req.body
-                .actor_user_id
+            ? req.body.actor_user_id
             : ""
         );
 
       if (
-        bodyActorUserId !==
-          "" &&
-        bodyActorUserId !==
-          actorEmail
+        bodyActorUserId !== "" &&
+        bodyActorUserId !== actorEmail
       ) {
         await writeAuthLogSafe(
           req,
@@ -1207,12 +1122,9 @@ const adminInviteTrainer =
           });
       }
 
-      /*
-      |--------------------------------------------------------------------------
-      | 3. Admin partner code required
-      |--------------------------------------------------------------------------
-      */
-
+      /**
+       * Admin must have partner code.
+       */
       if (
         !actor.partner_code ||
         String(
@@ -1260,12 +1172,9 @@ const adminInviteTrainer =
           actor.partner_code
         );
 
-      /*
-      |--------------------------------------------------------------------------
-      | 4. Validate input
-      |--------------------------------------------------------------------------
-      */
-
+      /**
+       * SERVER-SIDE input validation.
+       */
       const validation =
         validateInviteInput(
           req.body
@@ -1312,6 +1221,10 @@ const adminInviteTrainer =
           });
       }
 
+      /**
+       * IMPORTANT:
+       * After this point use ONLY validated values.
+       */
       const {
         first_name:
           firstName,
@@ -1330,12 +1243,9 @@ const adminInviteTrainer =
           ? phone
           : null;
 
-      /*
-      |--------------------------------------------------------------------------
-      | 5. Prevent duplicate invitations/users
-      |--------------------------------------------------------------------------
-      */
-
+      /**
+       * Prevent duplicate user/invite.
+       */
       const canCreate =
         await ensureInviteCanBeCreated(
           email
@@ -1382,21 +1292,18 @@ const adminInviteTrainer =
           });
       }
 
-      /*
-      |--------------------------------------------------------------------------
-      | 6. Generate partner code
-      |--------------------------------------------------------------------------
-      */
-
+      /**
+       * Generate trainer partner code.
+       */
       const partnerCode =
         await generateUniquePartnerCode();
 
-      /*
-      |--------------------------------------------------------------------------
-      | 7. Generate secure invite token
-      |--------------------------------------------------------------------------
-      */
-
+      /**
+       * Generate invite token.
+       *
+       * Raw token is sent only in URL.
+       * Database stores only hash.
+       */
       const rawToken =
         crypto
           .randomBytes(32)
@@ -1412,12 +1319,9 @@ const adminInviteTrainer =
           rawToken
         )}`;
 
-      /*
-      |--------------------------------------------------------------------------
-      | 8. Calculate invitation expiry
-      |--------------------------------------------------------------------------
-      */
-
+      /**
+       * Calculate expiration.
+       */
       const expiresAtDate =
         new Date(
           Date.now() +
@@ -1432,12 +1336,9 @@ const adminInviteTrainer =
           expiresAtDate
         );
 
-      /*
-      |--------------------------------------------------------------------------
-      | 9. Insert invitation
-      |--------------------------------------------------------------------------
-      */
-
+      /**
+       * Insert only validated data.
+       */
       invitationId =
         await createPendingInvite(
           {
@@ -1467,29 +1368,16 @@ const adminInviteTrainer =
           }
         );
 
-      /*
-      |--------------------------------------------------------------------------
-      | 10. Prepare email variables
-      |--------------------------------------------------------------------------
-      */
-
       const fullName =
         `${firstName} ${lastName}`.trim();
 
-      /*
-      |--------------------------------------------------------------------------
-      | HTML Injection defense in depth
-      |--------------------------------------------------------------------------
-      |
-      | Layer 1:
-      | validateHumanName() rejects HTML/template payloads before storage.
-      |
-      | Layer 2:
-      | escapeHtml() ensures plain text stays plain text if the Resend template
-      | uses a raw HTML placeholder such as {{{INVITED_NAME}}}.
-      |--------------------------------------------------------------------------
-      */
-
+      /**
+       * HTML output encoding:
+       *
+       * Validation prevents malicious data from getting in.
+       * escapeHtml() additionally protects when inserting
+       * plain text into HTML email templates.
+       */
       const safeFullName =
         escapeHtml(
           fullName
@@ -1505,12 +1393,9 @@ const adminInviteTrainer =
           email
         );
 
-      /*
-      |--------------------------------------------------------------------------
-      | 11. Send email
-      |--------------------------------------------------------------------------
-      */
-
+      /**
+       * Send invitation email.
+       */
       const emailResult =
         await sendResendTemplateEmail(
           email,
@@ -1542,23 +1427,14 @@ const adminInviteTrainer =
                 `${INVITE_EXPIRY_HOURS} hours`
               ),
 
-            /*
-            |--------------------------------------------------------------------------
-            | Server-generated invite URL
-            |--------------------------------------------------------------------------
-            */
-
             INVITE_LINK:
               inviteLink,
           }
         );
 
-      /*
-      |--------------------------------------------------------------------------
-      | Email failure
-      |--------------------------------------------------------------------------
-      */
-
+      /**
+       * Email failure.
+       */
       if (
         !emailResult.ok
       ) {
@@ -1623,22 +1499,16 @@ const adminInviteTrainer =
           });
       }
 
-      /*
-      |--------------------------------------------------------------------------
-      | 12. Mark invite sent
-      |--------------------------------------------------------------------------
-      */
-
+      /**
+       * Mark invite sent.
+       */
       await markInviteSent(
         invitationId
       );
 
-      /*
-      |--------------------------------------------------------------------------
-      | 13. Audit success
-      |--------------------------------------------------------------------------
-      */
-
+      /**
+       * Audit success.
+       */
       await writeAuthLogSafe(
         req,
         {
@@ -1665,12 +1535,9 @@ const adminInviteTrainer =
         }
       );
 
-      /*
-      |--------------------------------------------------------------------------
-      | 14. Response
-      |--------------------------------------------------------------------------
-      */
-
+      /**
+       * Success response.
+       */
       const response = {
         ok: true,
 
@@ -1719,12 +1586,10 @@ const adminInviteTrainer =
         },
       };
 
-      /*
-      |--------------------------------------------------------------------------
-      | Development/testing only
-      |--------------------------------------------------------------------------
-      */
-
+      /**
+       * Testing only.
+       * Keep disabled in production.
+       */
       if (
         RETURN_INVITE_LINK_FOR_TESTING
       ) {
@@ -1736,15 +1601,11 @@ const adminInviteTrainer =
         .status(201)
         .json(response);
     } catch (err) {
-      /*
-      |--------------------------------------------------------------------------
-      | Revoke half-created invitation
-      |--------------------------------------------------------------------------
-      */
-
+      /**
+       * Revoke partially-created invitation.
+       */
       if (
-        invitationId !==
-        null
+        invitationId !== null
       ) {
         await markInviteRevoked(
           invitationId
@@ -1816,13 +1677,9 @@ const adminInviteTrainer =
     }
   };
 
-// ─── Export ──────────────────────────────────────────────────────────────────
-
 module.exports = {
   adminInviteTrainer,
 };
-
-
 
 
 

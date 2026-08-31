@@ -10,6 +10,8 @@
  *  - DB role/status re-check
  *  - Parameterized SQL
  *  - Centralized human-name allowlist validation
+ *  - Centralized email validation
+ *  - Centralized phone validation
  *  - HTML output encoding helper
  *  - HMAC-SHA256 hashing for sensitive audit values/tokens
  *  - No-store security headers
@@ -21,6 +23,8 @@ const pool = require("../../../../config/db");
 
 const {
   validateHumanName,
+  validateEmailAddress,
+  validatePhoneNumber,
   escapeHtml,
 } = require("../../../../utils/securityValidation");
 
@@ -71,9 +75,6 @@ const RESEND_REPLY_TO =
 const RESEND_INVITE_TEMPLATE_ID =
   process.env.RESEND_INVITE_TEMPLATE_ID ||
   "admin_trainer_invitation";
-
-const EMAIL_MAX_LENGTH = 254;
-const PHONE_MAX_LENGTH = 30;
 
 const PARTNER_CODE_ALPHABET =
   "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
@@ -249,16 +250,13 @@ function normalizeEmail(
 | Name Normalization
 |--------------------------------------------------------------------------
 |
-| IMPORTANT:
+| cleanName() ONLY normalizes existing data.
 |
-| cleanName() only normalizes an already-existing value.
+| It must not be considered security validation.
 |
-| It must NOT be used as security validation for new input.
-|
-| For request input use:
+| For user/request input use:
 |
 | validateHumanName()
-|
 |--------------------------------------------------------------------------
 */
 
@@ -285,52 +283,31 @@ function cleanName(
 |--------------------------------------------------------------------------
 | Phone Validation
 |--------------------------------------------------------------------------
+|
+| This wrapper exists for compatibility with controllers that already call
+| cleanPhone().
+|
+| Unlike the old implementation, validation is now performed by the central
+| validatePhoneNumber() helper.
+|
+| Malicious values are REJECTED rather than silently cleaned.
+|--------------------------------------------------------------------------
 */
 
 function cleanPhone(
   value
 ) {
-  const phone =
-    value === null ||
-    value === undefined
-      ? ""
-      : String(
-          value
-        ).trim();
-
-  /*
-  |--------------------------------------------------------------------------
-  | Phone is optional
-  |--------------------------------------------------------------------------
-  */
+  const result =
+    validatePhoneNumber(
+      value,
+      "phone",
+      {
+        required: false,
+      }
+    );
 
   if (
-    phone === ""
-  ) {
-    return {
-      ok: true,
-      value: "",
-    };
-  }
-
-  /*
-  |--------------------------------------------------------------------------
-  | Allow:
-  |
-  | digits
-  | +
-  | -
-  | spaces
-  | ()
-  |
-  | Length: 6 - 30
-  |--------------------------------------------------------------------------
-  */
-
-  if (
-    !/^[0-9+\-\s()]{6,30}$/.test(
-      phone
-    )
+    !result.ok
   ) {
     return {
       ok: false,
@@ -338,13 +315,16 @@ function cleanPhone(
       status: 400,
 
       message:
+        result.message ||
         "Invalid phone number format",
     };
   }
 
   return {
     ok: true,
-    value: phone,
+
+    value:
+      result.value,
   };
 }
 
@@ -607,7 +587,7 @@ async function writeAuthLogSafe(
 | Actor Resolution
 |--------------------------------------------------------------------------
 |
-| Actor is derived from the verified JWT, then re-checked against DB.
+| Actor identity is derived from the verified JWT, then re-checked against DB.
 |--------------------------------------------------------------------------
 */
 
@@ -698,6 +678,35 @@ async function resolveActorFromToken(
     rows =
       result;
   } else {
+    /*
+    |--------------------------------------------------------------------------
+    | If resolving by email, validate JWT email before using it.
+    |--------------------------------------------------------------------------
+    */
+
+    const tokenEmailValidation =
+      validateEmailAddress(
+        tokenEmail,
+        "token email"
+      );
+
+    if (
+      !tokenEmailValidation.ok
+    ) {
+      return {
+        error: {
+          status: 401,
+
+          body: {
+            ok: false,
+
+            message:
+              "Invalid token user",
+          },
+        },
+      };
+    }
+
     const [result] =
       await pool.execute(
         `SELECT
@@ -722,7 +731,7 @@ async function resolveActorFromToken(
 
          LIMIT 1`,
         [
-          tokenEmail,
+          tokenEmailValidation.value,
         ]
       );
 
@@ -832,21 +841,81 @@ function assertActorUserIdMatches(
   body,
   actorEmail
 ) {
-  const bodyActorUserId =
-    normalizeEmail(
-      body &&
-      typeof body ===
-        "object"
-        ? body
-            .actor_user_id
-        : ""
+  const rawActorUserId =
+    body &&
+    typeof body ===
+      "object"
+      ? body.actor_user_id
+      : "";
+
+  /*
+  |--------------------------------------------------------------------------
+  | actor_user_id is optional
+  |--------------------------------------------------------------------------
+  */
+
+  if (
+    rawActorUserId ===
+      undefined ||
+    rawActorUserId ===
+      null ||
+    String(
+      rawActorUserId
+    ).trim() ===
+      ""
+  ) {
+    return {
+      ok: true,
+    };
+  }
+
+  /*
+  |--------------------------------------------------------------------------
+  | Validate provided actor email
+  |--------------------------------------------------------------------------
+  */
+
+  const bodyActorResult =
+    validateEmailAddress(
+      rawActorUserId,
+      "actor_user_id"
     );
 
   if (
-    bodyActorUserId !==
-      "" &&
-    bodyActorUserId !==
-      actorEmail
+    !bodyActorResult.ok
+  ) {
+    return {
+      ok: false,
+
+      status: 400,
+
+      message:
+        bodyActorResult.message,
+    };
+  }
+
+  const authenticatedActorResult =
+    validateEmailAddress(
+      actorEmail,
+      "authenticated user"
+    );
+
+  if (
+    !authenticatedActorResult.ok
+  ) {
+    return {
+      ok: false,
+
+      status: 401,
+
+      message:
+        "Invalid authenticated user",
+    };
+  }
+
+  if (
+    bodyActorResult.value !==
+      authenticatedActorResult.value
   ) {
     return {
       ok: false,
@@ -868,21 +937,14 @@ function assertActorUserIdMatches(
 | Invite Input Validation
 |--------------------------------------------------------------------------
 |
-| THIS IS THE IMPORTANT HTML-INJECTION FIX.
+| Server-side CWE-20 / injection remediation.
 |
-| The previous implementation:
+| Malicious values are rejected BEFORE:
 |
-| 1. called cleanName()
-| 2. checked only ASCII control characters
+| - database insertion
+| - email processing
+| - template rendering
 |
-| Therefore:
-|
-| <h1>HTML INJECTION</h1>
-| {{7*7}}
-|
-| were accepted.
-|
-| The new implementation uses validateHumanName().
 |--------------------------------------------------------------------------
 */
 
@@ -907,7 +969,7 @@ function validateInviteInput(
 
   /*
   |--------------------------------------------------------------------------
-  | First name
+  | First Name
   |--------------------------------------------------------------------------
   */
 
@@ -932,7 +994,7 @@ function validateInviteInput(
 
   /*
   |--------------------------------------------------------------------------
-  | Last name
+  | Last Name
   |--------------------------------------------------------------------------
   */
 
@@ -955,27 +1017,28 @@ function validateInviteInput(
     };
   }
 
-  const firstName =
-    firstNameResult.value;
-
-  const lastName =
-    lastNameResult.value;
-
   /*
   |--------------------------------------------------------------------------
   | Email
   |--------------------------------------------------------------------------
+  |
+  | Examples rejected:
+  |
+  | <script>@example.com
+  | {{7*7}}@example.com
+  | test<>@example.com
+  | test user@example.com
+  |--------------------------------------------------------------------------
   */
 
-  const email =
-    normalizeEmail(
-      body.email
+  const emailResult =
+    validateEmailAddress(
+      body.email,
+      "email"
     );
 
   if (
-    email === "" ||
-    email.length >
-      EMAIL_MAX_LENGTH
+    !emailResult.ok
   ) {
     return {
       ok: false,
@@ -983,25 +1046,7 @@ function validateInviteInput(
       status: 400,
 
       message:
-        "Valid email is required",
-    };
-  }
-
-  const emailRegex =
-    /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-
-  if (
-    !emailRegex.test(
-      email
-    )
-  ) {
-    return {
-      ok: false,
-
-      status: 400,
-
-      message:
-        "Valid email is required",
+        emailResult.message,
     };
   }
 
@@ -1009,30 +1054,58 @@ function validateInviteInput(
   |--------------------------------------------------------------------------
   | Phone
   |--------------------------------------------------------------------------
+  |
+  | Examples rejected:
+  |
+  | +91<script>alert(1)</script>9876543210
+  | +91{{7*7}}9876543210
+  |
+  | Important:
+  |
+  | Do not strip unexpected characters first.
+  |--------------------------------------------------------------------------
   */
 
   const phoneResult =
-    cleanPhone(
-      body.phone
+    validatePhoneNumber(
+      body.phone,
+      "phone",
+      {
+        required: false,
+      }
     );
 
   if (
     !phoneResult.ok
   ) {
-    return phoneResult;
+    return {
+      ok: false,
+
+      status: 400,
+
+      message:
+        phoneResult.message,
+    };
   }
+
+  /*
+  |--------------------------------------------------------------------------
+  | ONLY validated / normalized data leaves this function
+  |--------------------------------------------------------------------------
+  */
 
   return {
     ok: true,
 
     value: {
       first_name:
-        firstName,
+        firstNameResult.value,
 
       last_name:
-        lastName,
+        lastNameResult.value,
 
-      email,
+      email:
+        emailResult.value,
 
       phone:
         phoneResult.value,
@@ -1049,14 +1122,38 @@ function validateInviteInput(
 async function ensureInviteCanBeCreated(
   email
 ) {
-  const normalized =
-    normalizeEmail(
-      email
+  /*
+  |--------------------------------------------------------------------------
+  | Defense-in-depth:
+  | Validate email again before performing DB operations.
+  |--------------------------------------------------------------------------
+  */
+
+  const emailResult =
+    validateEmailAddress(
+      email,
+      "email"
     );
+
+  if (
+    !emailResult.ok
+  ) {
+    return {
+      ok: false,
+
+      status: 400,
+
+      message:
+        emailResult.message,
+    };
+  }
+
+  const normalized =
+    emailResult.value;
 
   /*
   |--------------------------------------------------------------------------
-  | Expire old pending invitations
+  | Expire stale pending invitations
   |--------------------------------------------------------------------------
   */
 
@@ -1169,14 +1266,31 @@ async function ensureInviteCanBeCreated(
 function generateRandomCodePart(
   length
 ) {
-  let code = "";
+  const requestedLength =
+    Number(length);
+
+  if (
+    !Number.isInteger(
+      requestedLength
+    ) ||
+    requestedLength < 1 ||
+    requestedLength > 64
+  ) {
+    throw new Error(
+      "Invalid random code length"
+    );
+  }
+
+  let generatedCode =
+    "";
 
   for (
     let i = 0;
-    i < length;
+    i <
+      requestedLength;
     i++
   ) {
-    code +=
+    generatedCode +=
       PARTNER_CODE_ALPHABET[
         crypto.randomInt(
           0,
@@ -1185,7 +1299,7 @@ function generateRandomCodePart(
       ];
   }
 
-  return code;
+  return generatedCode;
 }
 
 /*
@@ -1197,6 +1311,21 @@ function generateRandomCodePart(
 async function generateUniquePartnerCode(
   role
 ) {
+  /*
+  |--------------------------------------------------------------------------
+  | Only known role types are accepted.
+  |--------------------------------------------------------------------------
+  */
+
+  if (
+    role !== "admin" &&
+    role !== "trainer"
+  ) {
+    throw new Error(
+      "Invalid invitation role"
+    );
+  }
+
   const prefix =
     role === "admin"
       ? "ADM"
@@ -1213,6 +1342,12 @@ async function generateUniquePartnerCode(
       generateRandomCodePart(
         PARTNER_CODE_RANDOM_LEN
       );
+
+    /*
+    |--------------------------------------------------------------------------
+    | Parameterized SQL
+    |--------------------------------------------------------------------------
+    */
 
     const [hits] =
       await pool.execute(
@@ -1280,6 +1415,163 @@ async function createPendingInvite({
   tokenHash,
   expiresAt,
 }) {
+  /*
+  |--------------------------------------------------------------------------
+  | Validate email again before DB insertion
+  |--------------------------------------------------------------------------
+  */
+
+  const emailResult =
+    validateEmailAddress(
+      invitedEmail,
+      "invited_email"
+    );
+
+  if (
+    !emailResult.ok
+  ) {
+    throw new Error(
+      emailResult.message
+    );
+  }
+
+  /*
+  |--------------------------------------------------------------------------
+  | Validate names again before DB insertion
+  |--------------------------------------------------------------------------
+  */
+
+  const firstNameResult =
+    validateHumanName(
+      firstName,
+      "first_name"
+    );
+
+  if (
+    !firstNameResult.ok
+  ) {
+    throw new Error(
+      firstNameResult.message
+    );
+  }
+
+  const lastNameResult =
+    validateHumanName(
+      lastName,
+      "last_name"
+    );
+
+  if (
+    !lastNameResult.ok
+  ) {
+    throw new Error(
+      lastNameResult.message
+    );
+  }
+
+  /*
+  |--------------------------------------------------------------------------
+  | Validate phone again
+  |--------------------------------------------------------------------------
+  */
+
+  const phoneResult =
+    validatePhoneNumber(
+      phone,
+      "phone",
+      {
+        required: false,
+      }
+    );
+
+  if (
+    !phoneResult.ok
+  ) {
+    throw new Error(
+      phoneResult.message
+    );
+  }
+
+  /*
+  |--------------------------------------------------------------------------
+  | Validate invited role
+  |--------------------------------------------------------------------------
+  */
+
+  if (
+    invitedRole !==
+      "admin" &&
+    invitedRole !==
+      "trainer"
+  ) {
+    throw new Error(
+      "Invalid invited role"
+    );
+  }
+
+  /*
+  |--------------------------------------------------------------------------
+  | Validate server-generated partner code
+  |--------------------------------------------------------------------------
+  */
+
+  const safePartnerCode =
+    String(
+      partnerCode ||
+        ""
+    ).trim();
+
+  if (
+    !/^(ADM|TRN)[A-Z2-9]{7}$/.test(
+      safePartnerCode
+    )
+  ) {
+    throw new Error(
+      "Invalid partner code"
+    );
+  }
+
+  /*
+  |--------------------------------------------------------------------------
+  | Validate token hash
+  |--------------------------------------------------------------------------
+  */
+
+  const safeTokenHash =
+    String(
+      tokenHash ||
+        ""
+    ).trim();
+
+  if (
+    !/^[a-f0-9]{64}$/i.test(
+      safeTokenHash
+    )
+  ) {
+    throw new Error(
+      "Invalid token hash"
+    );
+  }
+
+  const normalizedEmail =
+    emailResult.value;
+
+  const normalizedInvitedBy =
+    normalizeEmail(
+      invitedByUserId
+    );
+
+  const normalizedParent =
+    normalizeEmail(
+      parentUserId
+    );
+
+  /*
+  |--------------------------------------------------------------------------
+  | Parameterized INSERT
+  |--------------------------------------------------------------------------
+  */
+
   const [result] =
     await pool.execute(
       `INSERT INTO app_user_invitations (
@@ -1318,31 +1610,30 @@ async function createPendingInvite({
          UTC_TIMESTAMP()
        )`,
       [
-        invitedEmail,
+        normalizedEmail,
 
-        firstName,
+        firstNameResult.value,
 
-        lastName,
+        lastNameResult.value,
 
-        phone,
+        phoneResult.value !==
+        ""
+          ? phoneResult.value
+          : null,
 
         secureHash(
-          invitedEmail
+          normalizedEmail
         ),
 
         invitedRole,
 
-        partnerCode,
+        safePartnerCode,
 
-        normalizeEmail(
-          invitedByUserId
-        ),
+        normalizedInvitedBy,
 
-        normalizeEmail(
-          parentUserId
-        ),
+        normalizedParent,
 
-        tokenHash,
+        safeTokenHash,
 
         expiresAt,
       ]
@@ -1362,6 +1653,20 @@ async function createPendingInvite({
 async function markInviteRevoked(
   invitationId
 ) {
+  const safeInvitationId =
+    Number(
+      invitationId
+    );
+
+  if (
+    !Number.isInteger(
+      safeInvitationId
+    ) ||
+    safeInvitationId <= 0
+  ) {
+    return;
+  }
+
   try {
     await pool.execute(
       `UPDATE app_user_invitations
@@ -1377,7 +1682,7 @@ async function markInviteRevoked(
 
        LIMIT 1`,
       [
-        invitationId,
+        safeInvitationId,
       ]
     );
   } catch (
@@ -1400,6 +1705,22 @@ async function markInviteRevoked(
 async function markInviteSent(
   invitationId
 ) {
+  const safeInvitationId =
+    Number(
+      invitationId
+    );
+
+  if (
+    !Number.isInteger(
+      safeInvitationId
+    ) ||
+    safeInvitationId <= 0
+  ) {
+    throw new Error(
+      "Invalid invitation id"
+    );
+  }
+
   await pool.execute(
     `UPDATE app_user_invitations
 
@@ -1414,7 +1735,7 @@ async function markInviteSent(
 
      LIMIT 1`,
     [
-      invitationId,
+      safeInvitationId,
     ]
   );
 }
@@ -1424,13 +1745,9 @@ async function markInviteSent(
 | Resend Email
 |--------------------------------------------------------------------------
 |
-| NOTE:
+| Destination email is validated again here because this helper can be used
+| by resend flows and can receive legacy database values.
 |
-| escapeHtml is imported from the centralized securityValidation helper and
-| re-exported below.
-|
-| Callers should escape user/stored text before passing it to the HTML email
-| template.
 |--------------------------------------------------------------------------
 */
 
@@ -1440,6 +1757,171 @@ async function sendResendTemplateEmail(
   templateId,
   variables
 ) {
+  /*
+  |--------------------------------------------------------------------------
+  | Destination Email Validation
+  |--------------------------------------------------------------------------
+  */
+
+  const emailResult =
+    validateEmailAddress(
+      toEmail,
+      "email"
+    );
+
+  if (
+    !emailResult.ok
+  ) {
+    return {
+      ok: false,
+
+      http_code: 400,
+
+      error:
+        emailResult.message,
+
+      data:
+        null,
+    };
+  }
+
+  const safeToEmail =
+    emailResult.value;
+
+  /*
+  |--------------------------------------------------------------------------
+  | Subject Validation
+  |--------------------------------------------------------------------------
+  |
+  | Prevent CRLF/header injection.
+  |--------------------------------------------------------------------------
+  */
+
+  const safeSubject =
+    typeof subject ===
+      "string"
+      ? subject.trim()
+      : "";
+
+  if (
+    safeSubject ===
+      "" ||
+    safeSubject.length >
+      200 ||
+    /[\r\n\x00]/.test(
+      safeSubject
+    )
+  ) {
+    return {
+      ok: false,
+
+      http_code: 400,
+
+      error:
+        "Invalid email subject",
+
+      data:
+        null,
+    };
+  }
+
+  /*
+  |--------------------------------------------------------------------------
+  | Template ID Validation
+  |--------------------------------------------------------------------------
+  */
+
+  const safeTemplateId =
+    typeof templateId ===
+      "string"
+      ? templateId.trim()
+      : "";
+
+  if (
+    safeTemplateId ===
+      "" ||
+    safeTemplateId.length >
+      200 ||
+    !/^[A-Za-z0-9_.-]+$/.test(
+      safeTemplateId
+    )
+  ) {
+    return {
+      ok: false,
+
+      http_code: 400,
+
+      error:
+        "Invalid email template",
+
+      data:
+        null,
+    };
+  }
+
+  /*
+  |--------------------------------------------------------------------------
+  | Template Variables Validation
+  |--------------------------------------------------------------------------
+  */
+
+  if (
+    !variables ||
+    typeof variables !==
+      "object" ||
+    Array.isArray(
+      variables
+    )
+  ) {
+    return {
+      ok: false,
+
+      http_code: 400,
+
+      error:
+        "Invalid email template variables",
+
+      data:
+        null,
+    };
+  }
+
+  /*
+  |--------------------------------------------------------------------------
+  | Partner Code Validation
+  |--------------------------------------------------------------------------
+  */
+
+  const templatePartnerCode =
+    String(
+      variables.PARTNER_CODE ||
+        ""
+    ).trim();
+
+  if (
+    !/^(ADM|TRN)[A-Z2-9]{7}$/.test(
+      templatePartnerCode
+    )
+  ) {
+    return {
+      ok: false,
+
+      http_code: 400,
+
+      error:
+        "Invalid email partner code",
+
+      data:
+        null,
+    };
+  }
+
+  /*
+  |--------------------------------------------------------------------------
+  | Resend API Configuration
+  |--------------------------------------------------------------------------
+  */
+
   if (
     !RESEND_API_KEY
   ) {
@@ -1466,24 +1948,25 @@ async function sendResendTemplateEmail(
             RESEND_FROM_EMAIL,
 
           to: [
-            toEmail,
+            safeToEmail,
           ],
 
-          subject,
+          subject:
+            safeSubject,
 
           reply_to:
             RESEND_REPLY_TO,
 
           template: {
             id:
-              templateId,
+              safeTemplateId,
 
             variables,
           },
 
           headers: {
             "X-Entity-Ref-ID":
-              `invite-${variables.PARTNER_CODE}`,
+              `invite-${templatePartnerCode}`,
           },
 
           tags: [
@@ -1504,6 +1987,9 @@ async function sendResendTemplateEmail(
                   variables
                     .INVITED_ROLE ||
                     ""
+                ).slice(
+                  0,
+                  50
                 ),
             },
 
@@ -1512,9 +1998,9 @@ async function sendResendTemplateEmail(
                 "template_id",
 
               value:
-                String(
-                  templateId ||
-                    "inline"
+                safeTemplateId.slice(
+                  0,
+                  100
                 ),
             },
           ],
@@ -1664,7 +2150,7 @@ module.exports = {
 
   /*
   |--------------------------------------------------------------------------
-  | Centralized HTML encoding
+  | Centralized HTML Encoding
   |--------------------------------------------------------------------------
   */
 
@@ -1716,6 +2202,1736 @@ module.exports = {
 
   sendResendTemplateEmail,
 };
+
+
+
+
+
+
+
+
+
+
+
+
+// "use strict";
+
+// /**
+//  * auth_common.js
+//  *
+//  * Shared helper module for Respyr invitation/auth flows.
+//  *
+//  * VAPT hardening:
+//  *  - Token-bound actor identity
+//  *  - DB role/status re-check
+//  *  - Parameterized SQL
+//  *  - Centralized human-name allowlist validation
+//  *  - HTML output encoding helper
+//  *  - HMAC-SHA256 hashing for sensitive audit values/tokens
+//  *  - No-store security headers
+//  */
+
+// const crypto = require("crypto");
+// const axios = require("axios");
+// const pool = require("../../../../config/db");
+
+// const {
+//   validateHumanName,
+//   escapeHtml,
+// } = require("../../../../utils/securityValidation");
+
+// /*
+// |--------------------------------------------------------------------------
+// | Configuration
+// |--------------------------------------------------------------------------
+// */
+
+// const APP_DEBUG =
+//   process.env.NODE_ENV !== "production";
+
+// const SECURITY_PEPPER =
+//   process.env.SECURITY_PEPPER ||
+//   process.env.JWT_SECRET ||
+//   "";
+
+// const INVITE_EXPIRY_HOURS = Math.max(
+//   1,
+//   parseInt(
+//     process.env.INVITE_EXPIRY_HOURS,
+//     10
+//   ) || 24
+// );
+
+// const RETURN_INVITE_LINK_FOR_TESTING =
+//   String(
+//     process.env.RETURN_INVITE_LINK_FOR_TESTING ||
+//       ""
+//   ).toLowerCase() === "true";
+
+// const FRONTEND_ACCEPT_INVITE_URL =
+//   process.env.FRONTEND_ACCEPT_INVITE_URL ||
+//   "https://api.rysflo.com/signup";
+
+// const RESEND_API_KEY =
+//   process.env.RESEND_API_KEY ||
+//   "";
+
+// const RESEND_FROM_EMAIL =
+//   process.env.RESEND_FROM_EMAIL ||
+//   "Respyr <invitation@respyr.ai>";
+
+// const RESEND_REPLY_TO =
+//   process.env.RESEND_REPLY_TO ||
+//   "respyr@respyr.ai";
+
+// const RESEND_INVITE_TEMPLATE_ID =
+//   process.env.RESEND_INVITE_TEMPLATE_ID ||
+//   "admin_trainer_invitation";
+
+// const EMAIL_MAX_LENGTH = 254;
+// const PHONE_MAX_LENGTH = 30;
+
+// const PARTNER_CODE_ALPHABET =
+//   "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+
+// const PARTNER_CODE_RANDOM_LEN = 7;
+
+// const PARTNER_CODE_MAX_ATTEMPTS = 30;
+
+// /*
+// |--------------------------------------------------------------------------
+// | HTTP / Response Helpers
+// |--------------------------------------------------------------------------
+// */
+
+// function applySecurityHeaders(res) {
+//   res.setHeader(
+//     "Cache-Control",
+//     "no-store, no-cache, must-revalidate, max-age=0"
+//   );
+
+//   res.setHeader(
+//     "Pragma",
+//     "no-cache"
+//   );
+
+//   res.setHeader(
+//     "X-Content-Type-Options",
+//     "nosniff"
+//   );
+
+//   res.setHeader(
+//     "X-Frame-Options",
+//     "DENY"
+//   );
+
+//   res.setHeader(
+//     "Referrer-Policy",
+//     "no-referrer"
+//   );
+// }
+
+// function sendJson(
+//   res,
+//   statusCode,
+//   payload
+// ) {
+//   return res
+//     .status(statusCode)
+//     .json(payload);
+// }
+
+// function ensurePostOrReject(
+//   req,
+//   res
+// ) {
+//   if (
+//     req.method !== "POST"
+//   ) {
+//     sendJson(
+//       res,
+//       405,
+//       {
+//         ok: false,
+//         message:
+//           "Method not allowed",
+//       }
+//     );
+
+//     return true;
+//   }
+
+//   return false;
+// }
+
+// function getJsonBody(req) {
+//   const body =
+//     req.body;
+
+//   if (
+//     !body ||
+//     typeof body !== "object" ||
+//     Array.isArray(body)
+//   ) {
+//     return {
+//       ok: false,
+//       status: 400,
+//       message:
+//         "Invalid JSON body",
+//     };
+//   }
+
+//   return {
+//     ok: true,
+//     body,
+//   };
+// }
+
+// /*
+// |--------------------------------------------------------------------------
+// | Server Configuration Validation
+// |--------------------------------------------------------------------------
+// */
+
+// function validateServerConfig() {
+//   const missing = [];
+
+//   if (
+//     !SECURITY_PEPPER
+//   ) {
+//     missing.push(
+//       "SECURITY_PEPPER"
+//     );
+//   }
+
+//   if (
+//     !RESEND_API_KEY
+//   ) {
+//     missing.push(
+//       "RESEND_API_KEY"
+//     );
+//   }
+
+//   if (
+//     !RESEND_INVITE_TEMPLATE_ID
+//   ) {
+//     missing.push(
+//       "RESEND_INVITE_TEMPLATE_ID"
+//     );
+//   }
+
+//   if (
+//     missing.length > 0
+//   ) {
+//     return {
+//       ok: false,
+
+//       status: 500,
+
+//       message:
+//         "Server configuration missing",
+
+//       missing:
+//         APP_DEBUG
+//           ? missing
+//           : [],
+//     };
+//   }
+
+//   return {
+//     ok: true,
+//   };
+// }
+
+// /*
+// |--------------------------------------------------------------------------
+// | Email Normalization
+// |--------------------------------------------------------------------------
+// */
+
+// function normalizeEmail(
+//   email
+// ) {
+//   return typeof email ===
+//     "string"
+//     ? email
+//         .trim()
+//         .toLowerCase()
+//     : "";
+// }
+
+// /*
+// |--------------------------------------------------------------------------
+// | Name Normalization
+// |--------------------------------------------------------------------------
+// |
+// | IMPORTANT:
+// |
+// | cleanName() only normalizes an already-existing value.
+// |
+// | It must NOT be used as security validation for new input.
+// |
+// | For request input use:
+// |
+// | validateHumanName()
+// |
+// |--------------------------------------------------------------------------
+// */
+
+// function cleanName(
+//   value
+// ) {
+//   if (
+//     value === null ||
+//     value === undefined
+//   ) {
+//     return "";
+//   }
+
+//   return String(value)
+//     .normalize("NFC")
+//     .trim()
+//     .replace(
+//       /\s+/g,
+//       " "
+//     );
+// }
+
+// /*
+// |--------------------------------------------------------------------------
+// | Phone Validation
+// |--------------------------------------------------------------------------
+// */
+
+// function cleanPhone(
+//   value
+// ) {
+//   const phone =
+//     value === null ||
+//     value === undefined
+//       ? ""
+//       : String(
+//           value
+//         ).trim();
+
+//   /*
+//   |--------------------------------------------------------------------------
+//   | Phone is optional
+//   |--------------------------------------------------------------------------
+//   */
+
+//   if (
+//     phone === ""
+//   ) {
+//     return {
+//       ok: true,
+//       value: "",
+//     };
+//   }
+
+//   /*
+//   |--------------------------------------------------------------------------
+//   | Allow:
+//   |
+//   | digits
+//   | +
+//   | -
+//   | spaces
+//   | ()
+//   |
+//   | Length: 6 - 30
+//   |--------------------------------------------------------------------------
+//   */
+
+//   if (
+//     !/^[0-9+\-\s()]{6,30}$/.test(
+//       phone
+//     )
+//   ) {
+//     return {
+//       ok: false,
+
+//       status: 400,
+
+//       message:
+//         "Invalid phone number format",
+//     };
+//   }
+
+//   return {
+//     ok: true,
+//     value: phone,
+//   };
+// }
+
+// /*
+// |--------------------------------------------------------------------------
+// | Secure Hash
+// |--------------------------------------------------------------------------
+// */
+
+// function secureHash(
+//   value
+// ) {
+//   return crypto
+//     .createHmac(
+//       "sha256",
+//       SECURITY_PEPPER
+//     )
+//     .update(
+//       String(value)
+//         .trim()
+//         .toLowerCase()
+//     )
+//     .digest("hex");
+// }
+
+// /*
+// |--------------------------------------------------------------------------
+// | Audit Log Hash
+// |--------------------------------------------------------------------------
+// */
+
+// function authLogHash(
+//   value
+// ) {
+//   if (
+//     value === null ||
+//     value === undefined
+//   ) {
+//     return null;
+//   }
+
+//   return crypto
+//     .createHmac(
+//       "sha256",
+//       SECURITY_PEPPER
+//     )
+//     .update(
+//       String(value)
+//         .trim()
+//         .toLowerCase()
+//     )
+//     .digest("hex");
+// }
+
+// /*
+// |--------------------------------------------------------------------------
+// | Client IP
+// |--------------------------------------------------------------------------
+// */
+
+// function getClientIp(
+//   req
+// ) {
+//   const ip =
+//     (
+//       typeof req.ip ===
+//         "string" &&
+//       req.ip
+//     ) ||
+//     req.socket
+//       ?.remoteAddress ||
+//     req.connection
+//       ?.remoteAddress ||
+//     "0.0.0.0";
+
+//   return String(ip)
+//     .slice(
+//       0,
+//       64
+//     );
+// }
+
+// /*
+// |--------------------------------------------------------------------------
+// | User Agent
+// |--------------------------------------------------------------------------
+// */
+
+// function getUserAgent(
+//   req
+// ) {
+//   const ua =
+//     (
+//       typeof req.get ===
+//         "function" &&
+//       req.get(
+//         "user-agent"
+//       )
+//     ) ||
+//     req.headers?.[
+//       "user-agent"
+//     ] ||
+//     "";
+
+//   return String(ua)
+//     .slice(
+//       0,
+//       500
+//     );
+// }
+
+// /*
+// |--------------------------------------------------------------------------
+// | UTC MySQL Date
+// |--------------------------------------------------------------------------
+// */
+
+// function toUtcMysqlDateTime(
+//   date
+// ) {
+//   const pad =
+//     (number) =>
+//       String(number)
+//         .padStart(
+//           2,
+//           "0"
+//         );
+
+//   return (
+//     `${date.getUTCFullYear()}-` +
+//     `${pad(
+//       date.getUTCMonth() +
+//         1
+//     )}-` +
+//     `${pad(
+//       date.getUTCDate()
+//     )} ` +
+//     `${pad(
+//       date.getUTCHours()
+//     )}:` +
+//     `${pad(
+//       date.getUTCMinutes()
+//     )}:` +
+//     `${pad(
+//       date.getUTCSeconds()
+//     )}`
+//   );
+// }
+
+// /*
+// |--------------------------------------------------------------------------
+// | Audit Log
+// |--------------------------------------------------------------------------
+// */
+
+// async function writeAuthLogSafe(
+//   req,
+//   {
+//     eventType,
+//     userId,
+//     role,
+//     partnerCode,
+//     identifier,
+//     success,
+//     failureReason,
+//   }
+// ) {
+//   try {
+//     const ipHash =
+//       authLogHash(
+//         getClientIp(req)
+//       );
+
+//     const userAgentHash =
+//       authLogHash(
+//         getUserAgent(req)
+//       );
+
+//     const identifierHash =
+//       identifier !== null &&
+//       identifier !== undefined
+//         ? authLogHash(
+//             identifier
+//           )
+//         : null;
+
+//     const truncatedEvent =
+//       String(
+//         eventType ||
+//           ""
+//       ).slice(
+//         0,
+//         60
+//       );
+
+//     const truncatedReason =
+//       failureReason !== null &&
+//       failureReason !==
+//         undefined
+//         ? String(
+//             failureReason
+//           ).slice(
+//             0,
+//             255
+//           )
+//         : null;
+
+//     await pool.execute(
+//       `INSERT INTO app_auth_logs (
+//          event_type,
+//          user_id,
+//          role,
+//          partner_code,
+//          identifier_hash,
+//          ip_hash,
+//          user_agent_hash,
+//          session_id_hash,
+//          success,
+//          failure_reason
+//        )
+//        VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`,
+//       [
+//         truncatedEvent,
+
+//         userId ??
+//           null,
+
+//         role ??
+//           null,
+
+//         partnerCode ??
+//           null,
+
+//         identifierHash,
+
+//         ipHash,
+
+//         userAgentHash,
+
+//         success
+//           ? 1
+//           : 0,
+
+//         truncatedReason,
+//       ]
+//     );
+//   } catch (
+//     error
+//   ) {
+//     console.error(
+//       "AUTH_LOG_WRITE_FAILED:",
+//       error?.code ||
+//         error?.message
+//     );
+//   }
+// }
+
+// /*
+// |--------------------------------------------------------------------------
+// | Actor Resolution
+// |--------------------------------------------------------------------------
+// |
+// | Actor is derived from the verified JWT, then re-checked against DB.
+// |--------------------------------------------------------------------------
+// */
+
+// async function resolveActorFromToken(
+//   req,
+//   requiredRole = null
+// ) {
+//   const payload =
+//     req.user ||
+//     {};
+
+//   const dieticianId =
+//     String(
+//       payload.sub ||
+//         payload.dietician_id ||
+//         ""
+//     ).trim();
+
+//   const tokenEmail =
+//     normalizeEmail(
+//       payload.email ||
+//         payload.user_id ||
+//         payload?.dietician
+//           ?.email ||
+//         ""
+//     );
+
+//   if (
+//     (
+//       !dieticianId ||
+//       dieticianId.length >
+//         64
+//     ) &&
+//     tokenEmail === ""
+//   ) {
+//     return {
+//       error: {
+//         status: 401,
+
+//         body: {
+//           ok: false,
+
+//           message:
+//             "Invalid token user",
+//         },
+//       },
+//     };
+//   }
+
+//   let rows;
+
+//   /*
+//   |--------------------------------------------------------------------------
+//   | Prefer dietician_id
+//   |--------------------------------------------------------------------------
+//   */
+
+//   if (
+//     dieticianId
+//   ) {
+//     const [result] =
+//       await pool.execute(
+//         `SELECT
+//            td.id,
+//            td.dietician_id,
+//            td.email,
+
+//            aur.user_id,
+//            aur.role,
+//            aur.partner_code,
+//            aur.parent_user_id,
+//            aur.status
+
+//          FROM table_dietician td
+
+//          INNER JOIN app_user_roles aur
+//            ON LOWER(aur.user_id) =
+//               LOWER(td.email)
+
+//          WHERE td.dietician_id = ?
+
+//          LIMIT 1`,
+//         [
+//           dieticianId,
+//         ]
+//       );
+
+//     rows =
+//       result;
+//   } else {
+//     const [result] =
+//       await pool.execute(
+//         `SELECT
+//            td.id,
+//            td.dietician_id,
+//            td.email,
+
+//            aur.user_id,
+//            aur.role,
+//            aur.partner_code,
+//            aur.parent_user_id,
+//            aur.status
+
+//          FROM table_dietician td
+
+//          INNER JOIN app_user_roles aur
+//            ON LOWER(aur.user_id) =
+//               LOWER(td.email)
+
+//          WHERE LOWER(td.email) =
+//                LOWER(?)
+
+//          LIMIT 1`,
+//         [
+//           tokenEmail,
+//         ]
+//       );
+
+//     rows =
+//       result;
+//   }
+
+//   const actor =
+//     rows?.[0] ||
+//     null;
+
+//   /*
+//   |--------------------------------------------------------------------------
+//   | Actor not found
+//   |--------------------------------------------------------------------------
+//   */
+
+//   if (
+//     !actor
+//   ) {
+//     return {
+//       error: {
+//         status: 401,
+
+//         body: {
+//           ok: false,
+
+//           message:
+//             "Token user not found",
+//         },
+//       },
+//     };
+//   }
+
+//   /*
+//   |--------------------------------------------------------------------------
+//   | Active account required
+//   |--------------------------------------------------------------------------
+//   */
+
+//   if (
+//     String(
+//       actor.status
+//     ) !==
+//     "active"
+//   ) {
+//     return {
+//       error: {
+//         status: 403,
+
+//         body: {
+//           ok: false,
+
+//           message:
+//             "Account is not active",
+//         },
+//       },
+//     };
+//   }
+
+//   /*
+//   |--------------------------------------------------------------------------
+//   | Optional role enforcement
+//   |--------------------------------------------------------------------------
+//   */
+
+//   if (
+//     requiredRole !==
+//       null &&
+//     String(
+//       actor.role
+//     ) !==
+//       requiredRole
+//   ) {
+//     return {
+//       error: {
+//         status: 403,
+
+//         body: {
+//           ok: false,
+
+//           message:
+//             "You are not allowed to perform this action",
+//         },
+//       },
+//     };
+//   }
+
+//   return {
+//     actor,
+
+//     actorEmail:
+//       normalizeEmail(
+//         actor.user_id ||
+//           actor.email
+//       ),
+//   };
+// }
+
+// /*
+// |--------------------------------------------------------------------------
+// | actor_user_id Cross-check
+// |--------------------------------------------------------------------------
+// */
+
+// function assertActorUserIdMatches(
+//   body,
+//   actorEmail
+// ) {
+//   const bodyActorUserId =
+//     normalizeEmail(
+//       body &&
+//       typeof body ===
+//         "object"
+//         ? body
+//             .actor_user_id
+//         : ""
+//     );
+
+//   if (
+//     bodyActorUserId !==
+//       "" &&
+//     bodyActorUserId !==
+//       actorEmail
+//   ) {
+//     return {
+//       ok: false,
+
+//       status: 403,
+
+//       message:
+//         "actor_user_id does not match the authenticated user",
+//     };
+//   }
+
+//   return {
+//     ok: true,
+//   };
+// }
+
+// /*
+// |--------------------------------------------------------------------------
+// | Invite Input Validation
+// |--------------------------------------------------------------------------
+// |
+// | THIS IS THE IMPORTANT HTML-INJECTION FIX.
+// |
+// | The previous implementation:
+// |
+// | 1. called cleanName()
+// | 2. checked only ASCII control characters
+// |
+// | Therefore:
+// |
+// | <h1>HTML INJECTION</h1>
+// | {{7*7}}
+// |
+// | were accepted.
+// |
+// | The new implementation uses validateHumanName().
+// |--------------------------------------------------------------------------
+// */
+
+// function validateInviteInput(
+//   body
+// ) {
+//   if (
+//     !body ||
+//     typeof body !==
+//       "object" ||
+//     Array.isArray(body)
+//   ) {
+//     return {
+//       ok: false,
+
+//       status: 400,
+
+//       message:
+//         "Invalid request body",
+//     };
+//   }
+
+//   /*
+//   |--------------------------------------------------------------------------
+//   | First name
+//   |--------------------------------------------------------------------------
+//   */
+
+//   const firstNameResult =
+//     validateHumanName(
+//       body.first_name,
+//       "first_name"
+//     );
+
+//   if (
+//     !firstNameResult.ok
+//   ) {
+//     return {
+//       ok: false,
+
+//       status: 400,
+
+//       message:
+//         firstNameResult.message,
+//     };
+//   }
+
+//   /*
+//   |--------------------------------------------------------------------------
+//   | Last name
+//   |--------------------------------------------------------------------------
+//   */
+
+//   const lastNameResult =
+//     validateHumanName(
+//       body.last_name,
+//       "last_name"
+//     );
+
+//   if (
+//     !lastNameResult.ok
+//   ) {
+//     return {
+//       ok: false,
+
+//       status: 400,
+
+//       message:
+//         lastNameResult.message,
+//     };
+//   }
+
+//   const firstName =
+//     firstNameResult.value;
+
+//   const lastName =
+//     lastNameResult.value;
+
+//   /*
+//   |--------------------------------------------------------------------------
+//   | Email
+//   |--------------------------------------------------------------------------
+//   */
+
+//   const email =
+//     normalizeEmail(
+//       body.email
+//     );
+
+//   if (
+//     email === "" ||
+//     email.length >
+//       EMAIL_MAX_LENGTH
+//   ) {
+//     return {
+//       ok: false,
+
+//       status: 400,
+
+//       message:
+//         "Valid email is required",
+//     };
+//   }
+
+//   const emailRegex =
+//     /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+//   if (
+//     !emailRegex.test(
+//       email
+//     )
+//   ) {
+//     return {
+//       ok: false,
+
+//       status: 400,
+
+//       message:
+//         "Valid email is required",
+//     };
+//   }
+
+//   /*
+//   |--------------------------------------------------------------------------
+//   | Phone
+//   |--------------------------------------------------------------------------
+//   */
+
+//   const phoneResult =
+//     cleanPhone(
+//       body.phone
+//     );
+
+//   if (
+//     !phoneResult.ok
+//   ) {
+//     return phoneResult;
+//   }
+
+//   return {
+//     ok: true,
+
+//     value: {
+//       first_name:
+//         firstName,
+
+//       last_name:
+//         lastName,
+
+//       email,
+
+//       phone:
+//         phoneResult.value,
+//     },
+//   };
+// }
+
+// /*
+// |--------------------------------------------------------------------------
+// | Ensure Invitation Can Be Created
+// |--------------------------------------------------------------------------
+// */
+
+// async function ensureInviteCanBeCreated(
+//   email
+// ) {
+//   const normalized =
+//     normalizeEmail(
+//       email
+//     );
+
+//   /*
+//   |--------------------------------------------------------------------------
+//   | Expire old pending invitations
+//   |--------------------------------------------------------------------------
+//   */
+
+//   await pool.execute(
+//     `UPDATE app_user_invitations
+
+//      SET
+//        status = 'expired',
+//        updated_at = UTC_TIMESTAMP()
+
+//      WHERE status = 'pending'
+
+//        AND expires_at <=
+//            UTC_TIMESTAMP()
+
+//        AND LOWER(invited_email) =
+//            LOWER(?)`,
+//     [
+//       normalized,
+//     ]
+//   );
+
+//   /*
+//   |--------------------------------------------------------------------------
+//   | Existing registered user
+//   |--------------------------------------------------------------------------
+//   */
+
+//   const [roleRows] =
+//     await pool.execute(
+//       `SELECT id
+
+//        FROM app_user_roles
+
+//        WHERE LOWER(user_id) =
+//              LOWER(?)
+
+//        LIMIT 1`,
+//       [
+//         normalized,
+//       ]
+//     );
+
+//   if (
+//     roleRows.length >
+//     0
+//   ) {
+//     return {
+//       ok: false,
+
+//       status: 409,
+
+//       message:
+//         "This email is already registered",
+//     };
+//   }
+
+//   /*
+//   |--------------------------------------------------------------------------
+//   | Existing pending invitation
+//   |--------------------------------------------------------------------------
+//   */
+
+//   const [inviteRows] =
+//     await pool.execute(
+//       `SELECT id
+
+//        FROM app_user_invitations
+
+//        WHERE LOWER(invited_email) =
+//              LOWER(?)
+
+//          AND status =
+//              'pending'
+
+//          AND expires_at >
+//              UTC_TIMESTAMP()
+
+//        LIMIT 1`,
+//       [
+//         normalized,
+//       ]
+//     );
+
+//   if (
+//     inviteRows.length >
+//     0
+//   ) {
+//     return {
+//       ok: false,
+
+//       status: 409,
+
+//       message:
+//         "This email already has a pending invitation",
+//     };
+//   }
+
+//   return {
+//     ok: true,
+//   };
+// }
+
+// /*
+// |--------------------------------------------------------------------------
+// | Random Partner Code
+// |--------------------------------------------------------------------------
+// */
+
+// function generateRandomCodePart(
+//   length
+// ) {
+//   let code = "";
+
+//   for (
+//     let i = 0;
+//     i < length;
+//     i++
+//   ) {
+//     code +=
+//       PARTNER_CODE_ALPHABET[
+//         crypto.randomInt(
+//           0,
+//           PARTNER_CODE_ALPHABET.length
+//         )
+//       ];
+//   }
+
+//   return code;
+// }
+
+// /*
+// |--------------------------------------------------------------------------
+// | Generate Unique Partner Code
+// |--------------------------------------------------------------------------
+// */
+
+// async function generateUniquePartnerCode(
+//   role
+// ) {
+//   const prefix =
+//     role === "admin"
+//       ? "ADM"
+//       : "TRN";
+
+//   for (
+//     let attempt = 0;
+//     attempt <
+//       PARTNER_CODE_MAX_ATTEMPTS;
+//     attempt++
+//   ) {
+//     const candidate =
+//       prefix +
+//       generateRandomCodePart(
+//         PARTNER_CODE_RANDOM_LEN
+//       );
+
+//     const [hits] =
+//       await pool.execute(
+//         `SELECT 1 AS hit
+
+//          FROM app_user_roles
+
+//          WHERE UPPER(partner_code) =
+//                UPPER(?)
+
+//          UNION ALL
+
+//          SELECT 1 AS hit
+
+//          FROM app_user_invitations
+
+//          WHERE UPPER(partner_code) =
+//                UPPER(?)
+
+//          UNION ALL
+
+//          SELECT 1 AS hit
+
+//          FROM table_dietician
+
+//          WHERE UPPER(dietician_id) =
+//                UPPER(?)
+
+//          LIMIT 1`,
+//         [
+//           candidate,
+//           candidate,
+//           candidate,
+//         ]
+//       );
+
+//     if (
+//       hits.length ===
+//       0
+//     ) {
+//       return candidate;
+//     }
+//   }
+
+//   throw new Error(
+//     "Could not generate unique partner code"
+//   );
+// }
+
+// /*
+// |--------------------------------------------------------------------------
+// | Create Pending Invitation
+// |--------------------------------------------------------------------------
+// */
+
+// async function createPendingInvite({
+//   invitedEmail,
+//   firstName,
+//   lastName,
+//   phone,
+//   invitedRole,
+//   partnerCode,
+//   invitedByUserId,
+//   parentUserId,
+//   tokenHash,
+//   expiresAt,
+// }) {
+//   const [result] =
+//     await pool.execute(
+//       `INSERT INTO app_user_invitations (
+//          invited_email,
+//          invited_first_name,
+//          invited_last_name,
+//          invited_phone,
+//          invited_email_hash,
+//          invited_role,
+//          partner_code,
+//          invited_by_user_id,
+//          parent_user_id,
+//          token_hash,
+//          status,
+//          expires_at,
+//          sent_at,
+//          created_at,
+//          updated_at
+//        )
+
+//        VALUES (
+//          ?,
+//          ?,
+//          ?,
+//          ?,
+//          ?,
+//          ?,
+//          ?,
+//          ?,
+//          ?,
+//          ?,
+//          'pending',
+//          ?,
+//          NULL,
+//          UTC_TIMESTAMP(),
+//          UTC_TIMESTAMP()
+//        )`,
+//       [
+//         invitedEmail,
+
+//         firstName,
+
+//         lastName,
+
+//         phone,
+
+//         secureHash(
+//           invitedEmail
+//         ),
+
+//         invitedRole,
+
+//         partnerCode,
+
+//         normalizeEmail(
+//           invitedByUserId
+//         ),
+
+//         normalizeEmail(
+//           parentUserId
+//         ),
+
+//         tokenHash,
+
+//         expiresAt,
+//       ]
+//     );
+
+//   return Number(
+//     result.insertId
+//   );
+// }
+
+// /*
+// |--------------------------------------------------------------------------
+// | Revoke Invitation
+// |--------------------------------------------------------------------------
+// */
+
+// async function markInviteRevoked(
+//   invitationId
+// ) {
+//   try {
+//     await pool.execute(
+//       `UPDATE app_user_invitations
+
+//        SET
+//          status =
+//            'revoked',
+
+//          updated_at =
+//            UTC_TIMESTAMP()
+
+//        WHERE id = ?
+
+//        LIMIT 1`,
+//       [
+//         invitationId,
+//       ]
+//     );
+//   } catch (
+//     error
+//   ) {
+//     console.error(
+//       "MARK_INVITE_REVOKED_FAILED:",
+//       error?.code ||
+//         error?.message
+//     );
+//   }
+// }
+
+// /*
+// |--------------------------------------------------------------------------
+// | Mark Invitation Sent
+// |--------------------------------------------------------------------------
+// */
+
+// async function markInviteSent(
+//   invitationId
+// ) {
+//   await pool.execute(
+//     `UPDATE app_user_invitations
+
+//      SET
+//        sent_at =
+//          UTC_TIMESTAMP(),
+
+//        updated_at =
+//          UTC_TIMESTAMP()
+
+//      WHERE id = ?
+
+//      LIMIT 1`,
+//     [
+//       invitationId,
+//     ]
+//   );
+// }
+
+// /*
+// |--------------------------------------------------------------------------
+// | Resend Email
+// |--------------------------------------------------------------------------
+// |
+// | NOTE:
+// |
+// | escapeHtml is imported from the centralized securityValidation helper and
+// | re-exported below.
+// |
+// | Callers should escape user/stored text before passing it to the HTML email
+// | template.
+// |--------------------------------------------------------------------------
+// */
+
+// async function sendResendTemplateEmail(
+//   toEmail,
+//   subject,
+//   templateId,
+//   variables
+// ) {
+//   if (
+//     !RESEND_API_KEY
+//   ) {
+//     return {
+//       ok: false,
+
+//       http_code: 0,
+
+//       error:
+//         "RESEND_API_KEY not configured",
+
+//       data:
+//         null,
+//     };
+//   }
+
+//   try {
+//     const response =
+//       await axios.post(
+//         "https://api.resend.com/emails",
+
+//         {
+//           from:
+//             RESEND_FROM_EMAIL,
+
+//           to: [
+//             toEmail,
+//           ],
+
+//           subject,
+
+//           reply_to:
+//             RESEND_REPLY_TO,
+
+//           template: {
+//             id:
+//               templateId,
+
+//             variables,
+//           },
+
+//           headers: {
+//             "X-Entity-Ref-ID":
+//               `invite-${variables.PARTNER_CODE}`,
+//           },
+
+//           tags: [
+//             {
+//               name:
+//                 "kind",
+
+//               value:
+//                 "invite",
+//             },
+
+//             {
+//               name:
+//                 "invited_role",
+
+//               value:
+//                 String(
+//                   variables
+//                     .INVITED_ROLE ||
+//                     ""
+//                 ),
+//             },
+
+//             {
+//               name:
+//                 "template_id",
+
+//               value:
+//                 String(
+//                   templateId ||
+//                     "inline"
+//                 ),
+//             },
+//           ],
+//         },
+
+//         {
+//           timeout:
+//             20_000,
+
+//           headers: {
+//             Authorization:
+//               `Bearer ${RESEND_API_KEY}`,
+
+//             "Content-Type":
+//               "application/json",
+//           },
+
+//           validateStatus:
+//             () => true,
+//         }
+//       );
+
+//     const httpCode =
+//       response.status;
+
+//     /*
+//     |--------------------------------------------------------------------------
+//     | Resend rejected request
+//     |--------------------------------------------------------------------------
+//     */
+
+//     if (
+//       httpCode < 200 ||
+//       httpCode >= 300
+//     ) {
+//       return {
+//         ok: false,
+
+//         http_code:
+//           httpCode,
+
+//         error:
+//           response.data
+//             ?.message ||
+//           "Resend API failed",
+
+//         data:
+//           response.data ??
+//           null,
+//       };
+//     }
+
+//     return {
+//       ok: true,
+
+//       http_code:
+//         httpCode,
+
+//       error:
+//         null,
+
+//       data:
+//         response.data,
+//     };
+//   } catch (
+//     error
+//   ) {
+//     return {
+//       ok: false,
+
+//       http_code:
+//         0,
+
+//       error:
+//         error?.code ||
+//         error?.message ||
+//         "Resend request failed",
+
+//       data:
+//         null,
+//     };
+//   }
+// }
+
+// /*
+// |--------------------------------------------------------------------------
+// | Exports
+// |--------------------------------------------------------------------------
+// */
+
+// module.exports = {
+//   /*
+//   |--------------------------------------------------------------------------
+//   | Config
+//   |--------------------------------------------------------------------------
+//   */
+
+//   APP_DEBUG,
+
+//   SECURITY_PEPPER,
+
+//   INVITE_EXPIRY_HOURS,
+
+//   RETURN_INVITE_LINK_FOR_TESTING,
+
+//   FRONTEND_ACCEPT_INVITE_URL,
+
+//   RESEND_INVITE_TEMPLATE_ID,
+
+//   /*
+//   |--------------------------------------------------------------------------
+//   | HTTP
+//   |--------------------------------------------------------------------------
+//   */
+
+//   applySecurityHeaders,
+
+//   sendJson,
+
+//   ensurePostOrReject,
+
+//   getJsonBody,
+
+//   validateServerConfig,
+
+//   /*
+//   |--------------------------------------------------------------------------
+//   | Validation / Sanitization / Hashing
+//   |--------------------------------------------------------------------------
+//   */
+
+//   normalizeEmail,
+
+//   cleanName,
+
+//   cleanPhone,
+
+//   secureHash,
+
+//   authLogHash,
+
+//   getClientIp,
+
+//   getUserAgent,
+
+//   toUtcMysqlDateTime,
+
+//   /*
+//   |--------------------------------------------------------------------------
+//   | Centralized HTML encoding
+//   |--------------------------------------------------------------------------
+//   */
+
+//   escapeHtml,
+
+//   /*
+//   |--------------------------------------------------------------------------
+//   | Audit
+//   |--------------------------------------------------------------------------
+//   */
+
+//   writeAuthLogSafe,
+
+//   /*
+//   |--------------------------------------------------------------------------
+//   | Authentication / Authorization
+//   |--------------------------------------------------------------------------
+//   */
+
+//   resolveActorFromToken,
+
+//   assertActorUserIdMatches,
+
+//   /*
+//   |--------------------------------------------------------------------------
+//   | Invitation
+//   |--------------------------------------------------------------------------
+//   */
+
+//   validateInviteInput,
+
+//   ensureInviteCanBeCreated,
+
+//   generateRandomCodePart,
+
+//   generateUniquePartnerCode,
+
+//   createPendingInvite,
+
+//   markInviteRevoked,
+
+//   markInviteSent,
+
+//   /*
+//   |--------------------------------------------------------------------------
+//   | Email
+//   |--------------------------------------------------------------------------
+//   */
+
+//   sendResendTemplateEmail,
+// };
 
 
 
