@@ -340,6 +340,10 @@ const {
 } = require("../controllers/dietitian/api/web/store_weekly_food_json_suggestion");
 
 const {
+  storeWeeklyFoodJsonSuggestionNewtest,
+} = require("../controllers/dietitian/api/web/store_weekly_food_json_suggestion_newtest");
+
+const {
   getLatest72hrTests,
 } = require("../controllers/dietitian/api/web/get_latest_72hr_tests");
 
@@ -966,6 +970,16 @@ router.post(
   serviceApiRateLimiter,
   serviceAuthMiddleware,
   storeWeeklyFoodJsonSuggestion
+);
+
+// Same contract as the route above, writing to weekly_food_json_suggestions_newtest
+// instead of weekly_food_json_suggestions. Same service-key auth, rate limit,
+// key scoping and table_clients ownership gate.
+router.post(
+  "/dietitian/api/web/store_weekly_food_json_suggestion_newtest",
+  serviceApiRateLimiter,
+  serviceAuthMiddleware,
+  storeWeeklyFoodJsonSuggestionNewtest
 );
 
 // The read side of the same pipeline: the generator pulls the last 72h of tests
