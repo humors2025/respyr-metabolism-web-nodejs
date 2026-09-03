@@ -33,7 +33,8 @@
  *    getSelfReadingsByEmail() lookup: their OWN test data, which is deliberately
  *    excluded from total_clients / total_tests so nothing is double counted.
  *  - Network codes = member codes ∪ trainer codes; clients are listed for those.
- *  - Client rows carry MASKED profile_name and email, masked owner email, latest
+ *  - Client rows carry MASKED profile_name and email, masked owner email, the
+ *    owning trainer's name + code (null when owned directly by an admin), latest
  *    test date + metabolism score, and a per-client distinct-day test count.
  *  - period_overview: a "reading" = 1 per profile per day (the same
  *    COUNT(DISTINCT profile_id, DATE(date_time)) convention as total_tests).
@@ -1139,10 +1140,19 @@ async function fetchClientsForCodes(codes, escapedSearch, limit, offset, exclude
   return rows;
 }
 
-/** Port of PHP formatClientRows(): MASKED client rows. */
-function formatClientRows(rows) {
+/**
+ * Port of PHP formatClientRows(): MASKED client rows.
+ *
+ * `trainerMap` : Map<UPPER(partner_code), { partner_code, name }> built from the
+ * group's child trainers (app_user_roles.role = 'trainer'). When a client's
+ * owner (tc.dietician_id) is one of those trainers, the row carries the
+ * trainer's name and code in `trainer`. When the client is owned directly by a
+ * group admin (no trainer in between), `trainer` fields are null.
+ */
+function formatClientRows(rows, trainerMap = new Map()) {
   return rows.map((row) => {
     const score = scoreValue(row.latest_score);
+    const trainer = trainerMap.get(normalizeCode(row.dietician_id)) ?? null;
 
     return {
       profile_id: row.profile_id,
@@ -1168,6 +1178,12 @@ function formatClientRows(rows) {
           row.owner_email !== null && row.owner_email !== undefined
             ? maskEmail(normalizeEmail(row.owner_email))
             : null,
+      },
+
+      // trainer who owns this client (null when owned directly by an admin)
+      trainer: {
+        partner_code: trainer ? trainer.partner_code : null,
+        name: trainer ? trainer.name : null,
       },
 
       total_tests: toInt(row.total_tests),
@@ -1451,6 +1467,15 @@ const getGroupDetails = async (req, res) => {
 
     const trainers = [...adminEntries, ...childTrainers];
 
+    // UPPER(partner_code) -> { partner_code, name } for every child trainer in
+    // the group (full list, not the paginated page) so each client row can name
+    // the trainer that owns it.
+    const trainerMap = new Map();
+    for (const t of childTrainers) {
+      const code = normalizeCode(t.partner_code);
+      if (code !== "") trainerMap.set(code, { partner_code: t.partner_code, name: t.name });
+    }
+
     // ── 3b. Self readings (each provider's OWN test data) ────────────────────
     // one lookup for every provider email, then attached to both lists.
     const providerEmails = trainers
@@ -1673,7 +1698,7 @@ const getGroupDetails = async (req, res) => {
         has_more: offset + limit < totalClients,
       },
 
-      clients: formatClientRows(clientRows),
+      clients: formatClientRows(clientRows, trainerMap),
     });
   } catch (err) {
     console.error("GET_GROUP_DETAILS_ERROR:", {
