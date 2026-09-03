@@ -22,6 +22,10 @@ const normalizeDieticianId = (value) => {
   return String(value || "").trim().toUpperCase();
 };
 
+const normalizeEmail = (value) => {
+  return String(value || "").trim().toLowerCase();
+};
+
 const parseBodyIfNeeded = (req) => {
   if (typeof req.body === "string") {
     try {
@@ -142,8 +146,15 @@ const getProfileImageUrl = (row, baseUrl) => {
   return signProfileImageUrl(baseUrl, row.dietician_id, row.profile_id);
 };
 
-const formatClientRows = (rows, selectedDate, baseUrl) => {
+const formatClientRows = (rows, selectedDate, baseUrl, dieticianEmail) => {
+  const ownerEmail = normalizeEmail(dieticianEmail);
+
   return rows.map((row) => {
+    // "self" = the trainer/dietitian invited themselves as a client
+    // (client email matches the owning dietitian's login email).
+    const clientEmail = normalizeEmail(row.email);
+    const isSelf = ownerEmail !== "" && clientEmail === ownerEmail;
+
     const rawScore = row.metabolism_score;
 
     const score =
@@ -164,6 +175,8 @@ const formatClientRows = (rows, selectedDate, baseUrl) => {
       dietician_id: normalizeDieticianId(row.dietician_id),
       profile_id: row.profile_id,
       client_name: row.client_name,
+      is_self: isSelf,
+      client_type: isSelf ? "self" : "client",
       phone_no: row.phone_no,
       email: row.email,
       dob: row.dob,
@@ -305,6 +318,20 @@ exports.get_clients_data_total_missed_test = async (req, res) => {
     const safeLimit = Number.isInteger(limit) && limit > 0 ? limit : PAGE_LIMIT;
     const safeOffset =
       Number.isInteger(offset) && offset >= 0 ? offset : 0;
+
+    debugStep = "dietician_email_lookup";
+
+    const [dieticianRows] = await pool.execute(
+      `
+        SELECT email
+        FROM table_dietician
+        WHERE UPPER(TRIM(dietician_id)) = ?
+        LIMIT 1
+      `,
+      [dieticianId]
+    );
+
+    const dieticianEmail = dieticianRows[0]?.email ?? null;
 
     debugStep = "summary_query_build";
 
@@ -489,7 +516,12 @@ exports.get_clients_data_total_missed_test = async (req, res) => {
         tested_total: Number(summary.tested_total ?? 0),
         missed_total: Number(summary.missed_total ?? 0),
       },
-      clients: formatClientRows(rows, selectedDate, buildPublicBaseUrl(req)),
+      clients: formatClientRows(
+        rows,
+        selectedDate,
+        buildPublicBaseUrl(req),
+        dieticianEmail
+      ),
     });
   } catch (error) {
     const safeLog = {

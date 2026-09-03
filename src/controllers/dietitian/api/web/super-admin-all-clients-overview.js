@@ -808,10 +808,19 @@ function formatClientRows(rows, selectedDate) {
     const maskedEmail = maskEmail(row.email);
     const maskedPhone = maskPhone(row.phone_no);
 
+    // "self" = the associated trainer/dietitian invited themselves as a client
+    // (raw client email matches the raw email of the dietitian who owns the
+    // profile). Compared on raw values before masking; only the flag is returned.
+    const clientEmail = normalizeEmail(row.email);
+    const ownerEmail = normalizeEmail(row.dietitian_email);
+    const isSelf = ownerEmail !== "" && clientEmail === ownerEmail;
+
     return {
       name: maskedName,
       email: maskedEmail,
       phone_no: maskedPhone,
+      is_self: isSelf,
+      client_type: isSelf ? "self" : "client",
 
       profile_id: row.profile_id,
       dietitian_id: row.dietician_id,
@@ -898,6 +907,8 @@ function formatClientRows(rows, selectedDate) {
         profile_id: row.profile_id,
         name: maskedName,
         email: maskedEmail,
+        is_self: isSelf,
+        client_type: isSelf ? "self" : "client",
         phone_no: maskedPhone,
         dob: "hidden",
         age: "hidden",
