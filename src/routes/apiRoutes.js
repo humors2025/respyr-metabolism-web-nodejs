@@ -168,6 +168,10 @@ const {
   superAdminOverview,
 } = require("../controllers/dietitian/api/web/super-admin-overview");
 
+const {
+  auditLogs,
+} = require("../controllers/dietitian/api/web/audit-logs");
+
 
 const {
   superAdminAllClientsOverview,
@@ -768,6 +772,14 @@ router.post(
   "/dietitian/api/web/super-admin-overview",
   authMiddleware,
   superAdminOverview
+);
+
+// Audit-log dashboard. super_admin only; the controller re-checks role/status
+// in the DB and enforces the AUDIT_LOG_ALLOWED_EMAILS allowlist.
+router.get(
+  "/dietitian/api/web/audit-logs",
+  authMiddleware,
+  auditLogs
 );
 
 
