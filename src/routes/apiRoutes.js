@@ -348,6 +348,33 @@ const {
   storeWeeklyFoodJsonSuggestionNewtest,
 } = require("../controllers/dietitian/api/web/store_weekly_food_json_suggestion_newtest");
 
+// weekly_food_json_suggestions_newtest — clones of every endpoint that touches
+// weekly_food_json_suggestions, pointed at the _newtest table instead. Same auth
+// and behaviour as the originals; keep each pair of files in sync.
+const {
+  foodJsonSuggestionApprovePlanNewtest,
+} = require("../controllers/dietitian/api/web/food_json_suggestion_approve_plan_newtest");
+
+const {
+  trainerUpdateWeeklyFoodJsonNewtest,
+} = require("../controllers/dietitian/api/web/trainer-update-weekly-food-json-newtest");
+
+const {
+  get_weekly_food_json_suggestions_weeks_newtest,
+} = require("../controllers/dietitian/api/web/get_weekly_food_json_suggestions_weeks_newtest");
+
+const {
+  get_weekly_tab_list_newtest,
+} = require("../controllers/dietitian/api/web/get_weekly_tab_list_newtest");
+
+const {
+  superAdminAllClientsOverviewNewtest,
+} = require("../controllers/dietitian/api/web/super-admin-all-clients-overview-newtest");
+
+const {
+  get_clients_data_total_missed_test_newtest,
+} = require("../controllers/dietitian/api/web/get_clients_data_total_missed_test_newtest");
+
 const {
   getLatest72hrTests,
 } = require("../controllers/dietitian/api/web/get_latest_72hr_tests");
@@ -998,6 +1025,46 @@ router.post(
   serviceApiRateLimiter,
   serviceAuthMiddleware,
   storeWeeklyFoodJsonSuggestionNewtest
+);
+
+// ── weekly_food_json_suggestions_newtest — dietitian-facing clones ──────────
+// Same JWT auth and middleware chain as the originals registered above; only
+// the business table differs (weekly_food_json_suggestions_newtest).
+
+router.post(
+  "/dietitian/api/web/get-weekly-tab-list-newtest",
+  authMiddleware,
+  get_weekly_tab_list_newtest
+);
+
+router.post(
+  "/dietitian/api/web/get_weekly_food_json_suggestions_weeks_newtest",
+  authMiddleware,
+  get_weekly_food_json_suggestions_weeks_newtest
+);
+
+router.post(
+  "/dietitian/api/web/trainer-update-weekly-food-json-newtest",
+  authMiddleware,
+  trainerUpdateWeeklyFoodJsonNewtest
+);
+
+router.post(
+  "/dietitian/api/web/food_json_suggestion_approve_plan_newtest",
+  authMiddleware,
+  foodJsonSuggestionApprovePlanNewtest
+);
+
+router.post(
+  "/dietitian/api/web/super-admin-all-clients-overview-newtest",
+  authMiddleware,
+  superAdminAllClientsOverviewNewtest
+);
+
+router.post(
+  "/dietitian/api/web/get-clients-data-total-missed-test-newtest",
+  authMiddleware,
+  get_clients_data_total_missed_test_newtest
 );
 
 // The read side of the same pipeline: the generator pulls the last 72h of tests
