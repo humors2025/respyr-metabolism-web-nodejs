@@ -147,6 +147,73 @@ function formatDateOnly(value) {
   return String(value).slice(0, 10);
 }
 
+// ─── Day resolution ──────────────────────────────────────────────────────────
+
+/**
+ * Keys a stored day object may use to identify itself. The PHP only ever
+ * looked at day_code, but generated plans (and the dashboard) have used other
+ * spellings, so every one of these is accepted.
+ */
+const DAY_ID_KEYS = ["day_code", "day", "day_key", "day_id", "code", "day_name", "name"];
+
+const WEEKDAY_NAMES = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
+
+/**
+ * Canonicalise a day identifier so that "d1", "D-1", "day_1", "Day 01" all
+ * become "d1" and "Monday" / "MON" become "mon". Anything else is returned
+ * lower-cased with separators stripped.
+ */
+function canonicalDayCode(value) {
+  const norm = String(value ?? "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, "");
+  if (!norm) return "";
+  const positional = norm.match(/^(?:d|day)0*(\d{1,2})$/);
+  if (positional) return `d${Number(positional[1])}`;
+  const weekday = WEEKDAY_NAMES.find((w) => norm === w || norm.startsWith(w));
+  return weekday || norm;
+}
+
+/** Every identifier a stored day object exposes, canonicalised. */
+function storedDayCodes(day) {
+  if (!isPlainObject(day)) return [];
+  const codes = [];
+  for (const key of DAY_ID_KEYS) {
+    if (day[key] !== undefined && day[key] !== null && day[key] !== "") {
+      const canon = canonicalDayCode(day[key]);
+      if (canon) codes.push(canon);
+    }
+  }
+  return codes;
+}
+
+/**
+ * Find the index of the requested day inside food_json.days.
+ *
+ *  1. Match the canonical request code against every identifier key on each
+ *     stored day (day_code, day, day_id, ...).
+ *  2. If the request is positional ("d1", "day_3") and nothing matched by
+ *     name, fall back to the array position (d1 → days[0]).
+ *
+ * Returns -1 when the day cannot be resolved.
+ */
+function resolveDayIndex(days, requestedCode) {
+  const target = canonicalDayCode(requestedCode);
+  if (!target || !Array.isArray(days)) return -1;
+
+  for (let i = 0; i < days.length; i++) {
+    if (storedDayCodes(days[i]).includes(target)) return i;
+  }
+
+  const positional = target.match(/^d(\d{1,2})$/);
+  if (positional) {
+    const idx = Number(positional[1]) - 1;
+    if (idx >= 0 && idx < days.length && isPlainObject(days[idx])) return idx;
+  }
+
+  return -1;
+}
+
 // ─── food_json (de)serialization ─────────────────────────────────────────────
 
 function sanitizeJsonText(value) {
@@ -589,17 +656,22 @@ const trainerUpdateWeeklyFoodJsonNewtest = async (req, res) => {
     }
 
     // ── 6. Locate the day ────────────────────────────────────────────────────
-    let dayIndex = null;
-    for (let i = 0; i < foodJson.days.length; i++) {
-      const currentDayCode = String(foodJson.days[i]?.day_code ?? "").toLowerCase();
-      if (currentDayCode === dayCode) {
-        dayIndex = i;
-        break;
-      }
+    const dayIndex = resolveDayIndex(foodJson.days, dayCode);
+    if (dayIndex < 0) {
+      fail(404, "day_code not found in food_json", {
+        requested_day_code: dayCode,
+        available_day_codes: foodJson.days.map((d, i) => {
+          if (!isPlainObject(d)) return null;
+          const key = DAY_ID_KEYS.find((k) => d[k] !== undefined && d[k] !== null && d[k] !== "");
+          return key ? String(d[key]) : `d${i + 1}`;
+        }),
+      });
     }
-    if (dayIndex === null) {
-      fail(404, "day_code not found in food_json");
-    }
+    const resolvedDay = foodJson.days[dayIndex];
+    const resolvedDayCode =
+      isPlainObject(resolvedDay) && resolvedDay.day_code !== undefined && resolvedDay.day_code !== null
+        ? String(resolvedDay.day_code)
+        : dayCode;
 
     // ── 7. Apply the mutation ────────────────────────────────────────────────
     let changedFood = null;
@@ -726,6 +798,8 @@ const trainerUpdateWeeklyFoodJsonNewtest = async (req, res) => {
       status_value:
         row.status === null || row.status === undefined ? null : Number(row.status),
       day_code: dayCode,
+      resolved_day_code: resolvedDayCode,
+      day_index: dayIndex,
       meal_type: mealType,
       food_index: finalFoodIndex,
       changed_food: changedFood,
