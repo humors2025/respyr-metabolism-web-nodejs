@@ -3,55 +3,40 @@
 /**
  * audit-logs.js
  *
- * Endpoint:
+ * Endpoints:
  *   GET /dietitian/api/web/audit-logs
+ *   GET /dietitian/api/web/audit-logs/live?after_id=<last_seen_id>
  *
- * Production URL:
+ * Production URLs:
  *   GET /v1/dietitian/api/web/audit-logs
+ *   GET /v1/dietitian/api/web/audit-logs/live?after_id=<last_seen_id>
  *
  * Source table:
- *   app_auth_logs — the fail-safe audit table every controller in this
- *   backend writes to (login/logout, invites, PHI reads, denials, ...).
- *
- *   Columns: id, event_type, user_id, role, partner_code, identifier_hash,
- *            ip_hash, user_agent_hash, session_id_hash, success,
- *            failure_reason, created_at
- *
- *   IP / user-agent / identifier are HMAC-SHA256(SECURITY_PEPPER) hashes.
- *   Raw PHI never lands in this table, so the dashboard returns the hashes
- *   as-is for correlation only. Filtering by ip_address hashes the supplied
- *   value with the same pepper and matches ip_hash.
+ *   app_auth_logs
  *
  * Auth:
- *   Bearer JWT via existing authMiddleware
+ *   Existing Bearer JWT through authMiddleware
  *
  * Authorized:
- *   super_admin only, further restricted to an email allowlist:
- *     AUDIT_LOG_ALLOWED_EMAILS=connect@respyr.in,another@respyr.in
- *   (defaults to connect@respyr.in when unset)
+ *   - Active super_admin
+ *   - Email included in AUDIT_LOG_ALLOWED_EMAILS
  *
- * Supported query params (all optional):
- *   page          1..MAX_PAGE
- *   limit         1..MAX_LIMIT
- *   search        substring over event_type / user_id / role /
- *                 partner_code / failure_reason (LIKE-escaped)
- *   event_type    exact
- *   user_id       exact (email, case-insensitive)
- *   role          exact
- *   partner_code  exact
- *   success       1 | 0 | true | false
- *   ip_address    exact (hashed before comparison)
- *   date_from     YYYY-MM-DD inclusive
- *   date_to       YYYY-MM-DD inclusive
+ * Default allowed email:
+ *   connect@respyr.in
  *
- * Security:
- *   - Identity is token-bound and re-checked in the DB (role + status)
- *   - Every read of the audit trail is itself audited to app_auth_logs
- *     (audit_logs_viewed / audit_logs_denied)
- *   - Parameterized SQL; LIKE wildcards escaped; LIMIT/OFFSET only ever
- *     inlined from strictly validated integers
- *   - Bounded pagination, strict query validation, no-store cache
- *   - Internal DB errors never reach the client
+ * Normal API:
+ *   Loads complete dashboard information:
+ *   - logs
+ *   - summary
+ *   - event types
+ *   - pagination
+ *   - filters
+ *
+ * Live API:
+ *   Loads ONLY records newer than after_id.
+ *
+ * IMPORTANT:
+ *   Live polling does NOT generate audit_logs_viewed.
  */
 
 const crypto = require("crypto");
@@ -68,24 +53,42 @@ const MAX_LIMIT = 100;
 const MAX_PAGE = 1000000;
 
 const MAX_SEARCH_LENGTH = 200;
-const MAX_EVENT_TYPE_LENGTH = 60; // matches writeAuthLogSafe truncation
+const MAX_EVENT_TYPE_LENGTH = 60;
 const MAX_USER_ID_LENGTH = 255;
 const MAX_ROLE_LENGTH = 64;
 const MAX_PARTNER_CODE_LENGTH = 64;
 const MAX_IP_LENGTH = 64;
 
 /**
- * Same pepper the writers use, so hashing a filter value here produces the
- * same digest that was stored.
+ * Maximum number of new records returned by one live request.
+ */
+const LIVE_LIMIT = 100;
+
+/**
+ * Same pepper used by the rest of the backend when writing
+ * identifier_hash / ip_hash / user_agent_hash.
  */
 const SECURITY_PEPPER =
-  process.env.SECURITY_PEPPER || process.env.JWT_SECRET || "";
+  process.env.SECURITY_PEPPER ||
+  process.env.JWT_SECRET ||
+  "";
 
+/**
+ * Users allowed to access the Audit Dashboard.
+ *
+ * Example:
+ *
+ * AUDIT_LOG_ALLOWED_EMAILS=
+ * connect@respyr.in,another@respyr.in
+ */
 const AUDIT_LOG_ALLOWED_EMAILS = String(
-  process.env.AUDIT_LOG_ALLOWED_EMAILS || "connect@respyr.in"
+  process.env.AUDIT_LOG_ALLOWED_EMAILS ||
+    "connect@respyr.in"
 )
   .split(",")
-  .map((email) => email.trim().toLowerCase())
+  .map((email) =>
+    email.trim().toLowerCase()
+  )
   .filter(Boolean);
 
 // -----------------------------------------------------------------------------
@@ -93,7 +96,9 @@ const AUDIT_LOG_ALLOWED_EMAILS = String(
 // -----------------------------------------------------------------------------
 
 function normalizeEmail(value) {
-  return typeof value === "string" ? value.trim().toLowerCase() : "";
+  return typeof value === "string"
+    ? value.trim().toLowerCase()
+    : "";
 }
 
 function isPlainScalar(value) {
@@ -105,168 +110,412 @@ function isPlainScalar(value) {
   );
 }
 
-/** Escape LIKE wildcards so a caller cannot widen the search beyond their term. */
+/**
+ * Escape LIKE wildcards.
+ */
 function escapeLike(term) {
-  return String(term).replace(/[\\%_]/g, "\\$&");
+  return String(term).replace(
+    /[\\%_]/g,
+    "\\$&"
+  );
 }
 
+/**
+ * Get requester IP.
+ */
 function getClientIp(req) {
   const ip =
-    (typeof req.ip === "string" && req.ip) ||
+    (typeof req.ip === "string" &&
+      req.ip) ||
     req.socket?.remoteAddress ||
     req.connection?.remoteAddress ||
     "0.0.0.0";
+
   return String(ip).slice(0, 64);
 }
 
+/**
+ * Get requester user-agent.
+ */
 function getUserAgent(req) {
   const ua =
-    (typeof req.get === "function" && req.get("user-agent")) ||
+    (typeof req.get === "function" &&
+      req.get("user-agent")) ||
     req.headers?.["user-agent"] ||
     "";
+
   return String(ua).slice(0, 500);
 }
 
-/** Mirrors authLogHash() in the sibling controllers. */
+/**
+ * Same hashing logic used by app_auth_logs writers.
+ */
 function authLogHash(value) {
-  if (value === null || value === undefined) return null;
+  if (
+    value === null ||
+    value === undefined
+  ) {
+    return null;
+  }
+
   return crypto
-    .createHmac("sha256", SECURITY_PEPPER)
-    .update(String(value).trim().toLowerCase())
+    .createHmac(
+      "sha256",
+      SECURITY_PEPPER
+    )
+    .update(
+      String(value)
+        .trim()
+        .toLowerCase()
+    )
     .digest("hex");
 }
 
 /**
- * Strict positive integer parser.
+ * Parse positive integer.
+ *
+ * Used for:
+ * page
+ * limit
  */
-function parsePositiveInteger(value, fallback, max) {
-  if (value === undefined || value === null || value === "") {
-    return { ok: true, value: fallback };
+function parsePositiveInteger(
+  value,
+  fallback,
+  max
+) {
+  if (
+    value === undefined ||
+    value === null ||
+    value === ""
+  ) {
+    return {
+      ok: true,
+      value: fallback,
+    };
   }
 
   if (!isPlainScalar(value)) {
-    return { ok: false, message: "Invalid numeric parameter" };
+    return {
+      ok: false,
+      message:
+        "Invalid numeric parameter",
+    };
   }
 
-  const raw = String(value).trim();
+  const raw =
+    String(value).trim();
 
   if (!/^\d+$/.test(raw)) {
-    return { ok: false, message: "Invalid numeric parameter" };
+    return {
+      ok: false,
+      message:
+        "Invalid numeric parameter",
+    };
   }
 
-  const parsed = Number.parseInt(raw, 10);
+  const parsed =
+    Number.parseInt(raw, 10);
 
-  if (!Number.isSafeInteger(parsed) || parsed < 1 || parsed > max) {
-    return { ok: false, message: "Numeric parameter is out of range" };
+  if (
+    !Number.isSafeInteger(parsed) ||
+    parsed < 1 ||
+    parsed > max
+  ) {
+    return {
+      ok: false,
+      message:
+        "Numeric parameter is out of range",
+    };
   }
 
-  return { ok: true, value: parsed };
+  return {
+    ok: true,
+    value: parsed,
+  };
 }
 
 /**
- * Validates YYYY-MM-DD and confirms the date actually exists
- * (rejects e.g. 2026-02-31).
+ * Parse non-negative integer.
+ *
+ * Used for:
+ * after_id
+ *
+ * after_id=0 is allowed.
+ */
+function parseNonNegativeInteger(
+  value
+) {
+  if (!isPlainScalar(value)) {
+    return {
+      ok: false,
+      message:
+        "Invalid numeric parameter",
+    };
+  }
+
+  const raw =
+    String(value ?? "").trim();
+
+  if (!/^\d+$/.test(raw)) {
+    return {
+      ok: false,
+      message:
+        "Invalid numeric parameter",
+    };
+  }
+
+  const parsed =
+    Number.parseInt(raw, 10);
+
+  if (
+    !Number.isSafeInteger(parsed) ||
+    parsed < 0
+  ) {
+    return {
+      ok: false,
+      message:
+        "Numeric parameter is out of range",
+    };
+  }
+
+  return {
+    ok: true,
+    value: parsed,
+  };
+}
+
+/**
+ * Validate YYYY-MM-DD.
  */
 function isValidDateOnly(value) {
-  if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+  if (
+    typeof value !== "string" ||
+    !/^\d{4}-\d{2}-\d{2}$/.test(
+      value
+    )
+  ) {
     return false;
   }
 
-  const [year, month, day] = value.split("-").map(Number);
-  const date = new Date(Date.UTC(year, month - 1, day));
+  const [year, month, day] =
+    value
+      .split("-")
+      .map(Number);
+
+  const date = new Date(
+    Date.UTC(
+      year,
+      month - 1,
+      day
+    )
+  );
 
   return (
-    date.getUTCFullYear() === year &&
-    date.getUTCMonth() === month - 1 &&
-    date.getUTCDate() === day
+    date.getUTCFullYear() ===
+      year &&
+    date.getUTCMonth() ===
+      month - 1 &&
+    date.getUTCDate() ===
+      day
   );
 }
 
-function cleanOptionalString(value, maxLength) {
-  if (value === undefined || value === null || value === "") {
-    return { ok: true, value: "" };
+/**
+ * Validate optional string.
+ */
+function cleanOptionalString(
+  value,
+  maxLength
+) {
+  if (
+    value === undefined ||
+    value === null ||
+    value === ""
+  ) {
+    return {
+      ok: true,
+      value: "",
+    };
   }
 
   if (typeof value !== "string") {
-    return { ok: false, message: "Invalid parameter" };
+    return {
+      ok: false,
+      message:
+        "Invalid parameter",
+    };
   }
 
   const cleaned = value.trim();
 
-  if (cleaned.length > maxLength) {
-    return { ok: false, message: "Parameter is too long" };
+  if (
+    cleaned.length >
+    maxLength
+  ) {
+    return {
+      ok: false,
+      message:
+        "Parameter is too long",
+    };
   }
 
-  // Reject control characters.
-  if (/[\x00-\x1f\x7f]/.test(cleaned)) {
-    return { ok: false, message: "Invalid characters in parameter" };
+  /**
+   * Reject control characters.
+   */
+  if (
+    /[\x00-\x1f\x7f]/.test(
+      cleaned
+    )
+  ) {
+    return {
+      ok: false,
+      message:
+        "Invalid characters in parameter",
+    };
   }
 
-  return { ok: true, value: cleaned };
+  return {
+    ok: true,
+    value: cleaned,
+  };
 }
 
 /**
- * success filter: 1 | 0 | true | false (case-insensitive). Returns
- * { ok, value } where value is 1, 0, or null when not supplied.
+ * Parse success:
+ *
+ * 1
+ * 0
+ * true
+ * false
  */
 function parseSuccessFlag(value) {
-  if (value === undefined || value === null || value === "") {
-    return { ok: true, value: null };
+  if (
+    value === undefined ||
+    value === null ||
+    value === ""
+  ) {
+    return {
+      ok: true,
+      value: null,
+    };
   }
 
   if (!isPlainScalar(value)) {
-    return { ok: false };
+    return {
+      ok: false,
+    };
   }
 
-  const raw = String(value).trim().toLowerCase();
+  const raw =
+    String(value)
+      .trim()
+      .toLowerCase();
 
-  if (raw === "1" || raw === "true") return { ok: true, value: 1 };
-  if (raw === "0" || raw === "false") return { ok: true, value: 0 };
+  if (
+    raw === "1" ||
+    raw === "true"
+  ) {
+    return {
+      ok: true,
+      value: 1,
+    };
+  }
 
-  return { ok: false };
+  if (
+    raw === "0" ||
+    raw === "false"
+  ) {
+    return {
+      ok: true,
+      value: 0,
+    };
+  }
+
+  return {
+    ok: false,
+  };
 }
 
 // -----------------------------------------------------------------------------
-// Fail-safe audit writer (schema mirrors writeAuthLogSafe() in siblings)
+// Audit log writer
 // -----------------------------------------------------------------------------
 
-async function writeAuthLogSafe(req, {
-  eventType,
-  userId,
-  role,
-  partnerCode,
-  identifier,
-  success,
-  failureReason,
-}) {
+/**
+ * Used only by the FULL audit endpoint.
+ *
+ * The live endpoint does NOT call this function.
+ */
+async function writeAuthLogSafe(
+  req,
+  {
+    eventType,
+    userId,
+    role,
+    partnerCode,
+    identifier,
+    success,
+    failureReason,
+  }
+) {
   try {
-    const ipHash = authLogHash(getClientIp(req));
-    const userAgentHash = authLogHash(getUserAgent(req));
+    const ipHash =
+      authLogHash(
+        getClientIp(req)
+      );
+
+    const userAgentHash =
+      authLogHash(
+        getUserAgent(req)
+      );
+
     const identifierHash =
-      identifier !== null && identifier !== undefined
+      identifier !== null &&
+      identifier !== undefined
         ? authLogHash(identifier)
         : null;
 
-    const truncatedEvent = String(eventType || "").slice(0, 60);
+    const truncatedEvent =
+      String(
+        eventType || ""
+      ).slice(0, 60);
+
     const truncatedReason =
-      failureReason !== null && failureReason !== undefined
-        ? String(failureReason).slice(0, 255)
+      failureReason !== null &&
+      failureReason !== undefined
+        ? String(
+            failureReason
+          ).slice(0, 255)
         : null;
 
     await pool.execute(
-      `INSERT INTO ${AUDIT_TABLE} (
-         event_type,
-         user_id,
-         role,
-         partner_code,
-         identifier_hash,
-         ip_hash,
-         user_agent_hash,
-         session_id_hash,
-         success,
-         failure_reason
-       )
-       VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`,
+      `
+        INSERT INTO ${AUDIT_TABLE}
+        (
+          event_type,
+          user_id,
+          role,
+          partner_code,
+          identifier_hash,
+          ip_hash,
+          user_agent_hash,
+          session_id_hash,
+          success,
+          failure_reason
+        )
+        VALUES
+        (
+          ?,
+          ?,
+          ?,
+          ?,
+          ?,
+          ?,
+          ?,
+          NULL,
+          ?,
+          ?
+        )
+      `,
       [
         truncatedEvent,
         userId ?? null,
@@ -280,7 +529,11 @@ async function writeAuthLogSafe(req, {
       ]
     );
   } catch (err) {
-    console.error("AUTH_LOG_WRITE_FAILED:", err?.code || err?.message);
+    console.error(
+      "AUTH_LOG_WRITE_FAILED:",
+      err?.code ||
+        err?.message
+    );
   }
 }
 
@@ -289,27 +542,50 @@ async function writeAuthLogSafe(req, {
 // -----------------------------------------------------------------------------
 
 /**
- * authMiddleware has already verified the JWT before this runs.
+ * authMiddleware already validates JWT.
  *
- * We still re-fetch the account from the database so a previously issued
- * token cannot retain audit access after the user's role/status changes.
+ * We still re-check user in database.
+ *
+ * This protects against:
+ * - disabled account
+ * - changed role
+ * - removed user
  */
-async function resolveAuditActor(req) {
-  const payload = req.user || {};
+async function resolveAuditActor(
+  req
+) {
+  const payload =
+    req.user || {};
 
-  /**
-   * This backend's JWTs carry dietician_id in sub; email may be top-level
-   * (user_id) or nested under dietician.email.
-   */
-  const dieticianId = String(payload.sub || payload.dietician_id || "").trim();
+  const dieticianId =
+    String(
+      payload.sub ||
+        payload.dietician_id ||
+        ""
+    ).trim();
 
-  const tokenEmail = normalizeEmail(
-    payload.email || payload.user_id || payload?.dietician?.email || ""
-  );
+  const tokenEmail =
+    normalizeEmail(
+      payload.email ||
+        payload.user_id ||
+        payload?.dietician
+          ?.email ||
+        ""
+    );
 
-  if ((!dieticianId || dieticianId.length > 64) && !tokenEmail) {
+  if (
+    (
+      !dieticianId ||
+      dieticianId.length > 64
+    ) &&
+    !tokenEmail
+  ) {
     return {
-      error: { status: 401, message: "Invalid authenticated user" },
+      error: {
+        status: 401,
+        message:
+          "Invalid authenticated user",
+      },
     };
   }
 
@@ -319,78 +595,142 @@ async function resolveAuditActor(req) {
       td.dietician_id,
       td.email,
       td.name,
+
       aur.user_id,
       aur.role,
       aur.partner_code,
       aur.parent_user_id,
       aur.status
+
     FROM table_dietician td
+
     INNER JOIN app_user_roles aur
-      ON LOWER(aur.user_id) = LOWER(td.email)
+      ON LOWER(aur.user_id) =
+         LOWER(td.email)
   `;
 
   let rows;
 
   if (dieticianId) {
-    [rows] = await pool.execute(
-      `${selectSql} WHERE td.dietician_id = ? LIMIT 1`,
-      [dieticianId]
-    );
+    [rows] =
+      await pool.execute(
+        `
+          ${selectSql}
+
+          WHERE td.dietician_id = ?
+
+          LIMIT 1
+        `,
+        [dieticianId]
+      );
   } else {
-    [rows] = await pool.execute(
-      `${selectSql} WHERE LOWER(td.email) = LOWER(?) LIMIT 1`,
-      [tokenEmail]
-    );
+    [rows] =
+      await pool.execute(
+        `
+          ${selectSql}
+
+          WHERE LOWER(td.email)
+                = LOWER(?)
+
+          LIMIT 1
+        `,
+        [tokenEmail]
+      );
   }
 
-  const actor = rows[0];
+  const actor =
+    rows?.[0];
 
   if (!actor) {
     return {
-      error: { status: 401, message: "Authenticated user not found" },
-    };
-  }
-
-  if (String(actor.status || "").toLowerCase() !== "active") {
-    return {
-      error: { status: 403, message: "Account is not active" },
-    };
-  }
-
-  if (String(actor.role || "").toLowerCase() !== "super_admin") {
-    return {
       error: {
-        status: 403,
-        message: "You are not authorized to view audit logs",
+        status: 401,
+        message:
+          "Authenticated user not found",
       },
     };
   }
 
-  const actorEmail = normalizeEmail(actor.user_id || actor.email);
-
-  if (!AUDIT_LOG_ALLOWED_EMAILS.includes(actorEmail)) {
+  /**
+   * Account must be active.
+   */
+  if (
+    String(
+      actor.status || ""
+    ).toLowerCase() !==
+    "active"
+  ) {
     return {
       error: {
         status: 403,
-        message: "You are not authorized to view audit logs",
+        message:
+          "Account is not active",
       },
     };
   }
 
-  return { actor, actorEmail };
+  /**
+   * Only super_admin.
+   */
+  if (
+    String(
+      actor.role || ""
+    ).toLowerCase() !==
+    "super_admin"
+  ) {
+    return {
+      error: {
+        status: 403,
+        message:
+          "You are not authorized to view audit logs",
+      },
+    };
+  }
+
+  const actorEmail =
+    normalizeEmail(
+      actor.user_id ||
+        actor.email
+    );
+
+  /**
+   * Email allow-list.
+   */
+  if (
+    !AUDIT_LOG_ALLOWED_EMAILS.includes(
+      actorEmail
+    )
+  ) {
+    return {
+      error: {
+        status: 403,
+        message:
+          "You are not authorized to view audit logs",
+      },
+    };
+  }
+
+  return {
+    actor,
+    actorEmail,
+  };
 }
 
 // -----------------------------------------------------------------------------
-// Validate query parameters
+// Validate normal audit query
 // -----------------------------------------------------------------------------
 
 function validateQuery(query) {
   const source =
-    query && typeof query === "object" && !Array.isArray(query) ? query : {};
+    query &&
+    typeof query ===
+      "object" &&
+    !Array.isArray(query)
+      ? query
+      : {};
 
-  /*
-   * Reject repeated parameters such as ?limit=20&limit=100 —
-   * Express turns those into arrays.
+  /**
+   * Supported parameters.
    */
   const supportedParams = [
     "page",
@@ -406,116 +746,262 @@ function validateQuery(query) {
     "date_to",
   ];
 
-  for (const key of supportedParams) {
-    if (!isPlainScalar(source[key])) {
-      return { ok: false, status: 400, message: `Invalid ${key} parameter` };
+  /**
+   * Reject arrays / repeated parameters.
+   */
+  for (
+    const key of
+    supportedParams
+  ) {
+    if (
+      !isPlainScalar(
+        source[key]
+      )
+    ) {
+      return {
+        ok: false,
+        status: 400,
+        message:
+          `Invalid ${key} parameter`,
+      };
     }
   }
 
-  const parsedPage = parsePositiveInteger(source.page, 1, MAX_PAGE);
+  // ---------------------------------------------------------------------------
+  // page
+  // ---------------------------------------------------------------------------
+
+  const parsedPage =
+    parsePositiveInteger(
+      source.page,
+      1,
+      MAX_PAGE
+    );
+
   if (!parsedPage.ok) {
-    return { ok: false, status: 400, message: "Invalid page parameter" };
+    return {
+      ok: false,
+      status: 400,
+      message:
+        "Invalid page parameter",
+    };
   }
 
-  const parsedLimit = parsePositiveInteger(source.limit, DEFAULT_LIMIT, MAX_LIMIT);
+  // ---------------------------------------------------------------------------
+  // limit
+  // ---------------------------------------------------------------------------
+
+  const parsedLimit =
+    parsePositiveInteger(
+      source.limit,
+      DEFAULT_LIMIT,
+      MAX_LIMIT
+    );
+
   if (!parsedLimit.ok) {
     return {
       ok: false,
       status: 400,
-      message: `limit must be between 1 and ${MAX_LIMIT}`,
+      message:
+        `limit must be between 1 and ${MAX_LIMIT}`,
     };
   }
 
+  // ---------------------------------------------------------------------------
+  // Strings
+  // ---------------------------------------------------------------------------
+
   const stringFields = [
-    ["search", MAX_SEARCH_LENGTH],
-    ["event_type", MAX_EVENT_TYPE_LENGTH],
-    ["user_id", MAX_USER_ID_LENGTH],
-    ["role", MAX_ROLE_LENGTH],
-    ["partner_code", MAX_PARTNER_CODE_LENGTH],
-    ["ip_address", MAX_IP_LENGTH],
+    [
+      "search",
+      MAX_SEARCH_LENGTH,
+    ],
+    [
+      "event_type",
+      MAX_EVENT_TYPE_LENGTH,
+    ],
+    [
+      "user_id",
+      MAX_USER_ID_LENGTH,
+    ],
+    [
+      "role",
+      MAX_ROLE_LENGTH,
+    ],
+    [
+      "partner_code",
+      MAX_PARTNER_CODE_LENGTH,
+    ],
+    [
+      "ip_address",
+      MAX_IP_LENGTH,
+    ],
   ];
 
   const strings = {};
 
-  for (const [key, maxLength] of stringFields) {
-    const result = cleanOptionalString(
-      source[key] === undefined || source[key] === null
-        ? ""
-        : String(source[key]),
-      maxLength
-    );
+  for (
+    const [
+      key,
+      maxLength,
+    ] of stringFields
+  ) {
+    const result =
+      cleanOptionalString(
+        source[key] ===
+            undefined ||
+          source[key] ===
+            null
+          ? ""
+          : String(
+              source[key]
+            ),
+        maxLength
+      );
 
     if (!result.ok) {
-      return { ok: false, status: 400, message: `Invalid ${key} parameter` };
+      return {
+        ok: false,
+        status: 400,
+        message:
+          `Invalid ${key} parameter`,
+      };
     }
 
-    strings[key] = result.value;
+    strings[key] =
+      result.value;
   }
 
-  const successFlag = parseSuccessFlag(source.success);
+  // ---------------------------------------------------------------------------
+  // success
+  // ---------------------------------------------------------------------------
+
+  const successFlag =
+    parseSuccessFlag(
+      source.success
+    );
+
   if (!successFlag.ok) {
     return {
       ok: false,
       status: 400,
-      message: "success must be 1, 0, true or false",
+      message:
+        "success must be 1, 0, true or false",
     };
   }
 
-  const dateFrom = String(source.date_from || "").trim();
-  const dateTo = String(source.date_to || "").trim();
+  // ---------------------------------------------------------------------------
+  // Dates
+  // ---------------------------------------------------------------------------
 
-  if (dateFrom && !isValidDateOnly(dateFrom)) {
+  const dateFrom =
+    String(
+      source.date_from || ""
+    ).trim();
+
+  const dateTo =
+    String(
+      source.date_to || ""
+    ).trim();
+
+  if (
+    dateFrom &&
+    !isValidDateOnly(
+      dateFrom
+    )
+  ) {
     return {
       ok: false,
       status: 400,
-      message: "date_from must use YYYY-MM-DD format",
+      message:
+        "date_from must use YYYY-MM-DD format",
     };
   }
 
-  if (dateTo && !isValidDateOnly(dateTo)) {
+  if (
+    dateTo &&
+    !isValidDateOnly(
+      dateTo
+    )
+  ) {
     return {
       ok: false,
       status: 400,
-      message: "date_to must use YYYY-MM-DD format",
+      message:
+        "date_to must use YYYY-MM-DD format",
     };
   }
 
-  if (dateFrom && dateTo && dateFrom > dateTo) {
+  if (
+    dateFrom &&
+    dateTo &&
+    dateFrom > dateTo
+  ) {
     return {
       ok: false,
       status: 400,
-      message: "date_from cannot be later than date_to",
+      message:
+        "date_from cannot be later than date_to",
     };
   }
 
   return {
     ok: true,
+
     value: {
-      page: parsedPage.value,
-      limit: parsedLimit.value,
-      search: strings.search,
-      eventType: strings.event_type,
-      userId: normalizeEmail(strings.user_id),
-      role: strings.role,
-      partnerCode: strings.partner_code,
-      success: successFlag.value,
-      ipAddress: strings.ip_address,
+      page:
+        parsedPage.value,
+
+      limit:
+        parsedLimit.value,
+
+      search:
+        strings.search,
+
+      eventType:
+        strings.event_type,
+
+      userId:
+        normalizeEmail(
+          strings.user_id
+        ),
+
+      role:
+        strings.role,
+
+      partnerCode:
+        strings.partner_code,
+
+      success:
+        successFlag.value,
+
+      ipAddress:
+        strings.ip_address,
+
       dateFrom,
+
       dateTo,
     },
   };
 }
 
 // -----------------------------------------------------------------------------
-// SQL filter builder
+// SQL filters
 // -----------------------------------------------------------------------------
 
 function buildFilters(filters) {
   const conditions = [];
   const params = [];
 
+  // ---------------------------------------------------------------------------
+  // Search
+  // ---------------------------------------------------------------------------
+
   if (filters.search) {
-    const pattern = `%${escapeLike(filters.search)}%`;
+    const pattern =
+      `%${escapeLike(
+        filters.search
+      )}%`;
 
     conditions.push(`
       (
@@ -527,164 +1013,356 @@ function buildFilters(filters) {
       )
     `);
 
-    params.push(pattern, pattern, pattern, pattern, pattern);
+    params.push(
+      pattern,
+      pattern,
+      pattern,
+      pattern,
+      pattern
+    );
   }
+
+  // ---------------------------------------------------------------------------
+  // Event type
+  // ---------------------------------------------------------------------------
 
   if (filters.eventType) {
-    conditions.push("event_type = ?");
-    params.push(filters.eventType);
+    conditions.push(
+      "event_type = ?"
+    );
+
+    params.push(
+      filters.eventType
+    );
   }
+
+  // ---------------------------------------------------------------------------
+  // User
+  // ---------------------------------------------------------------------------
 
   if (filters.userId) {
-    conditions.push("LOWER(user_id) = ?");
-    params.push(filters.userId);
+    conditions.push(
+      "LOWER(user_id) = ?"
+    );
+
+    params.push(
+      filters.userId
+    );
   }
+
+  // ---------------------------------------------------------------------------
+  // Role
+  // ---------------------------------------------------------------------------
 
   if (filters.role) {
-    conditions.push("role = ?");
-    params.push(filters.role);
+    conditions.push(
+      "role = ?"
+    );
+
+    params.push(
+      filters.role
+    );
   }
+
+  // ---------------------------------------------------------------------------
+  // Partner code
+  // ---------------------------------------------------------------------------
 
   if (filters.partnerCode) {
-    conditions.push("partner_code = ?");
-    params.push(filters.partnerCode);
+    conditions.push(
+      "partner_code = ?"
+    );
+
+    params.push(
+      filters.partnerCode
+    );
   }
 
-  if (filters.success !== null) {
-    conditions.push("success = ?");
-    params.push(filters.success);
+  // ---------------------------------------------------------------------------
+  // Success/failure
+  // ---------------------------------------------------------------------------
+
+  if (
+    filters.success !==
+    null
+  ) {
+    conditions.push(
+      "success = ?"
+    );
+
+    params.push(
+      filters.success
+    );
   }
+
+  // ---------------------------------------------------------------------------
+  // IP address
+  // ---------------------------------------------------------------------------
 
   if (filters.ipAddress) {
-    /*
-     * IPs are stored hashed. Hash the filter with the same pepper and
-     * compare digests — the raw IP never touches the query.
+    /**
+     * app_auth_logs stores IP as HMAC hash.
+     *
+     * Hash supplied IP first, then compare.
      */
-    conditions.push("ip_hash = ?");
-    params.push(authLogHash(filters.ipAddress));
+    conditions.push(
+      "ip_hash = ?"
+    );
+
+    params.push(
+      authLogHash(
+        filters.ipAddress
+      )
+    );
   }
+
+  // ---------------------------------------------------------------------------
+  // From date
+  // ---------------------------------------------------------------------------
 
   if (filters.dateFrom) {
-    conditions.push("created_at >= ?");
-    params.push(`${filters.dateFrom} 00:00:00`);
+    conditions.push(
+      "created_at >= ?"
+    );
+
+    params.push(
+      `${filters.dateFrom} 00:00:00`
+    );
   }
 
+  // ---------------------------------------------------------------------------
+  // To date
+  // ---------------------------------------------------------------------------
+
   if (filters.dateTo) {
-    /*
-     * Exclusive next-day comparison rather than 23:59:59 so fractional
-     * seconds remain correct.
+    /**
+     * Exclusive next-day check.
+     *
+     * Better than <= 23:59:59.
      */
-    conditions.push("created_at < DATE_ADD(?, INTERVAL 1 DAY)");
-    params.push(`${filters.dateTo} 00:00:00`);
+    conditions.push(
+      "created_at < DATE_ADD(?, INTERVAL 1 DAY)"
+    );
+
+    params.push(
+      `${filters.dateTo} 00:00:00`
+    );
   }
 
   return {
-    sql: conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "",
+    sql:
+      conditions.length > 0
+        ? `WHERE ${conditions.join(
+            " AND "
+          )}`
+        : "",
+
     params,
   };
 }
 
-// -----------------------------------------------------------------------------
-// Controller
-// -----------------------------------------------------------------------------
+// =============================================================================
+// NORMAL / FULL AUDIT LOG API
+// =============================================================================
 
-async function auditLogs(req, res) {
-  /*
-   * Do not allow audit data to be cached.
+async function auditLogs(
+  req,
+  res
+) {
+  /**
+   * Never cache audit information.
    */
-  res.setHeader("Cache-Control", "no-store, private, max-age=0");
-  res.setHeader("Pragma", "no-cache");
-  res.setHeader("Vary", "Authorization");
+  res.setHeader(
+    "Cache-Control",
+    "private, no-cache, no-store, must-revalidate, max-age=0"
+  );
+
+  res.setHeader(
+    "Pragma",
+    "no-cache"
+  );
+
+  res.setHeader(
+    "Expires",
+    "0"
+  );
+
+  res.setHeader(
+    "Vary",
+    "Authorization"
+  );
 
   try {
     // -------------------------------------------------------------------------
-    // 1. Resolve + authorize actor (super_admin + allowlist)
+    // 1. Authorization
     // -------------------------------------------------------------------------
 
-    const resolved = await resolveAuditActor(req);
+    const resolved =
+      await resolveAuditActor(
+        req
+      );
 
     if (resolved.error) {
-      await writeAuthLogSafe(req, {
-        eventType: "audit_logs_denied",
-        userId: null,
-        role: null,
-        partnerCode: null,
-        identifier: String(req.user?.sub || req.user?.dietician_id || ""),
-        success: false,
-        failureReason: resolved.error.message,
-      });
+      /**
+       * Record denied audit access.
+       *
+       * This is the FULL endpoint only.
+       */
+      await writeAuthLogSafe(
+        req,
+        {
+          eventType:
+            "audit_logs_denied",
 
-      return res.status(resolved.error.status).json({
-        ok: false,
-        message: resolved.error.message,
-      });
+          userId: null,
+
+          role: null,
+
+          partnerCode: null,
+
+          identifier:
+            String(
+              req.user?.sub ||
+                req.user
+                  ?.dietician_id ||
+                ""
+            ),
+
+          success: false,
+
+          failureReason:
+            resolved.error
+              .message,
+        }
+      );
+
+      return res
+        .status(
+          resolved.error
+            .status
+        )
+        .json({
+          ok: false,
+          message:
+            resolved.error
+              .message,
+        });
     }
 
-    const { actor, actorEmail } = resolved;
+    const {
+      actor,
+      actorEmail,
+    } = resolved;
 
     // -------------------------------------------------------------------------
-    // 2. Validate request
+    // 2. Validate filters
     // -------------------------------------------------------------------------
 
-    const validation = validateQuery(req.query);
+    const validation =
+      validateQuery(
+        req.query
+      );
 
     if (!validation.ok) {
-      return res.status(validation.status).json({
-        ok: false,
-        message: validation.message,
-      });
+      return res
+        .status(
+          validation.status
+        )
+        .json({
+          ok: false,
+          message:
+            validation.message,
+        });
     }
 
-    const filters = validation.value;
-    const { sql: whereSql, params: whereParams } = buildFilters(filters);
-    const offset = (filters.page - 1) * filters.limit;
+    const filters =
+      validation.value;
 
-    // -------------------------------------------------------------------------
-    // 3. Filtered count
-    // -------------------------------------------------------------------------
-
-    const [countRows] = await pool.execute(
-      `SELECT COUNT(*) AS total FROM ${AUDIT_TABLE} ${whereSql}`,
-      whereParams
+    const {
+      sql: whereSql,
+      params: whereParams,
+    } = buildFilters(
+      filters
     );
 
-    const total = Number(countRows?.[0]?.total || 0);
-    const totalPages = total === 0 ? 0 : Math.ceil(total / filters.limit);
+    const offset =
+      (filters.page - 1) *
+      filters.limit;
 
     // -------------------------------------------------------------------------
-    // 4. Requested page
+    // 3. Filtered total
     // -------------------------------------------------------------------------
 
-    /*
-     * LIMIT/OFFSET are inlined, not bound. mysqld_stmt_execute rejects bound
-     * LIMIT parameters on this MySQL build (ER_WRONG_ARGUMENTS, errno 1210).
-     * Both values are strictly validated integers (parsePositiveInteger:
-     * digits only, 1..MAX_LIMIT / 1..MAX_PAGE), so inlining is injection-safe.
+    const [countRows] =
+      await pool.execute(
+        `
+          SELECT
+            COUNT(*) AS total
+
+          FROM ${AUDIT_TABLE}
+
+          ${whereSql}
+        `,
+        whereParams
+      );
+
+    const total =
+      Number(
+        countRows?.[0]
+          ?.total || 0
+      );
+
+    const totalPages =
+      total === 0
+        ? 0
+        : Math.ceil(
+            total /
+              filters.limit
+          );
+
+    // -------------------------------------------------------------------------
+    // 4. Get requested page
+    // -------------------------------------------------------------------------
+
+    /**
+     * LIMIT and OFFSET are safe to inline because both values
+     * are validated integers.
      *
-     * DATE_FORMAT is intentional: created_at is MySQL DATETIME; returning a
-     * formatted string avoids Node/MySQL timezone conversion.
+     * DATE_FORMAT prevents timezone conversion of MySQL DATETIME.
      */
-    const [logRows] = await pool.execute(
-      `
-        SELECT
-          id,
-          event_type,
-          user_id,
-          role,
-          partner_code,
-          success,
-          failure_reason,
-          ip_hash,
-          user_agent_hash,
-          DATE_FORMAT(created_at, '%Y-%m-%d %H:%i:%s') AS created_at
-        FROM ${AUDIT_TABLE}
-        ${whereSql}
-        ORDER BY created_at DESC, id DESC
-        LIMIT ${filters.limit}
-        OFFSET ${offset}
-      `,
-      whereParams
-    );
+    const [logRows] =
+      await pool.execute(
+        `
+          SELECT
+            id,
+            event_type,
+            user_id,
+            role,
+            partner_code,
+            success,
+            failure_reason,
+            ip_hash,
+            user_agent_hash,
+
+            DATE_FORMAT(
+              created_at,
+              '%Y-%m-%d %H:%i:%s'
+            ) AS created_at
+
+          FROM ${AUDIT_TABLE}
+
+          ${whereSql}
+
+          ORDER BY
+            created_at DESC,
+            id DESC
+
+          LIMIT ${filters.limit}
+
+          OFFSET ${offset}
+        `,
+        whereParams
+      );
 
     // -------------------------------------------------------------------------
     // 5. Dashboard summary
@@ -697,125 +1375,608 @@ async function auditLogs(req, res) {
       [eventTypeRows],
     ] = await Promise.all([
       /**
-       * MySQL server date is used so "Today" follows the same clock as
-       * created_at.
+       * Today's logs
        */
       pool.execute(
         `
-          SELECT COUNT(*) AS total
-          FROM ${AUDIT_TABLE}
-          WHERE created_at >= CURDATE()
-            AND created_at < DATE_ADD(CURDATE(), INTERVAL 1 DAY)
-        `
-      ),
+          SELECT
+            COUNT(*) AS total
 
-      pool.execute(
-        `SELECT COUNT(DISTINCT event_type) AS total FROM ${AUDIT_TABLE}`
+          FROM ${AUDIT_TABLE}
+
+          WHERE
+            created_at >=
+              CURDATE()
+
+          AND created_at <
+              DATE_ADD(
+                CURDATE(),
+                INTERVAL 1 DAY
+              )
+        `
       ),
 
       /**
-       * Security-relevant events = every row the writers flagged as a
-       * failure/denial (success = 0). Exact column match; no LIKE chain.
+       * Unique event types
        */
       pool.execute(
-        `SELECT COUNT(*) AS total FROM ${AUDIT_TABLE} WHERE success = 0`
+        `
+          SELECT
+            COUNT(
+              DISTINCT event_type
+            ) AS total
+
+          FROM ${AUDIT_TABLE}
+        `
       ),
 
+      /**
+       * Failed/security events
+       */
       pool.execute(
         `
-          SELECT DISTINCT event_type
+          SELECT
+            COUNT(*) AS total
+
           FROM ${AUDIT_TABLE}
-          WHERE event_type IS NOT NULL AND event_type <> ''
-          ORDER BY event_type ASC
+
+          WHERE success = 0
+        `
+      ),
+
+      /**
+       * Event type dropdown
+       */
+      pool.execute(
+        `
+          SELECT DISTINCT
+            event_type
+
+          FROM ${AUDIT_TABLE}
+
+          WHERE
+            event_type IS NOT NULL
+
+          AND event_type <> ''
+
+          ORDER BY
+            event_type ASC
+
           LIMIT 500
         `
       ),
     ]);
 
-    const todayTotal = Number(todayRows?.[0]?.total || 0);
-    const uniqueEventTypes = Number(eventTypeCountRows?.[0]?.total || 0);
-    const securityEvents = Number(failedRows?.[0]?.total || 0);
+    const todayTotal =
+      Number(
+        todayRows?.[0]
+          ?.total || 0
+      );
 
-    const eventTypes = eventTypeRows
-      .map((row) => String(row.event_type || "").trim())
-      .filter(Boolean);
+    const uniqueEventTypes =
+      Number(
+        eventTypeCountRows?.[0]
+          ?.total || 0
+      );
 
-    const logs = logRows.map((row) => ({
-      id: row.id,
-      event_type: row.event_type,
-      user_id: row.user_id,
-      role: row.role,
-      partner_code: row.partner_code,
-      success: Number(row.success) === 1,
-      failure_reason: row.failure_reason,
-      ip_hash: row.ip_hash,
-      user_agent_hash: row.user_agent_hash,
-      created_at: row.created_at,
-    }));
+    const securityEvents =
+      Number(
+        failedRows?.[0]
+          ?.total || 0
+      );
+
+    const eventTypes =
+      eventTypeRows
+        .map((row) =>
+          String(
+            row.event_type ||
+              ""
+          ).trim()
+        )
+        .filter(Boolean);
+
+    /**
+     * Convert success from MySQL 0/1 to boolean.
+     */
+    const logs =
+      logRows.map(
+        (row) => ({
+          id:
+            Number(row.id),
+
+          event_type:
+            row.event_type,
+
+          user_id:
+            row.user_id,
+
+          role:
+            row.role,
+
+          partner_code:
+            row.partner_code,
+
+          success:
+            Number(
+              row.success
+            ) === 1,
+
+          failure_reason:
+            row.failure_reason,
+
+          ip_hash:
+            row.ip_hash,
+
+          user_agent_hash:
+            row.user_agent_hash,
+
+          created_at:
+            row.created_at,
+        })
+      );
 
     // -------------------------------------------------------------------------
-    // 6. Audit the read itself (fire-and-forget, never blocks the response)
+    // 6. Record full audit dashboard read
     // -------------------------------------------------------------------------
 
-    writeAuthLogSafe(req, {
-      eventType: "audit_logs_viewed",
-      userId: actorEmail,
-      role: "super_admin",
-      partnerCode: actor.partner_code ?? null,
-      identifier: actorEmail,
-      success: true,
-      failureReason: `page=${filters.page} limit=${filters.limit} filtered=${total}`,
-    });
+    /**
+     * IMPORTANT:
+     *
+     * This is allowed here because this endpoint is used for:
+     * - initial dashboard load
+     * - manual refresh
+     * - filter
+     * - pagination
+     *
+     * The LIVE endpoint below DOES NOT write audit_logs_viewed.
+     */
+    writeAuthLogSafe(
+      req,
+      {
+        eventType:
+          "audit_logs_viewed",
+
+        userId:
+          actorEmail,
+
+        role:
+          "super_admin",
+
+        partnerCode:
+          actor.partner_code ??
+          null,
+
+        identifier:
+          actorEmail,
+
+        success:
+          true,
+
+        failureReason:
+          `page=${filters.page} limit=${filters.limit} filtered=${total}`,
+      }
+    );
 
     // -------------------------------------------------------------------------
     // 7. Response
     // -------------------------------------------------------------------------
 
-    return res.status(200).json({
-      ok: true,
+    return res
+      .status(200)
+      .json({
+        ok: true,
 
-      summary: {
-        filtered_total: total,
-        today_total: todayTotal,
-        unique_event_types: uniqueEventTypes,
-        security_events: securityEvents,
-      },
+        summary: {
+          filtered_total:
+            total,
 
-      event_types: eventTypes,
+          today_total:
+            todayTotal,
 
-      logs,
+          unique_event_types:
+            uniqueEventTypes,
 
-      pagination: {
-        page: filters.page,
-        limit: filters.limit,
-        total,
-        total_pages: totalPages,
-        has_next: filters.page < totalPages,
-        has_prev: filters.page > 1,
-      },
-    });
+          security_events:
+            securityEvents,
+        },
+
+        event_types:
+          eventTypes,
+
+        logs,
+
+        pagination: {
+          page:
+            filters.page,
+
+          limit:
+            filters.limit,
+
+          total,
+
+          total_pages:
+            totalPages,
+
+          has_next:
+            filters.page <
+            totalPages,
+
+          has_prev:
+            filters.page > 1,
+        },
+      });
   } catch (error) {
-    /*
-     * Do not expose SQL/database details to the frontend.
+    /**
+     * Never expose DB details to frontend.
      */
-    console.error("AUDIT_LOGS_ERROR:", {
-      code: error?.code || null,
-      errno: error?.errno || null,
-      sqlState: error?.sqlState || null,
-      message: error?.message || "Unknown error",
-    });
+    console.error(
+      "AUDIT_LOGS_ERROR:",
+      {
+        code:
+          error?.code ||
+          null,
 
-    return res.status(500).json({
-      ok: false,
-      message: "Unable to load audit logs",
-    });
+        errno:
+          error?.errno ||
+          null,
+
+        sqlState:
+          error?.sqlState ||
+          null,
+
+        message:
+          error?.message ||
+          "Unknown error",
+      }
+    );
+
+    return res
+      .status(500)
+      .json({
+        ok: false,
+
+        message:
+          "Unable to load audit logs",
+      });
   }
 }
 
-// -----------------------------------------------------------------------------
-// Export
-// -----------------------------------------------------------------------------
+// =============================================================================
+// LIVE AUDIT API
+// =============================================================================
+
+/**
+ * Near-real-time audit feed.
+ *
+ * Frontend calls:
+ *
+ * /audit-logs/live?after_id=61580
+ *
+ * every 5 seconds.
+ *
+ * It returns only records with:
+ *
+ * id > 61580
+ *
+ * IMPORTANT:
+ *
+ * This endpoint DOES NOT:
+ *
+ * - calculate dashboard summary
+ * - calculate total count
+ * - calculate event types
+ * - create audit_logs_viewed
+ *
+ * Therefore it is much lighter than repeatedly calling the normal API.
+ */
+async function auditLogsLive(
+  req,
+  res
+) {
+  res.setHeader(
+    "Cache-Control",
+    "private, no-cache, no-store, must-revalidate, max-age=0"
+  );
+
+  res.setHeader(
+    "Pragma",
+    "no-cache"
+  );
+
+  res.setHeader(
+    "Expires",
+    "0"
+  );
+
+  res.setHeader(
+    "Vary",
+    "Authorization"
+  );
+
+  try {
+    // -------------------------------------------------------------------------
+    // 1. Authorization
+    // -------------------------------------------------------------------------
+
+    const resolved =
+      await resolveAuditActor(
+        req
+      );
+
+    if (resolved.error) {
+      /**
+       * IMPORTANT:
+       *
+       * Don't write audit_logs_denied on every failed polling request.
+       *
+       * Otherwise a broken/expired browser session could flood
+       * app_auth_logs every 5 seconds.
+       */
+      return res
+        .status(
+          resolved.error
+            .status
+        )
+        .json({
+          ok: false,
+
+          message:
+            resolved.error
+              .message,
+        });
+    }
+
+    // -------------------------------------------------------------------------
+    // 2. Validate after_id
+    // -------------------------------------------------------------------------
+
+    const parsedAfterId =
+      parseNonNegativeInteger(
+        req.query?.after_id
+      );
+
+    if (!parsedAfterId.ok) {
+      return res
+        .status(400)
+        .json({
+          ok: false,
+
+          message:
+            "after_id must be a non-negative integer",
+        });
+    }
+
+    const afterId =
+      parsedAfterId.value;
+
+    // -------------------------------------------------------------------------
+    // 3. Get NEW records only
+    // -------------------------------------------------------------------------
+
+    /**
+     * id is PRIMARY KEY.
+     *
+     * Therefore:
+     *
+     * WHERE id > ?
+     *
+     * is efficient for live polling.
+     *
+     * audit_logs_viewed is intentionally excluded from the LIVE feed.
+     *
+     * It still remains stored in app_auth_logs and can be viewed using
+     * the normal audit API / event filter.
+     */
+    const [rows] =
+      await pool.execute(
+        `
+          SELECT
+            id,
+            event_type,
+            user_id,
+            role,
+            partner_code,
+            success,
+            failure_reason,
+            ip_hash,
+            user_agent_hash,
+
+            DATE_FORMAT(
+              created_at,
+              '%Y-%m-%d %H:%i:%s'
+            ) AS created_at
+
+          FROM ${AUDIT_TABLE}
+
+          WHERE id > ?
+
+          AND event_type <>
+              'audit_logs_viewed'
+
+          ORDER BY
+            id ASC
+
+          LIMIT ${LIVE_LIMIT}
+        `,
+        [afterId]
+      );
+
+    /**
+     * Convert MySQL result.
+     */
+    const logs =
+      rows.map(
+        (row) => ({
+          id:
+            Number(row.id),
+
+          event_type:
+            row.event_type,
+
+          user_id:
+            row.user_id,
+
+          role:
+            row.role,
+
+          partner_code:
+            row.partner_code,
+
+          success:
+            Number(
+              row.success
+            ) === 1,
+
+          failure_reason:
+            row.failure_reason,
+
+          ip_hash:
+            row.ip_hash,
+
+          user_agent_hash:
+            row.user_agent_hash,
+
+          created_at:
+            row.created_at,
+        })
+      );
+
+    // -------------------------------------------------------------------------
+    // 4. Cursor
+    // -------------------------------------------------------------------------
+
+    let nextAfterId =
+      afterId;
+
+    if (logs.length > 0) {
+      nextAfterId =
+        logs[
+          logs.length - 1
+        ].id;
+    }
+
+    /**
+     * Example:
+     *
+     * after_id = 61580
+     *
+     * DB:
+     * 61581 audit_logs_viewed
+     * 61582 audit_logs_viewed
+     *
+     * Both are excluded.
+     *
+     * Without advancing the cursor, every poll would keep checking
+     * those same rows forever.
+     *
+     * Therefore, when fewer than LIVE_LIMIT normal records are returned,
+     * advance to the current maximum DB id.
+     */
+    if (
+      logs.length <
+      LIVE_LIMIT
+    ) {
+      const [maxRows] =
+        await pool.execute(
+          `
+            SELECT
+              COALESCE(
+                MAX(id),
+                ?
+              ) AS max_id
+
+            FROM ${AUDIT_TABLE}
+          `,
+          [afterId]
+        );
+
+      const tableMaxId =
+        Number(
+          maxRows?.[0]
+            ?.max_id ||
+            afterId
+        );
+
+      if (
+        Number.isSafeInteger(
+          tableMaxId
+        ) &&
+        tableMaxId >
+          nextAfterId
+      ) {
+        nextAfterId =
+          tableMaxId;
+      }
+    }
+
+    // -------------------------------------------------------------------------
+    // 5. Response
+    // -------------------------------------------------------------------------
+
+    return res
+      .status(200)
+      .json({
+        ok: true,
+
+        logs,
+
+        new_count:
+          logs.length,
+
+        after_id:
+          afterId,
+
+        next_after_id:
+          nextAfterId,
+
+        /**
+         * If exactly LIVE_LIMIT rows were returned,
+         * there may be additional logs waiting.
+         *
+         * Frontend may immediately call the endpoint again.
+         */
+        has_more:
+          logs.length ===
+          LIVE_LIMIT,
+      });
+  } catch (error) {
+    console.error(
+      "AUDIT_LOGS_LIVE_ERROR:",
+      {
+        code:
+          error?.code ||
+          null,
+
+        errno:
+          error?.errno ||
+          null,
+
+        sqlState:
+          error?.sqlState ||
+          null,
+
+        message:
+          error?.message ||
+          "Unknown error",
+      }
+    );
+
+    return res
+      .status(500)
+      .json({
+        ok: false,
+
+        message:
+          "Unable to load live audit logs",
+      });
+  }
+}
+
+// =============================================================================
+// EXPORTS
+// =============================================================================
 
 module.exports = {
   auditLogs,
+  auditLogsLive,
 };
