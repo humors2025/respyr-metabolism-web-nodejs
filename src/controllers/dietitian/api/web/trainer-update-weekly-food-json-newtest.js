@@ -218,20 +218,47 @@ function resolveDayIndex(days, requestedCode) {
 
 /**
  * The PHP assumed every day looks like { breakfast: { foods: [...] }, ... }.
- * Generated plans have not always honoured that, so meal access is resolved
- * through the helpers below, which accept:
- *   - day.breakfast.foods            (canonical)
- *   - day.Breakfast / day.BREAKFAST  (case-insensitive key)
- *   - day.breakfast = [ ...foods ]   (meal is the array itself)
- *   - day.breakfast.items / .food_items / .food_list / .food / .dishes
- *   - day.meals.breakfast.foods      (meals keyed by type)
- *   - day.meals = [ { meal_type: "breakfast", foods: [...] }, ... ]
- *     (identifier may be meal_type, meal, type, name, meal_name, title, slot)
- * Every accessor returns the LIVE array so mutations persist into food_json.
+ * Real rows in weekly_food_json_suggestions_newtest do not always honour that,
+ * so every meal access goes through a small accessor that understands:
+ *
+ *  A. "foods" layouts — a meal node that holds an array of food objects:
+ *     - day.breakfast.foods                (canonical)
+ *     - day.Breakfast / day.BREAKFAST      (case-insensitive key)
+ *     - day.breakfast = [ ...foods ]       (meal is the array itself)
+ *     - day.breakfast.items / .food_items / .food_list / .food / .dishes
+ *     - day.meals.breakfast.foods          (meals keyed by type)
+ *     - day.meals = [ { meal_type: "breakfast", foods: [...] }, ... ]
+ *
+ *  B. "recipe" layout — the generated-plan output where each entry of
+ *     day.meals IS one recipe:
+ *       { mealName: "breakfast", name, type, recipeId, variantId, recipe {..},
+ *         nutrition: { kcals, carbohydrate, protein, fat, fiber },
+ *         ingredients [..], alternatives [ ...same shape... ] }
+ *     Here the recipe is exposed as food_index 0. Updating index 0 with a
+ *     food whose name matches one of the entry's alternatives swaps the whole
+ *     alternative in (recipe, image, ingredients, nutrition) and keeps the old
+ *     recipe as an alternative, so the choice is reversible. Any other update
+ *     patches name / nutrition in place. Extra foods a dietitian adds to such a
+ *     meal live in entry.extra_foods and appear as index 1..n.
+ *
+ * All accessors operate on the LIVE objects so mutations persist to food_json.
  */
 const MEAL_CONTAINER_KEYS = ["meals", "meal", "meal_plan", "mealplan", "menu", "diet", "plan"];
-const MEAL_ID_KEYS = ["meal_type", "meal", "type", "name", "meal_name", "title", "slot", "code", "key"];
+const MEAL_ID_KEYS = [
+  "meal_type", "mealtype", "meal_name", "mealname", "meal", "slot", "title",
+  "eating_moment", "eatingmoment", "code", "key", "type", "name",
+];
 const FOODS_KEYS = ["foods", "items", "food_items", "food_list", "food", "dishes", "list", "entries"];
+const EXTRA_FOODS_KEY = "extra_foods";
+
+/** Map generated-plan nutrition keys → the API's food macro keys. */
+const NUTRITION_TO_MACRO = {
+  calories: ["kcals", "kcal", "calories", "energy"],
+  carbs_g: ["carbohydrate", "carbohydrates", "carbs", "carbs_g"],
+  protein_g: ["protein", "proteins", "protein_g"],
+  fat_g: ["fat", "fats", "fat_g"],
+  fiber_g: ["fiber", "fibre", "fiber_g", "fibre_g"],
+};
 
 function canonicalToken(value) {
   return String(value ?? "")
@@ -260,10 +287,39 @@ function findKeyCI(obj, wanted) {
   return null;
 }
 
-/**
- * Given a meal node (object or array), return its live foods array.
- * With create=true a missing array is created as meal.foods = [].
- */
+/** Does this meal entry identify itself as mealType (via any known id key)? */
+function entryMatchesMeal(entry, want) {
+  if (!isPlainObject(entry)) return false;
+  const idTokens = MEAL_ID_KEYS.map(canonicalToken);
+  for (const key of Object.keys(entry)) {
+    if (!idTokens.includes(canonicalToken(key))) continue;
+    const value = entry[key];
+    if (typeof value !== "string" && typeof value !== "number") continue;
+    if (canonicalMealType(value) === want) return true;
+  }
+  // Generated plans also carry recipe.recipe_meal_type: ["Breakfast"].
+  const rmt = entry.recipe?.recipe_meal_type;
+  if (Array.isArray(rmt) && rmt.length === 1 && canonicalMealType(rmt[0]) === want) return true;
+  return false;
+}
+
+/** The label a meal entry carries, for diagnostics only. */
+function entryMealLabel(entry) {
+  if (!isPlainObject(entry)) return null;
+  const preferred = ["mealName", "meal_name", "meal_type", "mealType", "meal", "slot", "title"];
+  for (const key of preferred) {
+    if (typeof entry[key] === "string" && entry[key] !== "") return entry[key];
+  }
+  const idTokens = MEAL_ID_KEYS.map(canonicalToken);
+  for (const key of Object.keys(entry)) {
+    if (idTokens.includes(canonicalToken(key)) && (typeof entry[key] === "string" || typeof entry[key] === "number")) {
+      return String(entry[key]);
+    }
+  }
+  return null;
+}
+
+/** Given a meal node (object or array), return its live foods array (or null). */
 function foodsArrayOf(meal, create) {
   if (Array.isArray(meal)) return meal;
   if (!isPlainObject(meal)) return null;
@@ -281,16 +337,219 @@ function foodsArrayOf(meal, create) {
   return null;
 }
 
-/** Locate the meal node for mealType inside a day. Returns null when absent. */
-function findMealNode(day, mealType) {
+/** A generated-plan entry: one recipe per meal, macros under nutrition. */
+function isRecipeMeal(entry) {
+  if (!isPlainObject(entry)) return false;
+  if (foodsArrayOf(entry, false)) return false;
+  return (
+    isPlainObject(entry.nutrition) ||
+    entry.recipeId !== undefined ||
+    entry.recipe_id !== undefined ||
+    isPlainObject(entry.recipe) ||
+    typeof entry.name === "string"
+  );
+}
+
+function readNutritionValue(nutrition, macroKey) {
+  if (!isPlainObject(nutrition)) return 0;
+  for (const key of NUTRITION_TO_MACRO[macroKey]) {
+    if (nutrition[key] !== undefined && nutrition[key] !== null && isNumericValue(nutrition[key])) {
+      return Number(nutrition[key]);
+    }
+  }
+  const ciKey = findKeyCI(nutrition, NUTRITION_TO_MACRO[macroKey]);
+  return ciKey && isNumericValue(nutrition[ciKey]) ? Number(nutrition[ciKey]) : 0;
+}
+
+/** Write a macro into a nutrition object using the key it already uses (or the generated-plan default). */
+function writeNutritionValue(nutrition, macroKey, value) {
+  const ciKey = findKeyCI(nutrition, NUTRITION_TO_MACRO[macroKey]);
+  nutrition[ciKey || NUTRITION_TO_MACRO[macroKey][0]] = roundMacro(value);
+}
+
+function servingsText(entry) {
+  if (typeof entry.portion_with_metric === "string" && entry.portion_with_metric.trim() !== "") {
+    return entry.portion_with_metric;
+  }
+  const people = entry.recipe?.recipe_amount_of_people;
+  if (Array.isArray(people) && people.length && isNumericValue(people[0])) {
+    return `serves ${Number(people[0])}`;
+  }
+  return "serves 1";
+}
+
+function capitalize(s) {
+  const t = String(s ?? "");
+  return t ? t[0].toUpperCase() + t.slice(1) : t;
+}
+
+/** Compact view of an alternative recipe for the response payload. */
+function alternativeSummary(alt) {
+  if (!isPlainObject(alt)) return null;
+  return {
+    food_name: String(alt.name ?? ""),
+    calories: roundMacro(readNutritionValue(alt.nutrition, "calories")),
+    carbs_g: roundMacro(readNutritionValue(alt.nutrition, "carbs_g")),
+    protein_g: roundMacro(readNutritionValue(alt.nutrition, "protein_g")),
+    fat_g: roundMacro(readNutritionValue(alt.nutrition, "fat_g")),
+    fiber_g: roundMacro(readNutritionValue(alt.nutrition, "fiber_g")),
+    recipe_id: alt.recipeId ?? alt.recipe_id ?? null,
+    variant_id: alt.variantId ?? alt.variant_id ?? null,
+    image: alt.recipe?.image ?? null,
+  };
+}
+
+/** Present a generated-plan recipe entry in the API's food shape (read-only view). */
+function recipeMealToFood(entry, mealType) {
+  return {
+    food_name: String(entry.name ?? ""),
+    calories: roundMacro(readNutritionValue(entry.nutrition, "calories")),
+    carbs_g: roundMacro(readNutritionValue(entry.nutrition, "carbs_g")),
+    protein_g: roundMacro(readNutritionValue(entry.nutrition, "protein_g")),
+    fat_g: roundMacro(readNutritionValue(entry.nutrition, "fat_g")),
+    fiber_g: roundMacro(readNutritionValue(entry.nutrition, "fiber_g")),
+    portion_with_metric: servingsText(entry),
+    category: typeof entry.category === "string" && entry.category !== "" ? entry.category : capitalize(mealType),
+    recipe_id: entry.recipeId ?? entry.recipe_id ?? null,
+    variant_id: entry.variantId ?? entry.variant_id ?? null,
+    image: entry.recipe?.image ?? null,
+    ingredients: Array.isArray(entry.ingredients) ? entry.ingredients : [],
+    alternatives: Array.isArray(entry.alternatives)
+      ? entry.alternatives.map(alternativeSummary).filter(Boolean)
+      : [],
+  };
+}
+
+/**
+ * Apply an API food object to the recipe entry at parent[key].
+ * If food_name names one of the entry's alternatives, the alternative becomes
+ * the recipe and the previous recipe takes its slot in alternatives.
+ * Then name / nutrition / portion / category are written from the food.
+ */
+function applyFoodToRecipeMeal(parent, key, food) {
+  let entry = parent[key];
+  const wantName = canonicalToken(food.food_name);
+  const alts = Array.isArray(entry.alternatives) ? entry.alternatives : [];
+  const altIdx = alts.findIndex((alt) => isPlainObject(alt) && canonicalToken(alt.name) === wantName);
+
+  if (altIdx >= 0 && canonicalToken(entry.name) !== wantName) {
+    const chosen = alts[altIdx];
+    const { alternatives: _ignored, [EXTRA_FOODS_KEY]: extras, ...previousRecipe } = entry;
+    const swapped = { ...chosen };
+    swapped.alternatives = alts.slice();
+    swapped.alternatives[altIdx] = previousRecipe;
+    if (swapped.mealName === undefined && entry.mealName !== undefined) swapped.mealName = entry.mealName;
+    if (swapped.eatingMomentId === undefined && entry.eatingMomentId !== undefined) {
+      swapped.eatingMomentId = entry.eatingMomentId;
+    }
+    if (extras !== undefined) swapped[EXTRA_FOODS_KEY] = extras;
+    parent[key] = swapped;
+    entry = swapped;
+  }
+
+  entry.name = String(food.food_name);
+  if (!isPlainObject(entry.nutrition)) entry.nutrition = {};
+  for (const macroKey of REQUIRED_MACRO_FIELDS) {
+    if (food[macroKey] !== undefined && isNumericValue(food[macroKey])) {
+      writeNutritionValue(entry.nutrition, macroKey, food[macroKey]);
+    }
+  }
+  if (typeof food.portion_with_metric === "string" && food.portion_with_metric.trim() !== "") {
+    entry.portion_with_metric = food.portion_with_metric.trim();
+  }
+  if (typeof food.category === "string" && food.category.trim() !== "") {
+    entry.category = food.category.trim();
+  }
+  return entry;
+}
+
+/** Build a brand-new recipe-style entry from an API food (used by "add" on a missing meal). */
+function newRecipeMealFromFood(mealType, food) {
+  const nutrition = {};
+  for (const macroKey of REQUIRED_MACRO_FIELDS) writeNutritionValue(nutrition, macroKey, food[macroKey]);
+  return {
+    mealName: mealType,
+    name: String(food.food_name),
+    nutrition,
+    portion_with_metric: food.portion_with_metric,
+    category: food.category,
+    ingredients: [],
+    alternatives: [],
+    custom: true,
+  };
+}
+
+/** Accessor over a plain foods array. */
+function makeFoodsAccessor(arr) {
+  return {
+    kind: "foods",
+    list: () => arr,
+    count: () => arr.length,
+    get: (i) => arr[i],
+    set: (i, food) => { arr[i] = food; },
+    push: (food) => { arr.push(food); return arr.length - 1; },
+    remove: (i) => arr.splice(i, 1)[0],
+  };
+}
+
+/** Accessor over a generated-plan recipe entry living at parent[key]. */
+function makeRecipeAccessor(parent, key, mealType) {
+  const entry = () => parent[key];
+  const hasPrimary = () => {
+    const e = entry();
+    return isPlainObject(e) && e.name !== null && e.name !== undefined && String(e.name) !== "";
+  };
+  const extras = (create) => {
+    const e = entry();
+    if (!Array.isArray(e[EXTRA_FOODS_KEY])) {
+      if (!create) return [];
+      e[EXTRA_FOODS_KEY] = [];
+    }
+    return e[EXTRA_FOODS_KEY];
+  };
+  return {
+    kind: "recipe",
+    list: () => (hasPrimary() ? [recipeMealToFood(entry(), mealType)] : []).concat(extras(false)),
+    count: () => (hasPrimary() ? 1 : 0) + extras(false).length,
+    get: (i) => (i === 0 && hasPrimary() ? recipeMealToFood(entry(), mealType) : extras(false)[i - (hasPrimary() ? 1 : 0)]),
+    set: (i, food) => {
+      if (i === 0 && hasPrimary()) applyFoodToRecipeMeal(parent, key, food);
+      else extras(true)[i - (hasPrimary() ? 1 : 0)] = food;
+    },
+    push: (food) => {
+      if (!hasPrimary()) {
+        applyFoodToRecipeMeal(parent, key, food);
+        return 0;
+      }
+      const e = extras(true);
+      e.push(food);
+      return e.length; // index = 1 + (e.length - 1)
+    },
+    remove: (i) => {
+      if (i === 0 && hasPrimary()) {
+        if (extras(false).length > 0) {
+          fail(400, "Remove the added foods of this meal before deleting its recipe");
+        }
+        const removed = recipeMealToFood(entry(), mealType);
+        if (Array.isArray(parent)) parent.splice(key, 1);
+        else delete parent[key];
+        return removed;
+      }
+      return extras(true).splice(i - (hasPrimary() ? 1 : 0), 1)[0];
+    },
+  };
+}
+
+/** Locate the meal node for mealType. Returns { parent, key } (node = parent[key]) or null. */
+function locateMeal(day, mealType) {
   if (!isPlainObject(day)) return null;
   const want = canonicalMealType(mealType);
 
   // 1. Direct key on the day (exact, then case/format-insensitive).
-  if (day[mealType] !== undefined && day[mealType] !== null) return day[mealType];
+  if (day[mealType] !== null && typeof day[mealType] === "object") return { parent: day, key: mealType };
   for (const key of Object.keys(day)) {
     if (canonicalMealType(key) === want && day[key] !== null && typeof day[key] === "object") {
-      return day[key];
+      return { parent: day, key };
     }
   }
 
@@ -299,19 +558,15 @@ function findMealNode(day, mealType) {
   const container = containerKey ? day[containerKey] : null;
 
   if (Array.isArray(container)) {
-    for (const entry of container) {
-      if (!isPlainObject(entry)) continue;
-      for (const idKey of MEAL_ID_KEYS) {
-        if (entry[idKey] !== undefined && canonicalMealType(entry[idKey]) === want) return entry;
-      }
+    for (let i = 0; i < container.length; i++) {
+      if (entryMatchesMeal(container[i], want)) return { parent: container, key: i };
     }
     return null;
   }
-
   if (isPlainObject(container)) {
     for (const key of Object.keys(container)) {
       if (canonicalMealType(key) === want && container[key] !== null && typeof container[key] === "object") {
-        return container[key];
+        return { parent: container, key };
       }
     }
   }
@@ -319,17 +574,21 @@ function findMealNode(day, mealType) {
 }
 
 /**
- * Return the live foods array for mealType in day, or null.
- * With create=true the meal (and its foods array) is created in whichever
- * layout the day already uses, so the stored shape stays consistent.
+ * Resolve an accessor for mealType in day, or null when absent.
+ * With create=true the meal is created in whichever layout the day already
+ * uses (recipe entry in a generated plan, foods array otherwise).
  */
-function resolveMealFoods(day, mealType, create = false) {
+function resolveMealAccessor(day, mealType, create = false) {
   if (!isPlainObject(day)) return null;
 
-  const existing = findMealNode(day, mealType);
-  if (existing !== null) {
-    const foods = foodsArrayOf(existing, create);
-    if (foods) return foods;
+  const located = locateMeal(day, mealType);
+  if (located) {
+    const node = located.parent[located.key];
+    const foods = foodsArrayOf(node, false);
+    if (foods) return makeFoodsAccessor(foods);
+    if (isRecipeMeal(node)) return makeRecipeAccessor(located.parent, located.key, mealType);
+    if (create && isPlainObject(node)) return makeFoodsAccessor(foodsArrayOf(node, true));
+    return null;
   }
   if (!create) return null;
 
@@ -337,16 +596,57 @@ function resolveMealFoods(day, mealType, create = false) {
   const container = containerKey ? day[containerKey] : null;
 
   if (Array.isArray(container)) {
+    if (container.some(isRecipeMeal)) {
+      // Generated-plan layout: placeholder recipe entry, filled by the first push().
+      container.push({ mealName: mealType, name: "", nutrition: {}, ingredients: [], alternatives: [], custom: true });
+      return makeRecipeAccessor(container, container.length - 1, mealType);
+    }
     const entry = { meal_type: mealType, foods: [] };
     container.push(entry);
-    return entry.foods;
+    return makeFoodsAccessor(entry.foods);
   }
   if (isPlainObject(container)) {
     container[mealType] = { foods: [] };
-    return container[mealType].foods;
+    return makeFoodsAccessor(container[mealType].foods);
   }
   day[mealType] = { foods: [] };
-  return day[mealType].foods;
+  return makeFoodsAccessor(day[mealType].foods);
+}
+
+/** Every food in a day (all four meal types, plus any unlabeled recipe entries), as API food objects. */
+function listDayFoods(day) {
+  if (!isPlainObject(day)) return [];
+  const seen = new Set();
+  let all = [];
+  for (const mealType of ALLOWED_MEALS) {
+    const located = locateMeal(day, mealType);
+    if (!located) continue;
+    const node = located.parent[located.key];
+    if (seen.has(node)) continue;
+    seen.add(node);
+    const accessor = resolveMealAccessor(day, mealType, false);
+    if (accessor) all = all.concat(accessor.list());
+  }
+  // Recipe entries whose label is not one of the four meal types still count.
+  const containerKey = findKeyCI(day, MEAL_CONTAINER_KEYS);
+  const container = containerKey ? day[containerKey] : null;
+  if (Array.isArray(container)) {
+    container.forEach((entry, i) => {
+      if (seen.has(entry) || !isRecipeMeal(entry)) return;
+      seen.add(entry);
+      all = all.concat(makeRecipeAccessor(container, i, entryMealLabel(entry) || "meal").list());
+    });
+  }
+  return all;
+}
+
+/** Keep a generated plan's own day.nutrition rollup consistent after an edit. */
+function syncDayNutrition(day, totals) {
+  if (!isPlainObject(day) || !isPlainObject(day.nutrition)) return;
+  for (const macroKey of REQUIRED_MACRO_FIELDS) {
+    const ciKey = findKeyCI(day.nutrition, NUTRITION_TO_MACRO[macroKey]);
+    if (ciKey) day.nutrition[ciKey] = roundMacro(totals[macroKey]);
+  }
 }
 
 /** Non-PHI structural hint for 404 diagnostics: which keys/meals the day exposes. */
@@ -356,11 +656,7 @@ function describeDayShape(day) {
   const container = containerKey ? day[containerKey] : null;
   let mealIds = null;
   if (Array.isArray(container)) {
-    mealIds = container.map((entry) => {
-      if (!isPlainObject(entry)) return null;
-      const idKey = MEAL_ID_KEYS.find((k) => entry[k] !== undefined && entry[k] !== null);
-      return idKey ? String(entry[idKey]) : null;
-    });
+    mealIds = container.map(entryMealLabel);
   } else if (isPlainObject(container)) {
     mealIds = Object.keys(container);
   }
@@ -368,7 +664,7 @@ function describeDayShape(day) {
     day_keys: Object.keys(day),
     meals_container: containerKey,
     meal_ids: mealIds,
-    meals_found: ALLOWED_MEALS.filter((m) => Array.isArray(resolveMealFoods(day, m, false))),
+    meals_found: ALLOWED_MEALS.filter((m) => resolveMealAccessor(day, m, false) !== null),
   };
 }
 
@@ -515,14 +811,7 @@ function sumFoods(foods) {
 }
 
 function sumDay(day) {
-  let allFoods = [];
-  for (const mealType of ALLOWED_MEALS) {
-    const foods = resolveMealFoods(day, mealType, false);
-    if (Array.isArray(foods)) {
-      allFoods = allFoods.concat(foods);
-    }
-  }
-  return sumFoods(allFoods);
+  return sumFoods(listDayFoods(day));
 }
 
 function recalculateWeeklyMacros(foodJson) {
@@ -533,16 +822,12 @@ function recalculateWeeklyMacros(foodJson) {
   const weeklyTotal = { calories: 0, carbs_g: 0, protein_g: 0, fat_g: 0, fiber_g: 0 };
 
   for (const day of foodJson.days) {
-    for (const mealType of ALLOWED_MEALS) {
-      const foods = resolveMealFoods(day, mealType, false);
-      if (!Array.isArray(foods)) continue;
-      for (const food of foods) {
-        weeklyTotal.calories += Number(food?.calories ?? 0) || 0;
-        weeklyTotal.carbs_g += Number(food?.carbs_g ?? 0) || 0;
-        weeklyTotal.protein_g += Number(food?.protein_g ?? 0) || 0;
-        weeklyTotal.fat_g += Number(food?.fat_g ?? 0) || 0;
-        weeklyTotal.fiber_g += Number(food?.fiber_g ?? 0) || 0;
-      }
+    for (const food of listDayFoods(day)) {
+      weeklyTotal.calories += Number(food?.calories ?? 0) || 0;
+      weeklyTotal.carbs_g += Number(food?.carbs_g ?? 0) || 0;
+      weeklyTotal.protein_g += Number(food?.protein_g ?? 0) || 0;
+      weeklyTotal.fat_g += Number(food?.fat_g ?? 0) || 0;
+      weeklyTotal.fiber_g += Number(food?.fiber_g ?? 0) || 0;
     }
   }
 
@@ -841,10 +1126,10 @@ const trainerUpdateWeeklyFoodJsonNewtest = async (req, res) => {
       fail(400, "Stored day entry is not an object", { day_code: resolvedDayCode });
     }
 
-    // Live reference into food_json; for "add" the meal/foods array is created
-    // in whatever layout this day already uses.
-    const mealFoods = resolveMealFoods(day, mealType, action === "add");
-    if (!Array.isArray(mealFoods)) {
+    // Accessor over the live food_json; for "add" the meal is created in
+    // whatever layout this day already uses (see "Meal resolution").
+    const meal = resolveMealAccessor(day, mealType, action === "add");
+    if (!meal) {
       fail(404, "Meal foods not found in food_json", {
         day_code: resolvedDayCode,
         meal_type: mealType,
@@ -854,34 +1139,35 @@ const trainerUpdateWeeklyFoodJsonNewtest = async (req, res) => {
 
     if (action === "add") {
       const newFood = normalizeFoodForAdd(payload.food);
-      finalFoodIndex = mealFoods.length;
-      mealFoods.push(newFood);
-      changedFood = newFood;
+      finalFoodIndex = meal.push(newFood);
+      changedFood = meal.get(finalFoodIndex);
     }
 
     if (action === "update" || action === "delete") {
-      if (foodIndex >= mealFoods.length || mealFoods[foodIndex] === undefined) {
+      if (foodIndex >= meal.count() || meal.get(foodIndex) === undefined) {
         fail(404, "Food index not found", {
           day_code: resolvedDayCode,
           meal_type: mealType,
           food_index: foodIndex,
-          food_count: mealFoods.length,
+          food_count: meal.count(),
         });
       }
     }
 
     if (action === "update") {
-      const updatedFood = patchExistingFood(mealFoods[foodIndex], payload.food);
-      mealFoods[foodIndex] = updatedFood;
+      const updatedFood = patchExistingFood(meal.get(foodIndex), payload.food);
+      meal.set(foodIndex, updatedFood);
       finalFoodIndex = foodIndex;
-      changedFood = updatedFood;
+      changedFood = meal.get(foodIndex);
     }
 
     if (action === "delete") {
-      deletedFood = mealFoods[foodIndex];
-      mealFoods.splice(foodIndex, 1);
+      deletedFood = meal.remove(foodIndex);
       finalFoodIndex = foodIndex;
     }
+
+    // Generated plans carry their own per-day nutrition rollup; keep it in step.
+    syncDayNutrition(day, sumDay(day));
 
     // ── 8. Recompute weekly macros + persist ─────────────────────────────────
     const weeklyMacros = recalculateWeeklyMacros(foodJson);
@@ -934,7 +1220,8 @@ const trainerUpdateWeeklyFoodJsonNewtest = async (req, res) => {
 
     // ── 9. Build response summaries ──────────────────────────────────────────
     const selectedDay = foodJson.days[dayIndex];
-    const selectedMealFoods = resolveMealFoods(selectedDay, mealType, false) || [];
+    const selectedMeal = resolveMealAccessor(selectedDay, mealType, false);
+    const selectedMealFoods = selectedMeal ? selectedMeal.list() : [];
 
     // Audit — success (fire-and-forget).
     writeAuthLogSafe(req, {
