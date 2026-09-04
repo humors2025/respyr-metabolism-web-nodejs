@@ -170,6 +170,7 @@ const {
 
 const {
   auditLogs,
+  auditLogsLive,
 } = require("../controllers/dietitian/api/web/audit-logs");
 
 
@@ -782,6 +783,11 @@ router.get(
   auditLogs
 );
 
+router.get(
+  "/dietitian/api/web/audit-logs/live",
+  authMiddleware,
+  auditLogsLive
+);
 
 router.post(
   "/dietitian/api/web/super-admin-all-clients-overview",
