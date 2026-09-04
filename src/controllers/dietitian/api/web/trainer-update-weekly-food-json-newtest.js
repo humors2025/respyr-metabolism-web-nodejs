@@ -214,6 +214,164 @@ function resolveDayIndex(days, requestedCode) {
   return -1;
 }
 
+// ─── Meal resolution ─────────────────────────────────────────────────────────
+
+/**
+ * The PHP assumed every day looks like { breakfast: { foods: [...] }, ... }.
+ * Generated plans have not always honoured that, so meal access is resolved
+ * through the helpers below, which accept:
+ *   - day.breakfast.foods            (canonical)
+ *   - day.Breakfast / day.BREAKFAST  (case-insensitive key)
+ *   - day.breakfast = [ ...foods ]   (meal is the array itself)
+ *   - day.breakfast.items / .food_items / .food_list / .food / .dishes
+ *   - day.meals.breakfast.foods      (meals keyed by type)
+ *   - day.meals = [ { meal_type: "breakfast", foods: [...] }, ... ]
+ *     (identifier may be meal_type, meal, type, name, meal_name, title, slot)
+ * Every accessor returns the LIVE array so mutations persist into food_json.
+ */
+const MEAL_CONTAINER_KEYS = ["meals", "meal", "meal_plan", "mealplan", "menu", "diet", "plan"];
+const MEAL_ID_KEYS = ["meal_type", "meal", "type", "name", "meal_name", "title", "slot", "code", "key"];
+const FOODS_KEYS = ["foods", "items", "food_items", "food_list", "food", "dishes", "list", "entries"];
+
+function canonicalToken(value) {
+  return String(value ?? "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, "");
+}
+
+/** "Breakfast", "morning_snack", "SNACK", "Evening Snacks" → one of ALLOWED_MEALS. */
+function canonicalMealType(value) {
+  const norm = canonicalToken(value);
+  if (!norm) return "";
+  if (norm.includes("breakfast")) return "breakfast";
+  if (norm.includes("lunch")) return "lunch";
+  if (norm.includes("dinner")) return "dinner";
+  if (norm.includes("snack")) return "snacks";
+  return norm;
+}
+
+/** Find the real key on obj whose canonical form matches one of the wanted tokens. */
+function findKeyCI(obj, wanted) {
+  if (!isPlainObject(obj)) return null;
+  const targets = (Array.isArray(wanted) ? wanted : [wanted]).map(canonicalToken);
+  for (const key of Object.keys(obj)) {
+    if (targets.includes(canonicalToken(key))) return key;
+  }
+  return null;
+}
+
+/**
+ * Given a meal node (object or array), return its live foods array.
+ * With create=true a missing array is created as meal.foods = [].
+ */
+function foodsArrayOf(meal, create) {
+  if (Array.isArray(meal)) return meal;
+  if (!isPlainObject(meal)) return null;
+
+  for (const key of FOODS_KEYS) {
+    if (Array.isArray(meal[key])) return meal[key];
+  }
+  const ciKey = findKeyCI(meal, FOODS_KEYS);
+  if (ciKey && Array.isArray(meal[ciKey])) return meal[ciKey];
+
+  if (create) {
+    meal.foods = [];
+    return meal.foods;
+  }
+  return null;
+}
+
+/** Locate the meal node for mealType inside a day. Returns null when absent. */
+function findMealNode(day, mealType) {
+  if (!isPlainObject(day)) return null;
+  const want = canonicalMealType(mealType);
+
+  // 1. Direct key on the day (exact, then case/format-insensitive).
+  if (day[mealType] !== undefined && day[mealType] !== null) return day[mealType];
+  for (const key of Object.keys(day)) {
+    if (canonicalMealType(key) === want && day[key] !== null && typeof day[key] === "object") {
+      return day[key];
+    }
+  }
+
+  // 2. Inside a meals container.
+  const containerKey = findKeyCI(day, MEAL_CONTAINER_KEYS);
+  const container = containerKey ? day[containerKey] : null;
+
+  if (Array.isArray(container)) {
+    for (const entry of container) {
+      if (!isPlainObject(entry)) continue;
+      for (const idKey of MEAL_ID_KEYS) {
+        if (entry[idKey] !== undefined && canonicalMealType(entry[idKey]) === want) return entry;
+      }
+    }
+    return null;
+  }
+
+  if (isPlainObject(container)) {
+    for (const key of Object.keys(container)) {
+      if (canonicalMealType(key) === want && container[key] !== null && typeof container[key] === "object") {
+        return container[key];
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * Return the live foods array for mealType in day, or null.
+ * With create=true the meal (and its foods array) is created in whichever
+ * layout the day already uses, so the stored shape stays consistent.
+ */
+function resolveMealFoods(day, mealType, create = false) {
+  if (!isPlainObject(day)) return null;
+
+  const existing = findMealNode(day, mealType);
+  if (existing !== null) {
+    const foods = foodsArrayOf(existing, create);
+    if (foods) return foods;
+  }
+  if (!create) return null;
+
+  const containerKey = findKeyCI(day, MEAL_CONTAINER_KEYS);
+  const container = containerKey ? day[containerKey] : null;
+
+  if (Array.isArray(container)) {
+    const entry = { meal_type: mealType, foods: [] };
+    container.push(entry);
+    return entry.foods;
+  }
+  if (isPlainObject(container)) {
+    container[mealType] = { foods: [] };
+    return container[mealType].foods;
+  }
+  day[mealType] = { foods: [] };
+  return day[mealType].foods;
+}
+
+/** Non-PHI structural hint for 404 diagnostics: which keys/meals the day exposes. */
+function describeDayShape(day) {
+  if (!isPlainObject(day)) return { day_type: Array.isArray(day) ? "array" : typeof day };
+  const containerKey = findKeyCI(day, MEAL_CONTAINER_KEYS);
+  const container = containerKey ? day[containerKey] : null;
+  let mealIds = null;
+  if (Array.isArray(container)) {
+    mealIds = container.map((entry) => {
+      if (!isPlainObject(entry)) return null;
+      const idKey = MEAL_ID_KEYS.find((k) => entry[k] !== undefined && entry[k] !== null);
+      return idKey ? String(entry[idKey]) : null;
+    });
+  } else if (isPlainObject(container)) {
+    mealIds = Object.keys(container);
+  }
+  return {
+    day_keys: Object.keys(day),
+    meals_container: containerKey,
+    meal_ids: mealIds,
+    meals_found: ALLOWED_MEALS.filter((m) => Array.isArray(resolveMealFoods(day, m, false))),
+  };
+}
+
 // ─── food_json (de)serialization ─────────────────────────────────────────────
 
 function sanitizeJsonText(value) {
@@ -359,7 +517,7 @@ function sumFoods(foods) {
 function sumDay(day) {
   let allFoods = [];
   for (const mealType of ALLOWED_MEALS) {
-    const foods = day?.[mealType]?.foods;
+    const foods = resolveMealFoods(day, mealType, false);
     if (Array.isArray(foods)) {
       allFoods = allFoods.concat(foods);
     }
@@ -376,7 +534,7 @@ function recalculateWeeklyMacros(foodJson) {
 
   for (const day of foodJson.days) {
     for (const mealType of ALLOWED_MEALS) {
-      const foods = day?.[mealType]?.foods;
+      const foods = resolveMealFoods(day, mealType, false);
       if (!Array.isArray(foods)) continue;
       for (const food of foods) {
         weeklyTotal.calories += Number(food?.calories ?? 0) || 0;
@@ -679,45 +837,49 @@ const trainerUpdateWeeklyFoodJsonNewtest = async (req, res) => {
     let finalFoodIndex = null;
 
     const day = foodJson.days[dayIndex];
+    if (!isPlainObject(day)) {
+      fail(400, "Stored day entry is not an object", { day_code: resolvedDayCode });
+    }
+
+    // Live reference into food_json; for "add" the meal/foods array is created
+    // in whatever layout this day already uses.
+    const mealFoods = resolveMealFoods(day, mealType, action === "add");
+    if (!Array.isArray(mealFoods)) {
+      fail(404, "Meal foods not found in food_json", {
+        day_code: resolvedDayCode,
+        meal_type: mealType,
+        ...describeDayShape(day),
+      });
+    }
 
     if (action === "add") {
-      if (!isPlainObject(day[mealType])) {
-        day[mealType] = { foods: [] };
-      }
-      if (!Array.isArray(day[mealType].foods)) {
-        day[mealType].foods = [];
-      }
-
       const newFood = normalizeFoodForAdd(payload.food);
-      finalFoodIndex = day[mealType].foods.length;
-      day[mealType].foods.push(newFood);
+      finalFoodIndex = mealFoods.length;
+      mealFoods.push(newFood);
       changedFood = newFood;
     }
 
-    if (action === "update") {
-      if (!Array.isArray(day[mealType]?.foods)) {
-        fail(404, "Meal foods not found in food_json");
+    if (action === "update" || action === "delete") {
+      if (foodIndex >= mealFoods.length || mealFoods[foodIndex] === undefined) {
+        fail(404, "Food index not found", {
+          day_code: resolvedDayCode,
+          meal_type: mealType,
+          food_index: foodIndex,
+          food_count: mealFoods.length,
+        });
       }
-      if (foodIndex >= day[mealType].foods.length || day[mealType].foods[foodIndex] === undefined) {
-        fail(404, "Food index not found");
-      }
+    }
 
-      const updatedFood = patchExistingFood(day[mealType].foods[foodIndex], payload.food);
-      day[mealType].foods[foodIndex] = updatedFood;
+    if (action === "update") {
+      const updatedFood = patchExistingFood(mealFoods[foodIndex], payload.food);
+      mealFoods[foodIndex] = updatedFood;
       finalFoodIndex = foodIndex;
       changedFood = updatedFood;
     }
 
     if (action === "delete") {
-      if (!Array.isArray(day[mealType]?.foods)) {
-        fail(404, "Meal foods not found in food_json");
-      }
-      if (foodIndex >= day[mealType].foods.length || day[mealType].foods[foodIndex] === undefined) {
-        fail(404, "Food index not found");
-      }
-
-      deletedFood = day[mealType].foods[foodIndex];
-      day[mealType].foods.splice(foodIndex, 1);
+      deletedFood = mealFoods[foodIndex];
+      mealFoods.splice(foodIndex, 1);
       finalFoodIndex = foodIndex;
     }
 
@@ -772,9 +934,7 @@ const trainerUpdateWeeklyFoodJsonNewtest = async (req, res) => {
 
     // ── 9. Build response summaries ──────────────────────────────────────────
     const selectedDay = foodJson.days[dayIndex];
-    const selectedMealFoods = Array.isArray(selectedDay?.[mealType]?.foods)
-      ? selectedDay[mealType].foods
-      : [];
+    const selectedMealFoods = resolveMealFoods(selectedDay, mealType, false) || [];
 
     // Audit — success (fire-and-forget).
     writeAuthLogSafe(req, {
