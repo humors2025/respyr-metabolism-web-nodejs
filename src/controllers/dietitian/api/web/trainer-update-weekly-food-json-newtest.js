@@ -73,6 +73,10 @@ const ALLOWED_MEALS = ["breakfast", "lunch", "snacks", "dinner"];
 
 const REQUIRED_TEXT_FIELDS = ["food_name", "portion_with_metric", "category"];
 const REQUIRED_MACRO_FIELDS = ["calories", "carbs_g", "protein_g", "fat_g", "fiber_g"];
+// Recipe metadata the plan screen sends alongside a food (Method / ingredients /
+// FitChef identifiers). Stored on the meal object exactly as received so the
+// read endpoint can hand them back; never validated or reshaped here.
+const RECIPE_PASSTHROUGH_FIELDS = ["recipe", "ingredients", "recipeId", "variantId", "hash", "eatingMomentId", "fitchefKey"];
 
 const DEFAULT_WEEKLY_NOTE =
   "These values represent the average daily nutrient intake across the full 7-day week.";
@@ -92,6 +96,15 @@ function fail(statusCode, message, extra = {}) {
 }
 
 // ─── Generic helpers ─────────────────────────────────────────────────────────
+
+/** Copy RECIPE_PASSTHROUGH_FIELDS that are present on source onto target, as received. */
+function copyRecipePassthrough(source, target) {
+  if (!isPlainObject(source)) return target;
+  for (const key of RECIPE_PASSTHROUGH_FIELDS) {
+    if (source[key] !== undefined) target[key] = source[key];
+  }
+  return target;
+}
 
 function isPlainObject(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -460,6 +473,7 @@ function applyFoodToRecipeMeal(parent, key, food) {
   if (typeof food.category === "string" && food.category.trim() !== "") {
     entry.category = food.category.trim();
   }
+  copyRecipePassthrough(food, entry);
   return entry;
 }
 
@@ -476,6 +490,7 @@ function newRecipeMealFromFood(mealType, food) {
     ingredients: [],
     alternatives: [],
     custom: true,
+    ...copyRecipePassthrough(food, {}),
   };
 }
 
@@ -753,6 +768,7 @@ function normalizeFoodForAdd(food) {
     fiber_g: roundMacro(food.fiber_g),
     portion_with_metric: String(food.portion_with_metric).trim(),
     category: String(food.category).trim(),
+    ...copyRecipePassthrough(food, {}),
   };
 }
 
@@ -784,6 +800,8 @@ function patchExistingFood(existingFood, incomingFood) {
       updatedFood[field] = roundMacro(incomingFood[field]);
     }
   }
+
+  copyRecipePassthrough(incomingFood, updatedFood);
 
   return updatedFood;
 }
