@@ -363,6 +363,15 @@ const {
   get_weekly_food_json_suggestions_weeks_newtest,
 } = require("../controllers/dietitian/api/web/get_weekly_food_json_suggestions_weeks_newtest");
 
+
+const {
+  searchFoods,
+} = require(
+  "../controllers/dietitian/api/web/search-foods"
+);
+
+
+
 const {
   get_weekly_tab_list_newtest,
 } = require("../controllers/dietitian/api/web/get_weekly_tab_list_newtest");
@@ -422,6 +431,9 @@ const {
 const {
   updateDietitianPassword,
 } = require("../controllers/dietitian/api/web/update_diatitian_password");
+
+
+
 
 
 
@@ -1048,6 +1060,15 @@ router.post(
   authMiddleware,
   trainerUpdateWeeklyFoodJsonNewtest
 );
+
+
+router.get(
+  "/dietitian/api/web/search-foods",
+  authMiddleware,
+  searchFoods
+);
+
+
 
 router.post(
   "/dietitian/api/web/food_json_suggestion_approve_plan_newtest",
