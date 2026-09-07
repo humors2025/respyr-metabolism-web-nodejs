@@ -444,10 +444,12 @@ function applyFoodToRecipeMeal(parent, key, food) {
   const wantName = canonicalToken(food.food_name);
   const alts = Array.isArray(entry.alternatives) ? entry.alternatives : [];
   const altIdx = alts.findIndex((alt) => isPlainObject(alt) && canonicalToken(alt.name) === wantName);
+  let swappedOut = null;
 
   if (altIdx >= 0 && canonicalToken(entry.name) !== wantName) {
     const chosen = alts[altIdx];
     const { alternatives: _ignored, [EXTRA_FOODS_KEY]: extras, ...previousRecipe } = entry;
+    swappedOut = previousRecipe;
     const swapped = { ...chosen };
     swapped.alternatives = alts.slice();
     swapped.alternatives[altIdx] = previousRecipe;
@@ -473,7 +475,16 @@ function applyFoodToRecipeMeal(parent, key, food) {
   if (typeof food.category === "string" && food.category.trim() !== "") {
     entry.category = food.category.trim();
   }
-  copyRecipePassthrough(food, entry);
+  // Recipe metadata sent by the client is stored as received. When the update
+  // came through patchExistingFood(meal.get(i), ...) the food also carries the
+  // read view of the recipe that was just swapped OUT (same array/object
+  // references); those echoes must not overwrite the alternative's own
+  // ingredients / recipe, or the plan would keep the old recipe's shopping items.
+  for (const key of RECIPE_PASSTHROUGH_FIELDS) {
+    if (food[key] === undefined) continue;
+    if (swappedOut && food[key] === swappedOut[key]) continue;
+    entry[key] = food[key];
+  }
   return entry;
 }
 
@@ -870,6 +881,296 @@ function recalculateWeeklyMacros(foodJson) {
   return weeklyMacros;
 }
 
+// ─── Shopping list sync ──────────────────────────────────────────────────────
+//
+// Generated plans carry a food_json.shopping block aggregated from the
+// ingredients of every recipe in the week. Any add / update / delete here
+// changes that ingredient set, so the block is rebuilt from the live plan after
+// each mutation instead of being persisted stale.
+//
+// The block's exact schema is produced outside this service, so the rebuild is
+// deliberately shape-preserving:
+//   - the item list is found whether `shopping` is the array itself, an object
+//     holding the array under a known key (items / list / ingredients / ...),
+//     or an object of category groups that each hold an array;
+//   - field names (name / quantity / unit / price / id) are learned from the
+//     items already stored, falling back to the ingredient objects' own keys;
+//   - an item whose ingredient is still in the plan keeps every other field it
+//     had (image, aisle, notes, ...) and only gets its quantity refreshed. Its
+//     price is the sum of ingredient prices when ingredients carry one,
+//     otherwise it is scaled pro-rata with the quantity;
+//   - an ingredient new to the plan is appended as a copy of the ingredient
+//     object; an item whose ingredient left the plan is dropped;
+//   - numeric total / count fields already present on the container are
+//     recomputed.
+// If the stored block cannot be understood it is left exactly as it was: the
+// food edit itself must never fail because of the shopping list.
+
+const SHOPPING_LIST_KEYS = ["items", "list", "ingredients", "products", "shopping_list", "shoppingList", "entries", "data"];
+const SHOPPING_TOTAL_KEYS = ["total", "total_price", "totalPrice", "total_cost", "totalCost", "estimated_cost", "estimatedCost", "price", "cost"];
+const SHOPPING_COUNT_KEYS = ["item_count", "itemCount", "count", "total_items", "totalItems"];
+const ING_ID_KEYS = ["ingredientId", "ingredient_id", "productId", "product_id", "sku", "id", "key"];
+const ING_NAME_KEYS = ["name", "ingredient", "ingredient_name", "ingredientName", "title", "label", "food_name", "item", "product"];
+const ING_QTY_KEYS = ["quantity", "qty", "amount", "total_quantity", "totalQuantity", "count"];
+const ING_UNIT_KEYS = ["unit", "units", "measure", "uom", "unit_name", "unitName"];
+const ING_PRICE_KEYS = ["price", "cost", "total_price", "totalPrice"];
+const ING_GROUP_KEYS = ["category", "aisle", "group", "department", "section"];
+
+/** First key (in `keys` preference order, case/format-insensitive) present on obj with a non-empty value. */
+function presentKey(obj, keys) {
+  if (!isPlainObject(obj)) return null;
+  const objKeys = Object.keys(obj);
+  for (const want of keys.map(canonicalToken)) {
+    const key = objKeys.find((k) => canonicalToken(k) === want);
+    if (key === undefined) continue;
+    const value = obj[key];
+    if (value !== undefined && value !== null && value !== "") return key;
+  }
+  return null;
+}
+
+/** Leading number of a quantity/price value: 200, "200", "200 g", "1,5 kg" → number; else null. */
+function parseQuantity(value) {
+  if (typeof value === "number") return Number.isFinite(value) ? value : null;
+  if (typeof value === "string") {
+    const match = value.trim().match(/^-?\d+(?:[.,]\d+)?/);
+    return match ? Number(match[0].replace(",", ".")) : null;
+  }
+  return null;
+}
+
+/** Write n back in the same style as the stored value ("200 g" keeps its " g" suffix). */
+function formatQuantityLike(template, n) {
+  const rounded = roundMacro(n);
+  if (typeof template === "string") {
+    const match = template.trim().match(/^-?\d+(?:[.,]\d+)?(.*)$/);
+    return `${rounded}${match ? match[1] : ""}`;
+  }
+  return rounded;
+}
+
+/** Stable identities of an ingredient / shopping item: by id and by name. */
+function ingredientIdentities(obj) {
+  const idKey = presentKey(obj, ING_ID_KEYS);
+  const nameKey = presentKey(obj, ING_NAME_KEYS);
+  const id = idKey ? `id:${String(obj[idKey]).trim().toLowerCase()}` : null;
+  const name = nameKey && canonicalToken(obj[nameKey]) ? `name:${canonicalToken(obj[nameKey])}` : null;
+  return { id, name };
+}
+
+/** Every ingredient in the plan, grouped by identity in order of first appearance. */
+function collectPlanIngredients(foodJson) {
+  const groups = [];
+  const byKey = new Map();
+  if (!Array.isArray(foodJson.days)) return groups;
+
+  for (const day of foodJson.days) {
+    for (const food of listDayFoods(day)) {
+      if (!Array.isArray(food?.ingredients)) continue;
+      for (const raw of food.ingredients) {
+        const ing = typeof raw === "string" && raw.trim() !== "" ? { name: raw.trim() } : raw;
+        if (!isPlainObject(ing)) continue;
+        const ids = ingredientIdentities(ing);
+        const key = ids.id || ids.name;
+        if (!key) continue;
+        let group = byKey.get(key);
+        if (!group) {
+          group = { ids, ingredients: [] };
+          byKey.set(key, group);
+          groups.push(group);
+        }
+        group.ingredients.push(ing);
+      }
+    }
+  }
+  return groups;
+}
+
+/** Sum quantity / price across the occurrences of one ingredient. */
+function aggregateIngredients(ingredients) {
+  let quantity = 0;
+  let hasQuantity = false;
+  let price = 0;
+  let hasPrice = false;
+  for (const ing of ingredients) {
+    const qtyKey = presentKey(ing, ING_QTY_KEYS);
+    const qty = qtyKey ? parseQuantity(ing[qtyKey]) : null;
+    if (qty !== null) {
+      quantity += qty;
+      hasQuantity = true;
+    }
+    const priceKey = presentKey(ing, ING_PRICE_KEYS);
+    const p = priceKey ? parseQuantity(ing[priceKey]) : null;
+    if (p !== null) {
+      price += p;
+      hasPrice = true;
+    }
+  }
+  return {
+    quantity: hasQuantity ? quantity : null,
+    price: hasPrice ? price : null,
+    sample: ingredients[0],
+  };
+}
+
+/**
+ * Locate the item arrays inside the stored shopping block.
+ * Returns [{ parent, key, items }] — parent === null when `shopping` is the
+ * array itself. Several entries mean the block is grouped by category.
+ */
+function locateShoppingLists(shopping) {
+  if (Array.isArray(shopping)) return [{ parent: null, key: null, items: shopping }];
+  if (!isPlainObject(shopping)) return [];
+
+  const listKey = presentKey(shopping, SHOPPING_LIST_KEYS);
+  if (listKey && Array.isArray(shopping[listKey])) {
+    return [{ parent: shopping, key: listKey, items: shopping[listKey] }];
+  }
+  const groupsOwner = listKey && isPlainObject(shopping[listKey]) ? shopping[listKey] : shopping;
+  return Object.keys(groupsOwner)
+    .filter((k) => Array.isArray(groupsOwner[k]))
+    .map((k) => ({ parent: groupsOwner, key: k, items: groupsOwner[k] }));
+}
+
+/** Recompute total / count fields that already exist on a container object. */
+function refreshShoppingTotals(owner, items) {
+  if (!isPlainObject(owner)) return;
+  const totalTokens = SHOPPING_TOTAL_KEYS.map(canonicalToken);
+  const countTokens = SHOPPING_COUNT_KEYS.map(canonicalToken);
+  for (const key of Object.keys(owner)) {
+    const token = canonicalToken(key);
+    if (countTokens.includes(token) && typeof owner[key] === "number") {
+      owner[key] = items.length;
+      continue;
+    }
+    if (!totalTokens.includes(token) || parseQuantity(owner[key]) === null) continue;
+    let sum = 0;
+    let complete = items.length > 0;
+    for (const item of items) {
+      const priceKey = presentKey(item, ING_PRICE_KEYS);
+      const p = priceKey ? parseQuantity(item[priceKey]) : null;
+      if (p === null) {
+        complete = false;
+        break;
+      }
+      sum += p;
+    }
+    if (complete) owner[key] = formatQuantityLike(owner[key], sum);
+  }
+}
+
+/**
+ * Rebuild food_json.shopping from the ingredients currently in the plan.
+ * Returns "absent" | "unrecognized" | "updated" | "failed" for the response.
+ */
+function syncShoppingList(foodJson) {
+  try {
+    const shopping = foodJson.shopping;
+    if (shopping === undefined || shopping === null) return "absent";
+
+    const lists = locateShoppingLists(shopping);
+    if (lists.length === 0) return "unrecognized";
+
+    // Existing items, flattened, remembering the group each came from.
+    const existing = [];
+    for (const list of lists) {
+      for (const item of list.items) {
+        if (isPlainObject(item)) existing.push({ item, list });
+      }
+    }
+    const firstItem = existing.length ? existing[0].item : null;
+    if (firstItem && !presentKey(firstItem, ING_NAME_KEYS) && !presentKey(firstItem, ING_ID_KEYS)) {
+      return "unrecognized";
+    }
+
+    const plan = collectPlanIngredients(foodJson);
+    const sampleIngredient = plan.length ? plan[0].ingredients[0] : null;
+
+    // Field names: what the stored items use, else what the ingredients use.
+    const nameKey = presentKey(firstItem, ING_NAME_KEYS) || presentKey(sampleIngredient, ING_NAME_KEYS) || "name";
+    const qtyKey = presentKey(firstItem, ING_QTY_KEYS) || presentKey(sampleIngredient, ING_QTY_KEYS) || "quantity";
+    const unitKey = presentKey(firstItem, ING_UNIT_KEYS) || presentKey(sampleIngredient, ING_UNIT_KEYS) || "unit";
+    const priceKey = presentKey(firstItem, ING_PRICE_KEYS) || presentKey(sampleIngredient, ING_PRICE_KEYS) || null;
+
+    const byId = new Map();
+    const byName = new Map();
+    for (const entry of existing) {
+      const ids = ingredientIdentities(entry.item);
+      if (ids.id && !byId.has(ids.id)) byId.set(ids.id, entry);
+      if (ids.name && !byName.has(ids.name)) byName.set(ids.name, entry);
+    }
+
+    const rebuilt = lists.map(() => []);
+    const listIndex = (list) => lists.indexOf(list);
+    const consumed = new Set();
+
+    for (const group of plan) {
+      const agg = aggregateIngredients(group.ingredients);
+      const match =
+        (group.ids.id && byId.get(group.ids.id)) ||
+        (group.ids.name && byName.get(group.ids.name)) ||
+        null;
+
+      if (match && !consumed.has(match)) {
+        consumed.add(match);
+        const item = { ...match.item };
+        if (agg.quantity !== null) {
+          const prevQty = parseQuantity(item[qtyKey]);
+          const prevPrice = priceKey ? parseQuantity(item[priceKey]) : null;
+          item[qtyKey] = formatQuantityLike(item[qtyKey], agg.quantity);
+          if (priceKey && agg.price !== null) {
+            item[priceKey] = formatQuantityLike(item[priceKey], agg.price);
+          } else if (priceKey && prevPrice !== null && prevQty !== null && prevQty > 0) {
+            item[priceKey] = formatQuantityLike(item[priceKey], (prevPrice / prevQty) * agg.quantity);
+          }
+        } else if (priceKey && agg.price !== null) {
+          item[priceKey] = formatQuantityLike(item[priceKey], agg.price);
+        }
+        rebuilt[listIndex(match.list)].push(item);
+        continue;
+      }
+
+      // New to the plan: copy the ingredient, expressed in the list's field names.
+      const sample = agg.sample;
+      const item = { ...sample };
+      const sName = presentKey(sample, ING_NAME_KEYS);
+      if (sName && sName !== nameKey) item[nameKey] = sample[sName];
+      const sUnit = presentKey(sample, ING_UNIT_KEYS);
+      if (sUnit && sUnit !== unitKey) item[unitKey] = sample[sUnit];
+      if (agg.quantity !== null) {
+        const sQty = presentKey(sample, ING_QTY_KEYS);
+        item[qtyKey] = formatQuantityLike(sQty ? sample[sQty] : null, agg.quantity);
+      }
+      if (priceKey && agg.price !== null) item[priceKey] = roundMacro(agg.price);
+
+      // Grouped blocks: the group whose name matches the ingredient's category, else the first.
+      let target = 0;
+      if (lists.length > 1) {
+        const gKey = presentKey(sample, ING_GROUP_KEYS);
+        const wanted = gKey ? canonicalToken(sample[gKey]) : "";
+        const idx = wanted ? lists.findIndex((l) => canonicalToken(l.key) === wanted) : -1;
+        target = idx >= 0 ? idx : 0;
+      }
+      rebuilt[target].push(item);
+    }
+
+    // Write back in place so the live foodJson object (and its container keys) are kept.
+    let allItems = [];
+    lists.forEach((list, i) => {
+      list.items.splice(0, list.items.length, ...rebuilt[i]);
+      allItems = allItems.concat(rebuilt[i]);
+    });
+    refreshShoppingTotals(isPlainObject(shopping) ? shopping : null, allItems);
+    if (lists.length === 1 && lists[0].parent && lists[0].parent !== shopping) {
+      refreshShoppingTotals(lists[0].parent, allItems);
+    }
+    return "updated";
+  } catch (err) {
+    console.error("SHOPPING_SYNC_FAILED:", err?.message);
+    return "failed";
+  }
+}
+
 // ─── Audit log (fail-safe, HMAC-hashed PII) ──────────────────────────────────
 
 function getClientIp(req) {
@@ -1187,11 +1488,10 @@ const trainerUpdateWeeklyFoodJsonNewtest = async (req, res) => {
     // Generated plans carry their own per-day nutrition rollup; keep it in step.
     syncDayNutrition(day, sumDay(day));
 
-    // The stored shopping block was priced/aggregated against the days as they
-    // existed at generation time. Any add/update/delete here invalidates it —
-    // drop it rather than persist stale ingredients/prices tied to a food that
-    // no longer exists in the plan.
-    delete foodJson.shopping;
+    // Rebuild the shopping list from the ingredients now in the plan, so an
+    // added, replaced or removed food is reflected there too (see "Shopping
+    // list sync"). Never throws; the status is echoed in the response.
+    const shoppingSync = syncShoppingList(foodJson);
 
     // ── 8. Recompute weekly macros + persist ─────────────────────────────────
     const weeklyMacros = recalculateWeeklyMacros(foodJson);
@@ -1278,6 +1578,7 @@ const trainerUpdateWeeklyFoodJsonNewtest = async (req, res) => {
       meal_summary: sumFoods(selectedMealFoods),
       day_summary: sumDay(selectedDay),
       weekly_json_data: weeklyMacros,
+      shopping_sync: shoppingSync,
       food_json: foodJson,
     });
   } catch (err) {
