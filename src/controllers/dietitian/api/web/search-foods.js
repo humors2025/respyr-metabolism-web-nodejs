@@ -99,6 +99,35 @@ function normalizeSlot(value) {
   return aliases[slot] || slot;
 }
 
+
+
+function resolveThumb(thumb) {
+  if (
+    !thumb ||
+    typeof thumb !== "string"
+  ) {
+    return null;
+  }
+
+  const value = thumb.trim();
+
+  if (!value) {
+    return null;
+  }
+
+  // Already a complete URL.
+  if (/^https?:\/\//i.test(value)) {
+    return value;
+  }
+
+  // Convert relative FitChef image path into a complete URL.
+  return `${FITCHEF_API_BASE_URL}${
+    value.startsWith("/") ? "" : "/"
+  }${value}`;
+}
+
+
+
 /*
 |--------------------------------------------------------------------------
 | Controller
@@ -240,21 +269,33 @@ const searchFoods = async (req, res) => {
     |--------------------------------------------------------------------------
     */
 
-    if (!q) {
-      return res.status(400).json({
-        status: false,
-        ok: false,
-        message: "q is required",
-      });
-    }
+    // if (!q) {
+    //   return res.status(400).json({
+    //     status: false,
+    //     ok: false,
+    //     message: "q is required",
+    //   });
+    // }
 
-    if (q.length < 2) {
-      return res.status(400).json({
-        status: false,
-        ok: false,
-        message: "Search query must contain at least 2 characters",
-      });
-    }
+    // if (q.length < 2) {
+    //   return res.status(400).json({
+    //     status: false,
+    //     ok: false,
+    //     message: "Search query must contain at least 2 characters",
+    //   });
+    // }
+
+
+    // q="" is allowed.
+// It is used by Make My Meal to browse available foods.
+
+if (q.length === 1) {
+  return res.status(400).json({
+    status: false,
+    ok: false,
+    message: "Search query must contain at least 2 characters",
+  });
+}
 
     if (!validSearchText(q)) {
       return res.status(400).json({
@@ -440,9 +481,24 @@ const searchFoods = async (req, res) => {
     |--------------------------------------------------------------------------
     */
 
-    return res
-      .status(200)
-      .json(data);
+    // return res
+    //   .status(200)
+    //   .json(data);
+
+
+    const results = Array.isArray(data.results)
+  ? data.results.map((item) => ({
+      ...item,
+      thumb: resolveThumb(item?.thumb),
+    }))
+  : [];
+
+return res.status(200).json({
+  ...data,
+  results,
+});
+
+
 
   } catch (error) {
     /*
