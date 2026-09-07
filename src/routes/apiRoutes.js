@@ -1062,8 +1062,18 @@ router.post(
 );
 
 
+// router.get(
+//   "/dietitian/api/web/search-foods",
+//   authMiddleware,
+//   searchFoods
+// );
+
+
 router.get(
-  "/dietitian/api/web/search-foods",
+  [
+    "/dietitian/api/web/search-foods",
+    "/search-foods",
+  ],
   authMiddleware,
   searchFoods
 );
