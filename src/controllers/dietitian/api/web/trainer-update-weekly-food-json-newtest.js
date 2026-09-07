@@ -1187,6 +1187,12 @@ const trainerUpdateWeeklyFoodJsonNewtest = async (req, res) => {
     // Generated plans carry their own per-day nutrition rollup; keep it in step.
     syncDayNutrition(day, sumDay(day));
 
+    // The stored shopping block was priced/aggregated against the days as they
+    // existed at generation time. Any add/update/delete here invalidates it —
+    // drop it rather than persist stale ingredients/prices tied to a food that
+    // no longer exists in the plan.
+    delete foodJson.shopping;
+
     // ── 8. Recompute weekly macros + persist ─────────────────────────────────
     const weeklyMacros = recalculateWeeklyMacros(foodJson);
 
