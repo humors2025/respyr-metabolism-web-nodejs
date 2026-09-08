@@ -433,7 +433,7 @@ const {
 } = require("../controllers/dietitian/api/web/update_diatitian_password");
 
 
-
+const { customMeal } = require("../controllers/dietitian/api/web/custom-meal");
 
 
 
@@ -1218,6 +1218,8 @@ router.post(
   habitsManager
 );
  
+
+  router.post("/dietitian/api/web/custom-meal", authMiddleware, customMeal);
 
 module.exports = router;
 
