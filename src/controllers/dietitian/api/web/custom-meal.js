@@ -63,7 +63,7 @@ const FITCHEF_API_BASE_URL = String(
   .trim()
   .replace(/\/+$/, "");
 
-const FITCHEF_API_TIMEOUT_MS = Number(process.env.FITCHEF_API_TIMEOUT_MS) || 15000;
+const FITCHEF_API_TIMEOUT_MS = Number(process.env.FITCHEF_API_TIMEOUT_MS) || 60000;
 
 const FITCHEF_SERVICE_KEY = String(process.env.FITCHEF_SERVICE_KEY || "").trim();
 
@@ -226,6 +226,27 @@ const customMeal = async (req, res) => {
       });
     }
 
+    // The row parsed as JSON, but that alone doesn't mean it's a usable
+    // plan — a row written before the schema settled, or one corrupted in
+    // a way that still parses (e.g. `{}`), would pass parseFoodJson() but
+    // has nothing FitChef can act on. This is the caller's data problem,
+    // not a server error, so 422 (not 500) — matches food_json_found /
+    // days_count in the safe log below either way.
+    const daysCount = Array.isArray(parsed.data?.days) ? parsed.data.days.length : 0;
+    if (!Array.isArray(parsed.data?.days)) {
+      await connection.rollback();
+      console.error("custom-meal: FOOD_JSON_DAYS_MISSING", {
+        record_id: recordId,
+        profile_id: access.profileId,
+        food_json_found: true,
+        days_count: 0,
+      });
+      return sendResponse(res, 422, {
+        status: false,
+        message: "Stored weekly plan has no days[] array — nothing to update",
+      });
+    }
+
     const weekStartDate =
       row.week_start_date instanceof Date
         ? row.week_start_date.toISOString().slice(0, 10)
@@ -275,18 +296,57 @@ const customMeal = async (req, res) => {
       );
     } catch (error) {
       await connection.rollback();
-      const isTimeout = error.code === "ECONNABORTED";
+
+      // Three distinct failure shapes, so "timed out" is never used loosely:
+      //  - TIMEOUT: axios' own `timeout` option elapsed with no response at
+      //    all (ECONNABORTED, or ETIMEDOUT on some Node/OpenSSL versions).
+      //    This means the client gave up waiting — it says nothing about
+      //    whether FitChef ever received the request.
+      //  - CONNECTION ERROR: the TCP/TLS connection itself never completed
+      //    (DNS failure, refused, unreachable, reset). This is a strong
+      //    signal the network path is broken (e.g. no NAT route out of the
+      //    Lambda's VPC) — FitChef was never reached, and this is NOT a
+      //    timeout in the sense of "FitChef was slow".
+      //  - OTHER: anything else axios threw (e.g. a malformed request on
+      //    our end). Rare, but logged distinctly rather than folded into
+      //    one of the two buckets above.
+      const CONNECTION_ERROR_CODES = new Set([
+        "ECONNREFUSED",
+        "ENOTFOUND",
+        "EHOSTUNREACH",
+        "ENETUNREACH",
+        "ECONNRESET",
+        "EPIPE",
+      ]);
+      const isTimeout = error.code === "ECONNABORTED" || error.code === "ETIMEDOUT";
+      const isConnectionError = !isTimeout && CONNECTION_ERROR_CODES.has(error.code);
+      const failureKind = isTimeout ? "timeout" : isConnectionError ? "connection_error" : "other";
+
       console.error("custom-meal: FITCHEF_UPSTREAM_UNREACHABLE", {
         record_id: recordId,
         day,
         meal_name: mealName,
+        failure_kind: failureKind,
+        error_code: error.code,
         message: error.message,
-        timeout: isTimeout,
         duration_ms: Date.now() - requestStartedAt,
       });
+
+      if (isTimeout) {
+        return sendResponse(res, 504, {
+          status: false,
+          message: `FitChef service timed out after ${FITCHEF_API_TIMEOUT_MS}ms`,
+        });
+      }
+      if (isConnectionError) {
+        return sendResponse(res, 502, {
+          status: false,
+          message: "Could not connect to FitChef service (connection error)",
+        });
+      }
       return sendResponse(res, 502, {
         status: false,
-        message: isTimeout ? "FitChef service timed out" : "FitChef service unreachable",
+        message: "FitChef service request failed",
       });
     }
 
@@ -395,8 +455,10 @@ const customMeal = async (req, res) => {
       profile_id: access.profileId,
       day,
       meal_name: mealName,
+      food_json_found: true,
+      days_count: daysCount,
       fitchef_status: fitchefResponse.status,
-      duration_ms: fitchefDurationMs,
+      fitchef_duration_ms: fitchefDurationMs,
     });
 
     return sendResponse(res, 200, {
