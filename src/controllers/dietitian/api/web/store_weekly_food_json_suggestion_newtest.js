@@ -50,6 +50,15 @@
  *    see the note at the status assignment below.
  *  - Macro aliases honoured exactly: cal|calories, cabs|carbs_g, fats|fat_g,
  *    Protein|protein_g, Fibre|fiber_g, plus digestive_score / recovery_score.
+ *    All seven are REQUIRED: the columns are varchar(10) NOT NULL (the PHP also
+ *    failed on a missing one, just with an opaque DB error). Values are stored
+ *    rounded to two decimals, as strings — see requiredMacro().
+ *  - original_food_json is written alongside food_json on both insert and
+ *    update, always as the generator's output. food_json is what the trainer
+ *    later edits; original_food_json stays as the untouched reference. On
+ *    regeneration both are replaced (consistent with status being reset).
+ *    This column is specific to the _newtest table — the original sibling does
+ *    not write it.
  *  - food_json accepted as an object/array OR a JSON string, re-encoded on the
  *    way in. JSON.stringify already matches PHP's JSON_UNESCAPED_UNICODE |
  *    JSON_UNESCAPED_SLASHES (it escapes neither).
@@ -66,8 +75,9 @@
  *  - Connection-failure and PDOException messages are no longer returned to the
  *    caller (they leaked DSN, schema and credentials). Gated behind APP_DEBUG;
  *    server logs carry only error metadata (code/errno/sqlState).
- *  - Macro/score inputs are validated as finite, non-negative numbers instead of
- *    being passed through to decimal columns unchecked.
+ *  - Macro/score inputs are validated as finite, non-negative numbers and
+ *    bounded to the varchar(10) column instead of being passed through
+ *    unchecked. A missing one is a 422, not a MySQL 1048 turned into a 500.
  *  - The read-then-write upsert runs in one transaction with SELECT ... FOR
  *    UPDATE, so two concurrent generations for the same week cannot both miss
  *    the existence check and insert duplicate rows.
@@ -110,8 +120,11 @@ const ID_MAX_LENGTH = 100;
 const FOOD_JSON_MAX_CHARS = 512_000;
 
 // Upper bound on macro / score values. Generous enough for any real weekly plan,
-// tight enough that a garbage value cannot silently land in a decimal column.
+// tight enough that a garbage value cannot silently land in the column.
 const MAX_NUMERIC_VALUE = 1_000_000;
+
+// The macro / score columns are varchar(10) NOT NULL — see requiredMacro().
+const MACRO_COLUMN_MAX_CHARS = 10;
 
 const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
 
@@ -158,13 +171,32 @@ function pickValue(payload, keys) {
 }
 
 /**
- * Validate an optional numeric field. Returns a JS number or null.
+ * Validate a REQUIRED macro / score field and return it as the string that is
+ * stored in the column.
+ *
+ * Schema reality (SHOW COLUMNS on weekly_food_json_suggestions_newtest): cal,
+ * cabs, fats, `Protein`, `Fibre`, digestive_score and recovery_score are all
+ * varchar(10) NOT NULL with no default — not nullable decimals. Two things
+ * follow from that:
+ *
+ *  1. A missing value cannot be bound as NULL: MySQL rejects it with 1048
+ *     "Column cannot be null", which surfaced to the caller as an opaque 500.
+ *     The PHP had exactly the same failure, so the generator has always had to
+ *     send every field; we now say so up front with a 422 instead.
+ *  2. The value must fit in 10 characters. A JS number such as
+ *     0.30000000000000004 or 12345.678901 serialises longer than that and fails
+ *     with 1406 "Data too long" in strict mode. We round to two decimals and
+ *     bind a string, which is the same storage format
+ *     trainer-update-weekly-food-json-newtest.js writes to these columns.
+ *
  * The PHP passed these straight to the driver; a non-numeric value would reach
  * the column as a string and be silently coerced (or truncated) by MySQL.
  */
-function optionalNumber(payload, keys, label) {
+function requiredMacro(payload, keys, label) {
   const raw = pickValue(payload, keys);
-  if (raw === null) return null;
+  if (raw === null) {
+    fail(422, `${label} is required`);
+  }
 
   if (typeof raw !== "number" && typeof raw !== "string") {
     fail(422, `${label} must be a number`);
@@ -182,7 +214,17 @@ function optionalNumber(payload, keys, label) {
     fail(422, `${label} is out of range`);
   }
 
-  return n;
+  const rounded = Math.round((n + Number.EPSILON) * 100) / 100;
+  const text = String(rounded);
+
+  // Belt and braces: MAX_NUMERIC_VALUE with two decimals is exactly 10 chars
+  // ("1000000.00" never occurs because String() drops trailing zeros), so this
+  // cannot trip for a validated value — but the column bound is the truth.
+  if (text.length > MACRO_COLUMN_MAX_CHARS) {
+    fail(422, `${label} is out of range`);
+  }
+
+  return text;
 }
 
 function requiredId(payload, key) {
@@ -409,14 +451,16 @@ async function resolveClientPair(profileId, dieticianId) {
  *     "dietitian_id": "RESPYRD05",     // required; must own the profile
  *     "profile_id":   "PRF10023",      // required
  *     "food_json":    { ... },         // required; object/array or JSON string
- *     "cal": 1850,        // or "calories"
- *     "cabs": 210,        // or "carbs_g"
- *     "fats": 60,         // or "fat_g"
- *     "Protein": 120,     // or "protein_g"
- *     "Fibre": 30,        // or "fiber_g"
- *     "digestive_score": 72,
- *     "recovery_score": 68
+ *     "cal": 1850,        // or "calories"   — required
+ *     "cabs": 210,        // or "carbs_g"    — required
+ *     "fats": 60,         // or "fat_g"      — required
+ *     "Protein": 120,     // or "protein_g"  — required
+ *     "Fibre": 30,        // or "fiber_g"    — required
+ *     "digestive_score": 72,               // required
+ *     "recovery_score": 68                 // required
  *   }
+ *   Macro / score values: number or numeric string, finite, >= 0, <= 1,000,000.
+ *   Stored rounded to two decimals (varchar(10) NOT NULL columns).
  */
 const storeWeeklyFoodJsonSuggestionNewtest = async (req, res) => {
   // HIPAA: never let intermediaries cache PHI responses.
@@ -452,14 +496,17 @@ const storeWeeklyFoodJsonSuggestionNewtest = async (req, res) => {
     auditProfileId = profileId;
 
     const foodJson = encodeFoodJson(payload);
+    const originalFoodJson = foodJson;
 
-    const cal = optionalNumber(payload, ["cal", "calories"], "cal");
-    const cabs = optionalNumber(payload, ["cabs", "carbs_g"], "cabs");
-    const fats = optionalNumber(payload, ["fats", "fat_g"], "fats");
-    const protein = optionalNumber(payload, ["Protein", "protein_g"], "Protein");
-    const fibre = optionalNumber(payload, ["Fibre", "fiber_g"], "Fibre");
-    const digestiveScore = optionalNumber(payload, ["digestive_score"], "digestive_score");
-    const recoveryScore = optionalNumber(payload, ["recovery_score"], "recovery_score");
+    // All seven are varchar(10) NOT NULL in the table, so each is required and
+    // is bound as a rounded string. See requiredMacro().
+    const cal = requiredMacro(payload, ["cal", "calories"], "cal");
+    const cabs = requiredMacro(payload, ["cabs", "carbs_g"], "cabs");
+    const fats = requiredMacro(payload, ["fats", "fat_g"], "fats");
+    const protein = requiredMacro(payload, ["Protein", "protein_g"], "Protein");
+    const fibre = requiredMacro(payload, ["Fibre", "fiber_g"], "Fibre");
+    const digestiveScore = requiredMacro(payload, ["digestive_score"], "digestive_score");
+    const recoveryScore = requiredMacro(payload, ["recovery_score"], "recovery_score");
 
     // ── 2. Key scoping (minimum necessary) ──────────────────────────────────
     if (!serviceKeyCanUseDieticianCode(req.serviceClient, dietitianId)) {
@@ -545,6 +592,7 @@ const storeWeeklyFoodJsonSuggestionNewtest = async (req, res) => {
             month_no = ?,
             year_no = ?,
             food_json = ?,
+            original_food_json = ?,
             source_api_date = ?,
             status = ?,
             cal = ?,
@@ -562,6 +610,7 @@ const storeWeeklyFoodJsonSuggestionNewtest = async (req, res) => {
           week.month_no,
           week.year_no,
           foodJson,
+          originalFoodJson,
           week.source_api_date,
           status,
           cal,
@@ -609,6 +658,7 @@ const storeWeeklyFoodJsonSuggestionNewtest = async (req, res) => {
           month_no,
           year_no,
           food_json,
+          original_food_json,
           source_api_date,
           status,
           cal,
@@ -619,7 +669,7 @@ const storeWeeklyFoodJsonSuggestionNewtest = async (req, res) => {
           digestive_score,
           recovery_score
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `,
       [
         canonicalDieticianId,
@@ -629,6 +679,7 @@ const storeWeeklyFoodJsonSuggestionNewtest = async (req, res) => {
         week.month_no,
         week.year_no,
         foodJson,
+        originalFoodJson,
         week.source_api_date,
         status,
         cal,

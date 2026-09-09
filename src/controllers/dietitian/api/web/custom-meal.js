@@ -29,7 +29,6 @@
  */
 
 const axios = require("axios");
-const crypto = require("crypto");
 
 const pool = require("../../../../config/db");
 const { requireProfileAccess } = require("../../../../utils/accessControl");
@@ -40,14 +39,27 @@ const isProduction =
 
 /*
 |--------------------------------------------------------------------------
-| Configuration — same variables search-foods.js already uses for the
-| Node -> FitChef direction. FITCHEF_SERVICE_KEY was previously optional
-| ("leave it empty for now"); this endpoint requires it, because it writes,
-| where search only reads.
+| Configuration
+|--------------------------------------------------------------------------
+|
+| Base URL: search-foods.js already reads FITCHEF_API_BASE_URL for the
+| Node -> FitChef direction, so that stays the primary name. This endpoint
+| also accepts FITCHEF_DASHBOARD_URL (the name used in the tested Python
+| contract doc) as a fallback so either env var name works without a
+| deploy-time rename.
+|
+| Service key: FITCHEF_SERVICE_KEY was previously optional on search
+| ("leave it empty for now"); this endpoint REQUIRES it, because it writes,
+| where search only reads. Per the tested Python /api/custom_meal_json
+| contract, the header name is X-FitChef-Service-Key (NOT the X-Service-Key
+| name search-foods.js sends — the two Python endpoints check different
+| header names, confirmed against the working curl test).
 |--------------------------------------------------------------------------
 */
 
-const FITCHEF_API_BASE_URL = String(process.env.FITCHEF_API_BASE_URL || "")
+const FITCHEF_API_BASE_URL = String(
+  process.env.FITCHEF_API_BASE_URL || process.env.FITCHEF_DASHBOARD_URL || ""
+)
   .trim()
   .replace(/\/+$/, "");
 
@@ -55,10 +67,38 @@ const FITCHEF_API_TIMEOUT_MS = Number(process.env.FITCHEF_API_TIMEOUT_MS) || 150
 
 const FITCHEF_SERVICE_KEY = String(process.env.FITCHEF_SERVICE_KEY || "").trim();
 
+const FITCHEF_SERVICE_KEY_HEADER = "X-FitChef-Service-Key";
+
 const sendResponse = (res, statusCode, response) => res.status(statusCode).json(response);
 
 const isPlainObject = (value) =>
   value !== null && typeof value === "object" && !Array.isArray(value);
+
+/** Ingredient validation per the tested contract: [{ key: "usa_breakfast:741", grams: 150 }].
+ * `key` must be a non-empty string, `grams` a finite positive number. Returns
+ * a normalized array (grams coerced to Number) or an error message. */
+function validateIngredients(list) {
+  if (!Array.isArray(list) || list.length === 0) {
+    return { ok: false, error: "ingredients[] is required" };
+  }
+  const normalized = [];
+  for (let i = 0; i < list.length; i += 1) {
+    const item = list[i];
+    if (!isPlainObject(item)) {
+      return { ok: false, error: `ingredients[${i}] must be an object` };
+    }
+    const key = typeof item.key === "string" ? item.key.trim() : "";
+    if (!key) {
+      return { ok: false, error: `ingredients[${i}].key is required` };
+    }
+    const grams = Number(item.grams);
+    if (!Number.isFinite(grams) || grams <= 0) {
+      return { ok: false, error: `ingredients[${i}].grams must be a positive number` };
+    }
+    normalized.push({ key, grams });
+  }
+  return { ok: true, data: normalized };
+}
 
 /** food_json as stored may be a JSON string, a Buffer, or already an object
  * (mysql2 sometimes auto-parses JSON columns depending on config) — accept
@@ -133,9 +173,11 @@ const customMeal = async (req, res) => {
       return sendResponse(res, 400, { status: false, message: "meal_name is required" });
     }
 
-    if (!Array.isArray(body.ingredients) || body.ingredients.length === 0) {
-      return sendResponse(res, 400, { status: false, message: "ingredients[] is required" });
+    const ingredientsCheck = validateIngredients(body.ingredients);
+    if (!ingredientsCheck.ok) {
+      return sendResponse(res, 400, { status: false, message: ingredientsCheck.error });
     }
+    const ingredients = ingredientsCheck.data;
 
     // ── 1. auth: dietitian_id must match the JWT, profile must belong to them ──
     const access = await requireProfileAccess(req, dietitianId, profileId);
@@ -210,10 +252,11 @@ const customMeal = async (req, res) => {
       name: body.name || "",
       method: body.method || "",
       prep_minutes: body.prep_minutes || "",
-      ingredients: body.ingredients,
+      ingredients,
       plan: parsed.data,
     };
 
+    const requestStartedAt = Date.now();
     let fitchefResponse;
     try {
       fitchefResponse = await axios.post(
@@ -223,7 +266,7 @@ const customMeal = async (req, res) => {
           headers: {
             Accept: "application/json",
             "Content-Type": "application/json",
-            "X-Service-Key": FITCHEF_SERVICE_KEY,
+            [FITCHEF_SERVICE_KEY_HEADER]: FITCHEF_SERVICE_KEY,
           },
           timeout: FITCHEF_API_TIMEOUT_MS,
           maxRedirects: 0,
@@ -234,8 +277,12 @@ const customMeal = async (req, res) => {
       await connection.rollback();
       const isTimeout = error.code === "ECONNABORTED";
       console.error("custom-meal: FITCHEF_UPSTREAM_UNREACHABLE", {
+        record_id: recordId,
+        day,
+        meal_name: mealName,
         message: error.message,
         timeout: isTimeout,
+        duration_ms: Date.now() - requestStartedAt,
       });
       return sendResponse(res, 502, {
         status: false,
@@ -244,17 +291,35 @@ const customMeal = async (req, res) => {
     }
 
     const fitchefBody = isPlainObject(fitchefResponse.data) ? fitchefResponse.data : {};
+    const fitchefDurationMs = Date.now() - requestStartedAt;
 
     if (fitchefResponse.status < 200 || fitchefResponse.status >= 300 || !fitchefBody.ok) {
-      // FitChef's own status (400/404/500/...) is forwarded as-is where it
-      // makes sense; anything unexpected falls back to 502. The DB is never
-      // touched — the transaction rolls back and the stored plan is
-      // untouched, exactly as it was before this request.
+      // The DB is never touched on any FitChef failure — the transaction
+      // rolls back and the stored plan is untouched, exactly as it was
+      // before this request.
       await connection.rollback();
       console.error("custom-meal: FITCHEF_REJECTED", {
+        record_id: recordId,
+        day,
+        meal_name: mealName,
         upstream_status: fitchefResponse.status,
         upstream_error: fitchefBody.error,
+        duration_ms: fitchefDurationMs,
       });
+
+      // 401 = service-key mismatch / Python-side misconfiguration, not a
+      // fault of the calling dietitian — surface as a server error, not an
+      // auth failure the frontend would try to "fix" by re-logging-in.
+      if (fitchefResponse.status === 401) {
+        return sendResponse(res, 500, {
+          status: false,
+          message: "FitChef service authentication failed (service key mismatch)",
+        });
+      }
+      // 400 (invalid plan/meal/ingredients) and 404 (day/meal not found)
+      // are the caller's problem and are forwarded as-is. Everything else
+      // (500, or anything unrecognized) becomes a 502 — Python's fault,
+      // surfaced as an upstream failure.
       const forwardStatus = [400, 404].includes(fitchefResponse.status) ? fitchefResponse.status : 502;
       return sendResponse(res, forwardStatus, {
         status: false,
@@ -264,7 +329,12 @@ const customMeal = async (req, res) => {
 
     if (!isPlainObject(fitchefBody.food_json)) {
       await connection.rollback();
-      console.error("custom-meal: FITCHEF_MISSING_FOOD_JSON");
+      console.error("custom-meal: FITCHEF_MISSING_FOOD_JSON", {
+        record_id: recordId,
+        day,
+        meal_name: mealName,
+        duration_ms: fitchefDurationMs,
+      });
       return sendResponse(res, 502, {
         status: false,
         message: "FitChef did not return an updated plan",
@@ -274,31 +344,73 @@ const customMeal = async (req, res) => {
     // ── 4. persist the updated plan back into the SAME row ────────────────
     const updatedFoodJson = JSON.stringify(fitchefBody.food_json);
 
-    await connection.execute(
-      `
-        UPDATE weekly_food_json_suggestions_newtest
-        SET food_json = ?, updated_at = NOW()
-        WHERE id = ?
-          AND UPPER(TRIM(dietician_id)) = ?
-          AND profile_id = ?
-        LIMIT 1
-      `,
-      [updatedFoodJson, recordId, access.dieticianId, access.profileId]
-    );
+    let updateResult;
+    try {
+      [updateResult] = await connection.execute(
+        `
+          UPDATE weekly_food_json_suggestions_newtest
+          SET food_json = ?, updated_at = NOW()
+          WHERE id = ?
+            AND UPPER(TRIM(dietician_id)) = ?
+            AND profile_id = ?
+          LIMIT 1
+        `,
+        [updatedFoodJson, recordId, access.dieticianId, access.profileId]
+      );
+    } catch (dbError) {
+      await connection.rollback();
+      // FitChef already generated the meal/image successfully at this point;
+      // the failure is purely ours. Logged distinctly so an on-call engineer
+      // doesn't mistake this for a FitChef-side problem.
+      console.error("custom-meal: DB_PERSIST_FAILED_AFTER_FITCHEF_SUCCESS", {
+        record_id: recordId,
+        day,
+        meal_name: mealName,
+        db_error: dbError.message,
+      });
+      return sendResponse(res, 500, {
+        status: false,
+        message: "FitChef generated the meal, but saving it failed. Nothing was changed — please retry.",
+      });
+    }
+
+    if (!updateResult || updateResult.affectedRows !== 1) {
+      await connection.rollback();
+      console.error("custom-meal: DB_PERSIST_NO_ROWS_AFFECTED_AFTER_FITCHEF_SUCCESS", {
+        record_id: recordId,
+        day,
+        meal_name: mealName,
+        affected_rows: updateResult ? updateResult.affectedRows : null,
+      });
+      return sendResponse(res, 409, {
+        status: false,
+        message: "Weekly plan row changed ownership or was removed before the update could be saved. Please retry.",
+      });
+    }
 
     await connection.commit();
 
+    console.log("custom-meal: SUCCESS", {
+      record_id: recordId,
+      profile_id: access.profileId,
+      day,
+      meal_name: mealName,
+      fitchef_status: fitchefResponse.status,
+      duration_ms: fitchefDurationMs,
+    });
+
     return sendResponse(res, 200, {
       status: true,
-      message: "Custom meal created successfully",
+      message: "Custom meal updated successfully",
       data: {
         record_id: recordId,
         profile_id: access.profileId,
         day,
-        meal_name: mealName,
         meal_index: fitchefBody.meal_index,
+        meal_name: mealName,
         meal: fitchefBody.meal,
         image: fitchefBody.image,
+        nutrition: isPlainObject(fitchefBody.nutrition) ? fitchefBody.nutrition : undefined,
         warnings: fitchefBody.warnings || [],
       },
     });

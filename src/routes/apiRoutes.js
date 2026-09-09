@@ -359,6 +359,13 @@ const {
   trainerUpdateWeeklyFoodJsonNewtest,
 } = require("../controllers/dietitian/api/web/trainer-update-weekly-food-json-newtest");
 
+
+const {
+  resetWeeklyFoodJsonNewtest,
+} = require("../controllers/dietitian/api/web/reset-weekly-food-json-newtest");
+
+
+
 const {
   get_weekly_food_json_suggestions_weeks_newtest,
 } = require("../controllers/dietitian/api/web/get_weekly_food_json_suggestions_weeks_newtest");
@@ -1059,6 +1066,13 @@ router.post(
   "/dietitian/api/web/trainer-update-weekly-food-json-newtest",
   authMiddleware,
   trainerUpdateWeeklyFoodJsonNewtest
+);
+
+
+router.post(
+  "/dietitian/api/web/reset-weekly-food-json-newtest",
+  authMiddleware,
+  resetWeeklyFoodJsonNewtest
 );
 
 
