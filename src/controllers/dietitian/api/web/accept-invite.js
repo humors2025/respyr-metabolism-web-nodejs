@@ -36,9 +36,17 @@ const {
 const {
   s3,
   AGREEMENT_S3_BUCKET,
+  AGREEMENT_STORAGE_SKIPPED,
+  AGREEMENT_SKIPPED_BUCKET,
 } = require(
   "../../../../config/s3"
 );
+
+// UAT ONLY: when agreement storage is skipped (config/s3.js), rows are recorded
+// against a marker bucket instead of a real one.
+const AGREEMENT_BUCKET_FOR_RECORD = AGREEMENT_STORAGE_SKIPPED
+  ? AGREEMENT_SKIPPED_BUCKET
+  : AGREEMENT_S3_BUCKET;
 
 const {
   APP_DEBUG,
@@ -1025,7 +1033,8 @@ const acceptInvite =
       */
 
       if (
-        !AGREEMENT_S3_BUCKET
+        !AGREEMENT_S3_BUCKET &&
+        !AGREEMENT_STORAGE_SKIPPED
       ) {
         await conn
           .rollback();
@@ -1154,8 +1163,10 @@ const acceptInvite =
       let agreementObjectInfo;
 
       try {
-        agreementObjectInfo =
-          await s3.send(
+        // UAT ONLY: storage skipped -> nothing to verify (see config/s3.js).
+        agreementObjectInfo = AGREEMENT_STORAGE_SKIPPED
+          ? { ContentLength: null, ETag: null }
+          : await s3.send(
             new HeadObjectCommand(
               {
                 Bucket:
@@ -2079,7 +2090,7 @@ const acceptInvite =
         [
           invite.id,
 
-          AGREEMENT_S3_BUCKET,
+          AGREEMENT_BUCKET_FOR_RECORD,
 
           agreementS3Key,
 
@@ -2181,7 +2192,7 @@ const acceptInvite =
 
             agreement: {
               s3_bucket:
-                AGREEMENT_S3_BUCKET,
+                AGREEMENT_BUCKET_FOR_RECORD,
 
               s3_key:
                 agreementS3Key,

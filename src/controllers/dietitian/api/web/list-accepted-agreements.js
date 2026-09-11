@@ -45,7 +45,7 @@ const pool = require("../../../../config/db");
 const { GetObjectCommand } = require("@aws-sdk/client-s3");
 const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
 
-const { s3, AGREEMENT_S3_BUCKET } = require("../../../../config/s3");
+const { s3, AGREEMENT_S3_BUCKET, AGREEMENT_SKIPPED_BUCKET } = require("../../../../config/s3");
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -298,6 +298,8 @@ async function getAcceptedAgreements(scopeParentEmail) {
  */
 async function buildDownloadUrl(bucket, key) {
   if (!bucket || !key) return null;
+  // UAT ONLY: rows recorded while storage was skipped have no file to link to.
+  if (bucket === AGREEMENT_SKIPPED_BUCKET) return null;
 
   try {
     const command = new GetObjectCommand({
