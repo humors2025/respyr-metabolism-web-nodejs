@@ -23,33 +23,66 @@ const poolConfig = {
 
 if (isLambda) {
   // ---------------------------------------------------------------------------
-  // TLS via certificate pinning (self-hosted MySQL on EC2).
+  // Transport security to MySQL, selected per environment with DB_SSL_MODE:
   //
-  // The DB is MySQL on an EC2 instance using MySQL's auto-generated
-  // self-signed certificates, so the public RDS CA bundle cannot validate it.
-  // Instead we PIN the server's own CA (src/config/mysql-ca.pem, copied from
-  // /var/lib/mysql/ca.pem on the DB host):
+  //   pinned    (default) TLS with full certificate CHAIN validation against a
+  //             CA file shipped in src/config. This is PRODUCTION. Only
+  //             certificates signed by the pinned CA are accepted, so a MITM
+  //             presenting any other certificate is rejected. Hostname matching
+  //             is skipped (checkServerIdentity) because MySQL auto-generated
+  //             certs carry a generic CN, not our IP; chain validation is
+  //             unaffected. The CA file is chosen with DB_CA_PATH (a file name
+  //             inside src/config, default mysql-ca.pem). If the DB server
+  //             certificates are ever regenerated, replace that file and
+  //             redeploy or connections fail closed with HANDSHAKE_SSL_ERROR.
   //
-  //   - rejectUnauthorized: true  -> full certificate CHAIN validation is ON.
-  //     Only certificates signed by our pinned CA are accepted. A MITM with
-  //     any other certificate (including any other self-signed cert) is
-  //     rejected. This replaces the previous rejectUnauthorized:false, which
-  //     accepted ANY certificate.
+  //   encrypted TLS on the wire but the server certificate is NOT verified.
+  //             Needs no CA file. Acceptable ONLY for non-production databases
+  //             that share a private subnet with the Lambda (e.g. UAT), where
+  //             a network-level MITM is not a realistic threat. Never for prod.
   //
-  //   - checkServerIdentity: () => undefined -> skips ONLY the hostname
-  //     check. MySQL auto-generated certs carry a generic CN (not our IP),
-  //     so hostname matching can never succeed. Chain validation above is
-  //     unaffected. Returning undefined = identity accepted.
+  //   disabled  Plain TCP, no TLS. Same restriction as "encrypted"; the MySQL
+  //             user must not carry REQUIRE SSL.
   //
-  // If the DB server's certificates are ever regenerated (e.g. MySQL
-  // reinstall), copy the new ca.pem into src/config/mysql-ca.pem and
-  // redeploy, or connections will fail closed with HANDSHAKE_SSL_ERROR.
+  // Any other value fails closed at startup rather than silently downgrading.
   // ---------------------------------------------------------------------------
-  poolConfig.ssl = {
-    rejectUnauthorized: true,
-    ca: fs.readFileSync(path.join(__dirname, "mysql-ca.pem"), "utf8"),
-    checkServerIdentity: () => undefined,
-  };
+  const sslMode = String(process.env.DB_SSL_MODE || "pinned")
+    .trim()
+    .toLowerCase();
+
+  if (sslMode === "pinned") {
+    const caFileName = process.env.DB_CA_PATH || "mysql-ca.pem";
+    const caPath = path.resolve(__dirname, caFileName);
+
+    if (!caPath.startsWith(path.resolve(__dirname) + path.sep)) {
+      throw new Error("DB_CA_PATH must be a file inside src/config");
+    }
+
+    if (!fs.existsSync(caPath)) {
+      throw new Error(
+        `DB CA file not found: ${caFileName} (set DB_CA_PATH to a file inside src/config)`
+      );
+    }
+
+    poolConfig.ssl = {
+      rejectUnauthorized: true,
+      ca: fs.readFileSync(caPath, "utf8"),
+      checkServerIdentity: () => undefined,
+    };
+  } else if (sslMode === "encrypted") {
+    poolConfig.ssl = {
+      rejectUnauthorized: false,
+    };
+  } else if (sslMode === "disabled") {
+    // No poolConfig.ssl: mysql2 connects without TLS.
+  } else {
+    throw new Error(
+      `Invalid DB_SSL_MODE "${process.env.DB_SSL_MODE}". Expected pinned, encrypted or disabled.`
+    );
+  }
+
+  // Safe to log: the mode is configuration, not a secret.
+  console.log("Database TLS mode:", sslMode);
 
   // Add connection timeout for Lambda
   poolConfig.connectTimeout = 10000;
