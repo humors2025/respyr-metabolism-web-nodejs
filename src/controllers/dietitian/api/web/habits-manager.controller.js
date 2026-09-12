@@ -270,6 +270,70 @@ function normalizeFoodType(input) {
   return JSON.stringify({});
 }
 
+// ── allergies / food_preferences (JSON columns on user_habits) ──────────────
+//   allergies        : ["nuts", "gluten"]
+//   food_preferences : { include: ["yogurt"], exclude: ["ham"] }
+//   Consumed by get_latest_72hr_tests.js (meal-plan generator feed).
+
+const MAX_FOOD_LIST_ITEMS = 100;
+const MAX_FOOD_ITEM_LENGTH = 100;
+
+const EMPTY_FOOD_PREFERENCES = Object.freeze({ include: [], exclude: [] });
+
+/**
+ * Validate a list of food names. Returns a clean string[] (trimmed, de-duplicated,
+ * order kept), or null when the input is not a list of strings or exceeds the
+ * caps. null / "" count as an empty list.
+ */
+function normalizeStringList(input) {
+  if (input == null || input === "") return [];
+  if (!Array.isArray(input)) return null;
+  if (input.length > MAX_FOOD_LIST_ITEMS) return null;
+  const seen = new Set();
+  const out = [];
+  for (const item of input) {
+    if (typeof item !== "string") return null;
+    const text = item.trim();
+    if (text.length > MAX_FOOD_ITEM_LENGTH) return null;
+    if (text === "" || seen.has(text)) continue;
+    seen.add(text);
+    out.push(text);
+  }
+  return out;
+}
+
+/** food_preferences INPUT → { include, exclude }, or null when invalid. */
+function normalizeFoodPreferences(input) {
+  if (input == null || input === "") return { include: [], exclude: [] };
+  if (!isPlainObject(input)) return null;
+  const include = normalizeStringList(input.include);
+  const exclude = normalizeStringList(input.exclude);
+  if (include === null || exclude === null) return null;
+  return { include, exclude };
+}
+
+// Stored JSON → response shape. mysql2 returns native JSON columns already
+// parsed and TEXT columns as strings; both are handled. Malformed rows read back
+// as empty, never throw.
+function decodeStoredJson(raw) {
+  if (raw == null || raw === "") return null;
+  try {
+    return typeof raw === "string" ? JSON.parse(raw) : raw;
+  } catch (_) {
+    return null;
+  }
+}
+
+function buildStringList(raw) {
+  return normalizeStringList(decodeStoredJson(raw)) ?? [];
+}
+
+function buildFoodPreferences(raw) {
+  return (
+    normalizeFoodPreferences(decodeStoredJson(raw)) ?? { ...EMPTY_FOOD_PREFERENCES }
+  );
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 //  Token-bound profile access (BOLA/IDOR guard) — runs before every action.
 //  On success returns { dieticianId, profileId }; on failure writes the HTTP
@@ -1289,7 +1353,8 @@ async function actionFetchPreferences({ req, res, access }) {
   const { profileId } = access;
 
   const [rows] = await pool.execute(
-    `SELECT id, profile_id, goal, activity, food_type, glp_1, dttm, tsstamp
+    `SELECT id, profile_id, goal, activity, food_type, allergies, food_preferences,
+            glp_1, dttm, tsstamp
        FROM user_habits
       WHERE profile_id = ?
       ORDER BY id DESC
@@ -1310,6 +1375,8 @@ async function actionFetchPreferences({ req, res, access }) {
       goal: row.goal,
       activity: row.activity,
       food_type: buildFoodType(row.food_type),
+      allergies: buildStringList(row.allergies),
+      food_preferences: buildFoodPreferences(row.food_preferences),
       glp_1: Number(row.glp_1 ?? 0),
       dttm: row.dttm,
       tsstamp: row.tsstamp,
@@ -1318,7 +1385,8 @@ async function actionFetchPreferences({ req, res, access }) {
 }
 
 // ── save_preferences ─ upsert user_habits for a profile ─────────────────────
-//   Body: { profile_id, goal, activity, food_type?, glp_1? }
+//   Body: { profile_id, goal, activity, food_type?, glp_1?,
+//           allergies?: string[], food_preferences?: { include?, exclude? } }
 //   UPDATE the latest row; if none exists, INSERT. (No unique-key dependency.)
 async function actionSavePreferences({ req, res, access }) {
   const { profileId } = access;
@@ -1341,9 +1409,44 @@ async function actionSavePreferences({ req, res, access }) {
   const foodTypeJson = normalizeFoodType(req.body?.food_type);
   const epoch = Math.floor(Date.now() / 1000);
 
-  // Try UPDATE latest row first.
+  // allergies / food_preferences are OPTIONAL. When the key is absent the stored
+  // value is kept on UPDATE (an older dashboard build must not wipe them), and
+  // defaults to empty on INSERT. When present, it is validated and replaces the
+  // stored value; explicit null clears it.
+  let allergies = null;
+  if (req.body?.allergies !== undefined) {
+    allergies = normalizeStringList(req.body.allergies);
+    if (allergies === null) {
+      return fail(
+        res,
+        422,
+        `allergies must be a list of up to ${MAX_FOOD_LIST_ITEMS} strings`,
+        "VALIDATION_ERROR"
+      );
+    }
+  }
+
+  let foodPreferences = null;
+  if (req.body?.food_preferences !== undefined) {
+    foodPreferences = normalizeFoodPreferences(req.body.food_preferences);
+    if (foodPreferences === null) {
+      return fail(
+        res,
+        422,
+        "food_preferences must be an object with include/exclude string lists",
+        "VALIDATION_ERROR"
+      );
+    }
+  }
+
+  // Try UPDATE latest row first. The stored lists are read alongside the id so an
+  // omitted key can be carried forward without a second round trip.
   const [existing] = await pool.execute(
-    `SELECT id FROM user_habits WHERE profile_id = ? ORDER BY id DESC LIMIT 1`,
+    `SELECT id, allergies, food_preferences
+       FROM user_habits
+      WHERE profile_id = ?
+      ORDER BY id DESC
+      LIMIT 1`,
     [profileId]
   );
 
@@ -1351,20 +1454,46 @@ async function actionSavePreferences({ req, res, access }) {
   let updated;
   if (existing.length) {
     id = Number(existing[0].id);
+    if (allergies === null) allergies = buildStringList(existing[0].allergies);
+    if (foodPreferences === null) {
+      foodPreferences = buildFoodPreferences(existing[0].food_preferences);
+    }
     await pool.execute(
       `UPDATE user_habits
-          SET goal = ?, activity = ?, food_type = ?, glp_1 = ?,
+          SET goal = ?, activity = ?, food_type = ?,
+              allergies = ?, food_preferences = ?, glp_1 = ?,
               dttm = CURDATE(), tsstamp = ?
         WHERE id = ?`,
-      [goal, activity, foodTypeJson, glp1, epoch, id]
+      [
+        goal,
+        activity,
+        foodTypeJson,
+        JSON.stringify(allergies),
+        JSON.stringify(foodPreferences),
+        glp1,
+        epoch,
+        id,
+      ]
     );
     updated = true;
   } else {
+    if (allergies === null) allergies = [];
+    if (foodPreferences === null) foodPreferences = { ...EMPTY_FOOD_PREFERENCES };
     const [result] = await pool.execute(
       `INSERT INTO user_habits
-         (profile_id, goal, activity, food_type, glp_1, dttm, tsstamp)
-       VALUES (?, ?, ?, ?, ?, CURDATE(), ?)`,
-      [profileId, goal, activity, foodTypeJson, glp1, epoch]
+         (profile_id, goal, activity, food_type, allergies, food_preferences,
+          glp_1, dttm, tsstamp)
+       VALUES (?, ?, ?, ?, ?, ?, ?, CURDATE(), ?)`,
+      [
+        profileId,
+        goal,
+        activity,
+        foodTypeJson,
+        JSON.stringify(allergies),
+        JSON.stringify(foodPreferences),
+        glp1,
+        epoch,
+      ]
     );
     id = Number(result.insertId);
     updated = false;
@@ -1380,6 +1509,8 @@ async function actionSavePreferences({ req, res, access }) {
       goal,
       activity,
       food_type: buildFoodType(foodTypeJson),
+      allergies,
+      food_preferences: foodPreferences,
       glp_1: glp1,
       epoch_timestamp: epoch,
     },
