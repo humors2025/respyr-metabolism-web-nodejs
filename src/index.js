@@ -61,6 +61,7 @@ app.use((req, res, next) => {
   if (isLocal) {
     const allowedOrigins = [
       "http://localhost:3000",
+      "https://localhost:3000", // next dev --experimental-https (Stripe return URLs must be https)
       "http://localhost:3001",
       "http://localhost:5173",
       "http://localhost:8080", // static marketing site (Website/) served locally

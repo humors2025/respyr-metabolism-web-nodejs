@@ -33,7 +33,15 @@ const ROUNDS = Math.max(4, parseInt(process.env.BCRYPT_ROUNDS, 10) || 12);
 
 const USERS = [
   { email: "connect@respyr.in",       name: "Respyr Super Admin", role: "super_admin",    code: "RESPYRD01", parent: null },
-  { email: "evan@test.local",         name: "Evan Gaudet",        role: "admin",          code: "RESPYRD05", parent: "connect@respyr.in" },
+  // Real US team roster (emails + codes as recorded in schema.sql notes), so
+  // local dropdowns look like UAT. Passwords are the seed password.
+  { email: "evan.gaudet@gmail.com",   name: "Evan Gaudet",        role: "admin",          code: "RESPYRD05", parent: "connect@respyr.in" },
+  { email: "derek.lopez88@gmail.com", name: "Derek Lopez",        role: "admin",          code: "RESPYRD06", parent: "connect@respyr.in" },
+  { email: "tanner.l.staton@gmail.com", name: "Tanner Staton",    role: "trainer",        code: "RESPYRD07", parent: "evan.gaudet@gmail.com" },
+  { email: "teddy@wunderinteractive.com", name: "Teddy",          role: "trainer",        code: "RESPYRD08", parent: "evan.gaudet@gmail.com" },
+  { email: "snutwell@yahoo.com",      name: "S. Nutwell",         role: "trainer",        code: "RESPYRD10", parent: "evan.gaudet@gmail.com" },
+  // Test gym
+  { email: "evan@test.local",         name: "Evan (test TA)",     role: "admin",          code: "TESTTA01",  parent: "connect@respyr.in" },
   { email: "owner@ironworks.test",    name: "Iron Works Owner",   role: "facility_admin", code: "TRX1234",   parent: "evan@test.local", facility: true },
   { email: "tanner@ironworks.test",   name: "Tanner Staton",      role: "trainer",        code: "TRN0000001", parent: "owner@ironworks.test", facility: true, split: 50 },
   { email: "sophia@ironworks.test",   name: "Sophia Lee",         role: "trainer",        code: "TRN0000002", parent: "owner@ironworks.test", facility: true, split: 0 },
@@ -103,9 +111,11 @@ async function main() {
       );
     }
 
+    const superHash0 = await bcrypt.hash("Qwerty@12345", ROUNDS);
+    await conn.execute(`UPDATE table_dietician SET password = ? WHERE email = 'connect@respyr.in'`, [superHash0]);
     await conn.commit();
     console.log(`Seeded facility #${facilityId} (${FACILITY.name}), ${USERS.length} users, ${CLIENTS.length} clients.`);
-    console.log(`Password for all accounts: ${PASSWORD}`);
+    console.log(`Password for seed accounts: ${PASSWORD} (connect@respyr.in: Qwerty@12345)`);
   } catch (e) {
     await conn.rollback();
     throw e;
