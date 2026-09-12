@@ -291,6 +291,14 @@ const {
   setTrainerCommissionSplit,
 } = require("../controllers/dietitian/api/web/set-trainer-commission-split");
 
+const {
+  createCheckoutSession,
+} = require("../controllers/dietitian/api/web/create-checkout-session");
+
+const {
+  stripeWebhook,
+} = require("../controllers/stripe/stripe-webhook");
+
 
 const {
   superAdminInviteTrainer,
@@ -996,6 +1004,21 @@ router.post(
   "/dietitian/api/web/set-trainer-commission-split",
   authMiddleware,
   setTrainerCommissionSplit
+);
+
+
+// Public: starts Stripe Checkout from an /order/<code> link. No JWT; the
+// global rate limiter applies and nothing sensitive is returned.
+router.post(
+  "/dietitian/api/web/create-checkout-session",
+  createCheckoutSession
+);
+
+// Stripe -> us. Authenticated by the Stripe signature over req.rawBody, not
+// by JWT. Mounted at both paths so the Lambda /v1 rewrite and a bare host work.
+router.post(
+  ["/stripe/webhook", "/dietitian/api/web/stripe-webhook"],
+  stripeWebhook
 );
 
 
