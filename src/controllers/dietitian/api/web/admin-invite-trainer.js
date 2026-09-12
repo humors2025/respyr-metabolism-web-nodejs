@@ -288,12 +288,14 @@ async function resolveActorFromToken(
             td.id,
             td.dietician_id,
             td.email,
+            td.name,
 
             aur.user_id,
             aur.role,
             aur.partner_code,
             aur.parent_user_id,
             aur.facility_id,
+            aur.commission_split_pct,
             aur.status
 
           FROM table_dietician td
@@ -320,12 +322,14 @@ async function resolveActorFromToken(
             td.id,
             td.dietician_id,
             td.email,
+            td.name,
 
             aur.user_id,
             aur.role,
             aur.partner_code,
             aur.parent_user_id,
             aur.facility_id,
+            aur.commission_split_pct,
             aur.status
 
           FROM table_dietician td

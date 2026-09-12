@@ -310,6 +310,9 @@ const {
   setCommissionRate,
 } = require("../controllers/dietitian/api/web/commission-rate");
 
+const { earningsSummary } = require("../controllers/dietitian/api/web/earnings-summary");
+const { listFacilities } = require("../controllers/dietitian/api/web/list-facilities");
+
 const {
   runBreathCreditsEndpoint,
   runPayoutsEndpoint,
@@ -1051,6 +1054,8 @@ router.post("/dietitian/api/web/run-breath-credits", authMiddleware, runBreathCr
 router.post("/dietitian/api/web/run-payouts", authMiddleware, runPayoutsEndpoint);
 router.post("/dietitian/api/web/list-payouts", authMiddleware, listPayouts);
 router.post("/dietitian/api/web/commission-overview", authMiddleware, commissionOverview);
+router.post("/dietitian/api/web/earnings-summary", authMiddleware, earningsSummary);
+router.post("/dietitian/api/web/list-facilities", authMiddleware, listFacilities);
 
 
 router.post(
