@@ -442,6 +442,10 @@ const {
 
 const { customMeal } = require("../controllers/dietitian/api/web/custom-meal");
 
+// 🍽️ food_log — read-only list of a client's food log (day / date-range).
+// Same JWT + requireProfileAccess gate as habits-manager.
+const { foodLog } = require("../controllers/dietitian/api/web/food-log");
+
 
 
 /* ===============================
@@ -1234,6 +1238,11 @@ router.post(
  
 
   router.post("/dietitian/api/web/custom-meal", authMiddleware, customMeal);
+
+// 🍽️ food_log list (read-only).
+// Body: { profile_id, dietitian_id?, date? | start_date? + end_date?, slot?, source? }
+// Only live rows (deleted = 0) are returned.
+router.post("/dietitian/api/web/food-log", authMiddleware, foodLog);
 
 module.exports = router;
 
