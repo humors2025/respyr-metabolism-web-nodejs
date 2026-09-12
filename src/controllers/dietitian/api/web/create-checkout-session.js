@@ -11,9 +11,14 @@
  *
  * Body:
  *  {
- *    "partner_code": "TRN0000001",   // optional; unknown/inactive codes still sell
+ *    "partner_code": "TRN0000001",   // optional; unknown/inactive codes still sell (at list price)
+ *    "qr_id":        "K7M2P9",       // optional; a printed sticker, resolved to its current partner code
  *    "email":        "buyer@x.com"   // optional; pre-fills Checkout
  *  }
+ *
+ * Pricing: the list price from pricing_settings; a valid partner code applies
+ * that code's Stripe promotion code (list -> referred price). With no code the
+ * member can still type one on the Checkout page (allow_promotion_codes).
  *
  * Response: { ok, checkout_url, session_id, attributed_to: { partner_code, role } | null }
  *
@@ -26,12 +31,13 @@
 const crypto = require("crypto");
 const {
   requireStripe,
-  STRIPE_PRICE_LOOKUP_KEY,
   ORDER_SUCCESS_URL,
   ORDER_CANCEL_URL,
   PLAN_CODE,
 } = require("../../../../config/stripe");
 const { resolvePartnerCode, normalizeCode } = require("../../../../utils/partnerCodeResolver");
+const pricing = require("../../../../services/pricing");
+const qr = require("../../../../services/qrCodes");
 const { validateEmailAddress } = require("../../../../utils/securityValidation");
 
 const SECURITY_PEPPER = process.env.SECURITY_PEPPER || process.env.JWT_SECRET || "";
@@ -39,31 +45,6 @@ const SECURITY_PEPPER = process.env.SECURITY_PEPPER || process.env.JWT_SECRET ||
 function hashIp(req) {
   const ip = (typeof req.ip === "string" && req.ip) || req.socket?.remoteAddress || "";
   return crypto.createHmac("sha256", SECURITY_PEPPER).update(String(ip)).digest("hex").slice(0, 32);
-}
-
-let cachedPriceId = null;
-let cachedPriceAt = 0;
-const PRICE_CACHE_MS = 10 * 60 * 1000;
-
-/** Look the recurring price up by lookup_key so the id never lives in code. */
-async function resolvePriceId(stripe) {
-  if (cachedPriceId && Date.now() - cachedPriceAt < PRICE_CACHE_MS) return cachedPriceId;
-
-  const prices = await stripe.prices.list({
-    lookup_keys: [STRIPE_PRICE_LOOKUP_KEY],
-    active: true,
-    limit: 1,
-  });
-
-  if (!prices.data.length) {
-    const err = new Error(`No active Stripe price with lookup_key ${STRIPE_PRICE_LOOKUP_KEY}`);
-    err.code = "STRIPE_PRICE_MISSING";
-    throw err;
-  }
-
-  cachedPriceId = prices.data[0].id;
-  cachedPriceAt = Date.now();
-  return cachedPriceId;
 }
 
 const createCheckoutSession = async (req, res) => {
@@ -78,7 +59,16 @@ const createCheckoutSession = async (req, res) => {
     const stripe = requireStripe();
     const body = req.body && typeof req.body === "object" ? req.body : {};
 
-    const rawCode = normalizeCode(body.partner_code);
+    // A sticker id wins over a typed code: the sticker is what was scanned.
+    let qrId = null;
+    let rawCode = normalizeCode(body.partner_code);
+    if (typeof body.qr_id === "string" && body.qr_id.trim()) {
+      const sticker = await qr.resolve(body.qr_id);
+      if (sticker) {
+        qrId = sticker.id;
+        if (sticker.partner_code) rawCode = sticker.partner_code;
+      }
+    }
     const attributed = rawCode ? await resolvePartnerCode(rawCode) : null;
 
     let email = null;
@@ -90,7 +80,9 @@ const createCheckoutSession = async (req, res) => {
       email = check.value;
     }
 
-    const priceId = await resolvePriceId(stripe);
+    const pr = await pricing.ensureStripePricing();
+    const priceId = pr.stripe_list_price_id;
+    const promotionCodeId = attributed ? await pricing.ensurePromotionCode(attributed.partner_code) : null;
 
     // Everything the webhook needs to attribute this sale, on both the session
     // and the subscription (the subscription is what invoices reference).
@@ -101,6 +93,7 @@ const createCheckoutSession = async (req, res) => {
       attributed_user_id: attributed ? attributed.user_id : "",
       attributed_role: attributed ? attributed.role : "",
       facility_id: attributed && attributed.facility_id != null ? String(attributed.facility_id) : "",
+      qr_id: qrId || "",
       ip_hash: hashIp(req),
     };
 
@@ -111,7 +104,10 @@ const createCheckoutSession = async (req, res) => {
       cancel_url: rawCode ? `${ORDER_CANCEL_URL}/${encodeURIComponent(rawCode)}` : ORDER_CANCEL_URL,
       customer_email: email || undefined,
       client_reference_id: attributed ? attributed.partner_code : undefined,
-      allow_promotion_codes: false,
+      // Pre-apply the referral discount; otherwise let the member type a code.
+      ...(promotionCodeId
+        ? { discounts: [{ promotion_code: promotionCodeId }] }
+        : { allow_promotion_codes: true }),
       billing_address_collection: "required",
       shipping_address_collection: { allowed_countries: ["US"] },
       phone_number_collection: { enabled: true },
@@ -123,10 +119,17 @@ const createCheckoutSession = async (req, res) => {
       integration_identifier: "rysflo_order_page_kqzmwvtb",
     });
 
+    if (qrId) await qr.recordScan(qrId);
+
     return res.status(200).json({
       ok: true,
       checkout_url: session.url,
       session_id: session.id,
+      pricing: {
+        currency: pr.currency,
+        list_price_minor: Number(pr.list_price_minor),
+        price_minor: attributed ? Number(pr.referred_price_minor) : Number(pr.list_price_minor),
+      },
       ...(attributed && {
         attributed_to: { partner_code: attributed.partner_code, role: attributed.role },
       }),

@@ -27,6 +27,9 @@ const pool = require("../../config/db");
 const { requireStripe, STRIPE_WEBHOOK_SECRET, STRIPE_TERM_MONTHS, PLAN_CODE } = require("../../config/stripe");
 const ledger = require("../../services/commissionLedger");
 const connect = require("../../services/stripeConnectAccounts");
+const pricing = require("../../services/pricing");
+const purchaseCodes = require("../../services/purchaseCodes");
+const { resolvePartnerCode } = require("../../utils/partnerCodeResolver");
 
 function toMysqlDateTime(unixSeconds) {
   if (unixSeconds == null) return null;
@@ -42,10 +45,25 @@ function lower(v) {
 async function onCheckoutSessionCompleted(stripe, session) {
   if (session.mode !== "subscription" || !session.subscription) return;
 
-  const subscription = await stripe.subscriptions.retrieve(String(session.subscription));
+  const subscription = await stripe.subscriptions.retrieve(String(session.subscription), { expand: ["discounts"] });
   const item = subscription.items?.data?.[0];
   const price = item?.price;
-  const md = subscription.metadata || session.metadata || {};
+  const md = { ...(session.metadata || {}), ...(subscription.metadata || {}) };
+
+  // Attribution rule (a): the code used at purchase. Website links stamp it in
+  // metadata; a code typed on Checkout (or an in-app purchase through the PHP
+  // checkout) shows up as a promotion code on the subscription's discount.
+  const promoId = await promotionCodeIdOf(subscription);
+  if (!md.attributed_partner_code && promoId) {
+    const code = await pricing.partnerCodeForPromotion(promoId);
+    const resolved = code ? await resolvePartnerCode(code) : null;
+    if (resolved) {
+      md.attributed_partner_code = resolved.partner_code;
+      md.attributed_user_id = resolved.user_id;
+      md.attributed_role = resolved.role;
+      md.facility_id = resolved.facility_id == null ? "" : String(resolved.facility_id);
+    }
+  }
 
   const purchaserEmail = lower(session.customer_details?.email || session.customer_email);
 
@@ -64,15 +82,22 @@ async function onCheckoutSessionCompleted(stripe, session) {
     `
       INSERT INTO referral_subscriptions (
         stripe_subscription_id, stripe_customer_id, stripe_checkout_session_id,
-        purchaser_email, profile_id,
-        attributed_partner_code, attributed_user_id, attributed_role, facility_id,
+        purchaser_email, profile_id, linked_via, linked_at,
+        attributed_partner_code, attributed_user_id, attributed_role, qr_id, stripe_promotion_code_id, facility_id,
         plan_code, price_id, currency, unit_amount_minor, status,
         current_period_start, current_period_end
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON DUPLICATE KEY UPDATE
         stripe_checkout_session_id = VALUES(stripe_checkout_session_id),
         purchaser_email = COALESCE(purchaser_email, VALUES(purchaser_email)),
         profile_id      = COALESCE(profile_id, VALUES(profile_id)),
+        linked_via      = COALESCE(linked_via, VALUES(linked_via)),
+        linked_at       = COALESCE(linked_at, VALUES(linked_at)),
+        attributed_partner_code = COALESCE(attributed_partner_code, VALUES(attributed_partner_code)),
+        attributed_user_id      = COALESCE(attributed_user_id, VALUES(attributed_user_id)),
+        attributed_role         = COALESCE(attributed_role, VALUES(attributed_role)),
+        facility_id             = COALESCE(facility_id, VALUES(facility_id)),
+        stripe_promotion_code_id = COALESCE(stripe_promotion_code_id, VALUES(stripe_promotion_code_id)),
         status          = VALUES(status),
         current_period_start = VALUES(current_period_start),
         current_period_end   = VALUES(current_period_end)
@@ -83,9 +108,13 @@ async function onCheckoutSessionCompleted(stripe, session) {
       session.id,
       purchaserEmail,
       profileId,
+      profileId ? "email" : null,
+      profileId ? new Date().toISOString().slice(0, 19).replace("T", " ") : null,
       md.attributed_partner_code || null,
       md.attributed_user_id || null,
       md.attributed_role || null,
+      md.qr_id || null,
+      promoId,
       md.facility_id ? Number(md.facility_id) : null,
       md.plan_code || PLAN_CODE,
       price?.id || "",
@@ -144,6 +173,29 @@ async function onCheckoutSessionCompleted(stripe, session) {
   for (const inv of paid.data) {
     await recordInvoice(inv);
   }
+
+  // Purchase code for the app (skipped when the buyer is already a linked app
+  // user — they bought in-app or by email match, nothing to redeem).
+  if (!profileId) {
+    const pc = await purchaseCodes.ensurePurchaseCode({ stripeSubscriptionId: subscription.id });
+    if (pc?.created) {
+      const mail = await purchaseCodes.sendPurchaseCodeEmail({ stripeSubscriptionId: subscription.id });
+      if (!mail.ok) console.warn("PURCHASE_CODE_EMAIL_NOT_SENT:", { subscription: subscription.id, reason: mail.reason });
+    }
+  }
+}
+
+/** promo_… id on a subscription's discount, if any (current and legacy shapes). */
+async function promotionCodeIdOf(subscription) {
+  const discounts = Array.isArray(subscription.discounts) ? subscription.discounts : [];
+  for (const d of discounts) {
+    const disc = typeof d === "string" ? null : d;
+    const pc = disc?.promotion_code;
+    if (pc) return typeof pc === "string" ? pc : pc.id;
+  }
+  const legacy = subscription.discount?.promotion_code;
+  if (legacy) return typeof legacy === "string" ? legacy : legacy.id;
+  return null;
 }
 
 async function recordInvoice(invoice) {

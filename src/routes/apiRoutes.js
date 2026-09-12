@@ -311,6 +311,7 @@ const {
 } = require("../controllers/dietitian/api/web/commission-rate");
 
 const { earningsSummary } = require("../controllers/dietitian/api/web/earnings-summary");
+const referralOps = require("../controllers/dietitian/api/web/referral-ops");
 const { listFacilities } = require("../controllers/dietitian/api/web/list-facilities");
 
 const {
@@ -1056,6 +1057,18 @@ router.post("/dietitian/api/web/list-payouts", authMiddleware, listPayouts);
 router.post("/dietitian/api/web/commission-overview", authMiddleware, commissionOverview);
 router.post("/dietitian/api/web/earnings-summary", authMiddleware, earningsSummary);
 router.post("/dietitian/api/web/list-facilities", authMiddleware, listFacilities);
+
+// Referral programme v0.3 — public order-page helpers (no JWT) …
+router.post("/dietitian/api/web/order-page-context", referralOps.orderPageContext);
+router.post("/dietitian/api/web/order-session-status", referralOps.orderSessionStatus);
+// … and authenticated operations.
+router.post("/dietitian/api/web/referred-members", authMiddleware, referralOps.referredMembers);
+router.post("/dietitian/api/web/resend-purchase-code", authMiddleware, referralOps.resendPurchaseCode);
+router.post("/dietitian/api/web/qr-generate", authMiddleware, referralOps.qrGenerate);
+router.post("/dietitian/api/web/qr-link", authMiddleware, referralOps.qrLink);
+router.post("/dietitian/api/web/qr-list", authMiddleware, referralOps.qrList);
+router.post("/dietitian/api/web/get-pricing", authMiddleware, referralOps.getPricing);
+router.post("/dietitian/api/web/set-pricing", authMiddleware, referralOps.setPricingEndpoint);
 
 
 router.post(

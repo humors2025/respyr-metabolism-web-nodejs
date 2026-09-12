@@ -45,17 +45,10 @@ function creditForReadingDays(readingDays, daysInPeriod) {
   return Math.min(BREATH_CREDIT_CAP_MINOR, readingDays * BREATH_CREDIT_PER_DAY_MINOR);
 }
 
-/** Link purchaser email -> app profile for subscriptions still unlinked. */
+/** Link purchase code redemptions and unique email matches -> app profile. */
 async function linkProfilesByEmail() {
-  const [res] = await pool.execute(
-    `
-      UPDATE referral_subscriptions rs
-      JOIN table_clients tc ON LOWER(tc.email) = LOWER(rs.purchaser_email)
-      SET rs.profile_id = tc.profile_id
-      WHERE rs.profile_id IS NULL AND rs.purchaser_email IS NOT NULL
-    `
-  );
-  return res.affectedRows;
+  const r = await require("./purchaseCodes").linkProfiles();
+  return r.by_purchase_code + r.by_email;
 }
 
 async function countReadingDays(profileId, periodStart, periodEndExclusive) {

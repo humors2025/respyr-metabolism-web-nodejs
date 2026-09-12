@@ -22,6 +22,7 @@
  */
 
 const pool = require("../config/db");
+const { resolvePartnerCode } = require("../utils/partnerCodeResolver");
 
 function lower(v) {
   return typeof v === "string" ? v.trim().toLowerCase() : "";
@@ -158,7 +159,27 @@ async function recordInvoicePaid({ stripeInvoiceId, stripeSubscriptionId, amount
       `SELECT * FROM referral_subscriptions WHERE stripe_subscription_id = ? LIMIT 1 FOR UPDATE`,
       [stripeSubscriptionId]
     );
-    const sub = subs[0];
+    let sub = subs[0];
+
+    // Attribution rule (b): no code at purchase, but the member has since
+    // linked a gym/trainer in the app -> that code earns from this invoice on.
+    if (sub && !sub.attributed_user_id && sub.profile_id) {
+      const [tc] = await conn.execute(
+        `SELECT dietician_id FROM table_clients WHERE profile_id = ? ORDER BY id DESC LIMIT 1`,
+        [sub.profile_id]
+      );
+      const appCode = tc[0]?.dietician_id ? String(tc[0].dietician_id) : "";
+      const resolved = appCode ? await resolvePartnerCode(appCode) : null;
+      if (resolved) {
+        await conn.execute(
+          `UPDATE referral_subscriptions
+           SET attributed_partner_code = ?, attributed_user_id = ?, attributed_role = ?, facility_id = ?
+           WHERE id = ? AND attributed_user_id IS NULL`,
+          [resolved.partner_code, resolved.user_id, resolved.role, resolved.facility_id, sub.id]
+        );
+        sub = { ...sub, attributed_partner_code: resolved.partner_code, attributed_user_id: resolved.user_id, attributed_role: resolved.role, facility_id: resolved.facility_id };
+      }
+    }
 
     // Not a referral sale (or the checkout event has not arrived yet — Stripe
     // can deliver invoice.paid first). Nothing to attribute; the entry can be
