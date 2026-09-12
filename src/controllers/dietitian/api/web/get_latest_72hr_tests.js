@@ -74,6 +74,7 @@
  *    db/migrations/20260912_user_habits_allergies_food_preferences.sql and
  *    written by habits-manager save_preferences. Missing or malformed values
  *    degrade to empty lists, never to a skipped row or a 500.
+ *  - `zip_code` (string|null) from the same user_habits row, returned as stored.
  *
  * HIPAA controls:
  *  - Minimum-necessary columns; test_json is read to extract the macro summary but
@@ -390,7 +391,8 @@ const getLatest72hrTests = async (req, res) => {
           uh.activity,
           uh.food_type,
           uh.allergies,
-          uh.food_preferences
+          uh.food_preferences,
+          uh.zip_code
 
         FROM table_test_data t
 
@@ -416,7 +418,8 @@ const getLatest72hrTests = async (req, res) => {
                 uh1.activity,
                 uh1.food_type,
                 uh1.allergies,
-                uh1.food_preferences
+                uh1.food_preferences,
+                uh1.zip_code
             FROM user_habits uh1
             INNER JOIN (
                 SELECT profile_id, MAX(id) AS latest_habit_id
@@ -471,6 +474,7 @@ const getLatest72hrTests = async (req, res) => {
 
         level_type: row.level_type,
         location: row.location ?? null,
+        zip_code: row.zip_code ?? null,
         activity: row.activity ?? null,
         food_type: extractFoodType(row.food_type),
         allergies: extractAllergies(row.allergies),
