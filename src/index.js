@@ -163,8 +163,10 @@ app.use((req, res, next) => {
 // Example:
 // /v1/dietitian/api/web/... -> /dietitian/api/web/...
 // =====================================================
+// Also applied locally so the dashboard's /v1-prefixed calls work against
+// `npm run dev` without a separate config.
 app.use((req, res, next) => {
-  if (isLambda && (req.url === "/v1" || req.url.startsWith("/v1/"))) {
+  if (req.url === "/v1" || req.url.startsWith("/v1/")) {
     req.url = req.url.replace(/^\/v1/, "") || "/";
   }
 
