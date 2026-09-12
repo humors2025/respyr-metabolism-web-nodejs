@@ -299,6 +299,24 @@ const {
   stripeWebhook,
 } = require("../controllers/stripe/stripe-webhook");
 
+const {
+  stripeConnectStatus,
+  stripeConnectOnboardingLink,
+  stripeConnectDashboardLink,
+} = require("../controllers/dietitian/api/web/stripe-connect");
+
+const {
+  getCommissionRate,
+  setCommissionRate,
+} = require("../controllers/dietitian/api/web/commission-rate");
+
+const {
+  runBreathCreditsEndpoint,
+  runPayoutsEndpoint,
+  listPayouts,
+  commissionOverview,
+} = require("../controllers/dietitian/api/web/commission-ops");
+
 
 const {
   superAdminInviteTrainer,
@@ -1020,6 +1038,19 @@ router.post(
   ["/stripe/webhook", "/dietitian/api/web/stripe-webhook"],
   stripeWebhook
 );
+
+
+router.post("/dietitian/api/web/stripe-connect-status", authMiddleware, stripeConnectStatus);
+router.post("/dietitian/api/web/stripe-connect-onboarding-link", authMiddleware, stripeConnectOnboardingLink);
+router.post("/dietitian/api/web/stripe-connect-dashboard-link", authMiddleware, stripeConnectDashboardLink);
+
+router.post("/dietitian/api/web/get-commission-rate", authMiddleware, getCommissionRate);
+router.post("/dietitian/api/web/set-commission-rate", authMiddleware, setCommissionRate);
+
+router.post("/dietitian/api/web/run-breath-credits", authMiddleware, runBreathCreditsEndpoint);
+router.post("/dietitian/api/web/run-payouts", authMiddleware, runPayoutsEndpoint);
+router.post("/dietitian/api/web/list-payouts", authMiddleware, listPayouts);
+router.post("/dietitian/api/web/commission-overview", authMiddleware, commissionOverview);
 
 
 router.post(
