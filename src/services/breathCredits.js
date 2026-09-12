@@ -48,6 +48,7 @@ function creditForReadingDays(readingDays, daysInPeriod) {
 /** Link purchase code redemptions and unique email matches -> app profile. */
 async function linkProfilesByEmail() {
   const r = await require("./purchaseCodes").linkProfiles();
+  await require("./commissionLedger").rebuildHeldForActivatedPayees();
   return r.by_purchase_code + r.by_email;
 }
 

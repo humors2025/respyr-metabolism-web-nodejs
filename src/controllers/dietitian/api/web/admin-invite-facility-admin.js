@@ -344,4 +344,4 @@ const adminInviteFacilityAdmin = async (req, res) => {
   }
 };
 
-module.exports = { adminInviteFacilityAdmin };
+module.exports = { adminInviteFacilityAdmin, generateUniqueFacilityCode, validateFacilityName };

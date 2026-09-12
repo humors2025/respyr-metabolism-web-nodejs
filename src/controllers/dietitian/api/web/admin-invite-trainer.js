@@ -1742,6 +1742,7 @@ module.exports = {
     validateInviteInput,
     ensureInviteCanBeCreated,
     createPendingInvite,
+    generateUniquePartnerCode,
     markInviteRevoked,
     markInviteSent,
     sendResendTemplateEmail,

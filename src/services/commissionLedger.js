@@ -191,7 +191,22 @@ async function recordInvoicePaid({ stripeInvoiceId, stripeSubscriptionId, amount
 
     const rate = await rateAt(conn, paidAt);
     const gymCommission = Math.round((amountPaidMinor * rate) / 100);
-    const payees = await resolvePayees(conn, sub);
+    let payees = await resolvePayees(conn, sub);
+
+    // Payee invited via a sticker but not yet active: hold the whole gym
+    // commission against the invited email; rebuilt on activation.
+    let awaitingActivation = false;
+    if (!payees.length) {
+      const [inv] = await conn.execute(
+        `SELECT invited_email, invited_role, facility_id FROM app_user_invitations
+         WHERE UPPER(partner_code) = ? AND status = 'pending' ORDER BY id DESC LIMIT 1`,
+        [String(sub.attributed_partner_code || "").toUpperCase()]
+      );
+      if (inv[0]) {
+        awaitingActivation = true;
+        payees = [{ user_id: lower(inv[0].invited_email), role: String(inv[0].invited_role), share_pct: 100, facility_id: inv[0].facility_id == null ? null : Number(inv[0].facility_id) }];
+      }
+    }
 
     if (!payees.length) {
       await conn.commit();
@@ -203,7 +218,7 @@ async function recordInvoicePaid({ stripeInvoiceId, stripeSubscriptionId, amount
 
     for (let i = 0; i < payees.length; i++) {
       const p = payees[i];
-      const canPay = await payeeCanBePaid(conn, p.user_id);
+      const canPay = !awaitingActivation && (await payeeCanBePaid(conn, p.user_id));
       const [res] = await conn.execute(
         `
           INSERT IGNORE INTO commission_entries (
@@ -229,7 +244,7 @@ async function recordInvoicePaid({ stripeInvoiceId, stripeSubscriptionId, amount
           amounts[i],
           currency,
           canPay ? "pending" : "held",
-          canPay ? null : "payee has not completed Stripe payout setup",
+          canPay ? null : awaitingActivation ? "awaiting account activation" : "payee has not completed Stripe payout setup",
         ]
       );
       recorded += res.affectedRows;
@@ -268,6 +283,37 @@ async function reverseInvoice({ stripeInvoiceId, reason }) {
   return { reversed: res.affectedRows };
 }
 
+/**
+ * Entries held for a payee who has since accepted their invite: rebuild them
+ * with the real split (facility admin / trainer) now that the account exists.
+ */
+async function rebuildHeldForActivatedPayees() {
+  const [rows] = await pool.execute(
+    `
+      SELECT DISTINCT ce.stripe_invoice_id, ce.stripe_subscription_id, ce.invoice_net_minor, ce.currency, ce.invoice_paid_at
+      FROM commission_entries ce
+      JOIN app_user_roles aur ON LOWER(aur.user_id) = LOWER(ce.payee_user_id) AND aur.status = 'active'
+      WHERE ce.status = 'held' AND ce.hold_reason = 'awaiting account activation'
+    `
+  );
+  let rebuilt = 0;
+  for (const r of rows) {
+    await pool.execute(
+      `DELETE FROM commission_entries WHERE stripe_invoice_id = ? AND status = 'held' AND hold_reason = 'awaiting account activation'`,
+      [r.stripe_invoice_id]
+    );
+    await recordInvoicePaid({
+      stripeInvoiceId: r.stripe_invoice_id,
+      stripeSubscriptionId: r.stripe_subscription_id,
+      amountPaidMinor: Number(r.invoice_net_minor),
+      currency: r.currency,
+      paidAt: r.invoice_paid_at instanceof Date ? r.invoice_paid_at.toISOString().slice(0, 19).replace("T", " ") : r.invoice_paid_at,
+    });
+    rebuilt += 1;
+  }
+  return { rebuilt };
+}
+
 /** Held entries become pending once the payee's Connect account is verified. */
 async function releaseHeldForPayee(userId) {
   const [res] = await pool.execute(
@@ -275,10 +321,11 @@ async function releaseHeldForPayee(userId) {
       UPDATE commission_entries
       SET status = 'pending', hold_reason = NULL, updated_at = UTC_TIMESTAMP()
       WHERE LOWER(payee_user_id) = ? AND status = 'held'
+        AND (hold_reason IS NULL OR hold_reason <> 'awaiting account activation')
     `,
     [lower(userId)]
   );
   return { released: res.affectedRows };
 }
 
-module.exports = { recordInvoicePaid, reverseInvoice, releaseHeldForPayee, allocate, resolvePayees };
+module.exports = { recordInvoicePaid, reverseInvoice, releaseHeldForPayee, rebuildHeldForActivatedPayees, allocate, resolvePayees };

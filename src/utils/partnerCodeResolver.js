@@ -63,7 +63,36 @@ function shape(row) {
   };
 }
 
-async function resolvePartnerCode(rawCode) {
+/**
+ * A code on a *pending* invitation (sticker set up in the field before the
+ * owner accepted). The sale is attributed to the invitee's email; commission
+ * is held until the account is active.
+ */
+async function lookupPendingInvitation(code) {
+  const [rows] = await pool.execute(
+    `
+      SELECT invited_email, invited_role, partner_code, parent_user_id, facility_id, facility_name
+      FROM app_user_invitations
+      WHERE UPPER(partner_code) = ? AND status = 'pending' AND expires_at > UTC_TIMESTAMP()
+        AND invited_role IN ('facility_admin','trainer')
+      ORDER BY id DESC LIMIT 1
+    `,
+    [code]
+  );
+  const r = rows[0];
+  if (!r) return null;
+  return {
+    partner_code: String(r.partner_code).toUpperCase(),
+    user_id: String(r.invited_email).toLowerCase(),
+    role: String(r.invited_role),
+    facility_id: r.facility_id == null ? null : Number(r.facility_id),
+    parent_user_id: r.parent_user_id ? String(r.parent_user_id).toLowerCase() : null,
+    pending: true,
+    facility_name: r.facility_name || null,
+  };
+}
+
+async function resolvePartnerCode(rawCode, { allowPending = true } = {}) {
   const code = normalizeCode(rawCode);
   if (code === "") return null;
 
@@ -79,7 +108,7 @@ async function resolvePartnerCode(rawCode) {
     hops += 1;
   }
 
-  return null;
+  return allowPending ? lookupPendingInvitation(code) : null;
 }
 
 module.exports = { resolvePartnerCode, normalizeCode };

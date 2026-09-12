@@ -2068,6 +2068,23 @@ const acceptInvite =
         ]
       );
 
+      // A sticker set up in the field for this invite now points at an active
+      // account; held commission is rebuilt by the nightly job.
+      await conn.execute(
+        `
+          UPDATE qr_codes
+          SET target_status = 'active',
+              facility_id   = COALESCE(?, facility_id),
+              linked_user_id = ?
+          WHERE invitation_id = ?
+        `,
+        [
+          facilityId,
+          email,
+          invite.id,
+        ]
+      );
+
       /*
       |--------------------------------------------------------------------------
       | Mark invitation accepted
