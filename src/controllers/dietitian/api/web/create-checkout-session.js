@@ -119,6 +119,8 @@ const createCheckoutSession = async (req, res) => {
       // > Settings > Public details before it can be enabled (go-live item).
       metadata,
       subscription_data: { metadata },
+      // Dashboard label for this checkout flow (random suffix per Stripe guidance).
+      integration_identifier: "rysflo_order_page_kqzmwvtb",
     });
 
     return res.status(200).json({

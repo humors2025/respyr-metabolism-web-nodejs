@@ -5,7 +5,9 @@
  * needs. Secrets come from the environment (Secrets Manager on Lambda, .env
  * locally) — never from the database.
  *
- *   STRIPE_SECRET_KEY        sk_test_… / sk_live_…
+ *   STRIPE_SECRET_KEY        sk_test_… / sk_live_… (production: use a restricted
+ *                            key, rk_…, scoped to Checkout, Billing, Customers,
+ *                            Connect accounts/transfers and webhooks)
  *   STRIPE_WEBHOOK_SECRET    whsec_… for the /stripe/webhook endpoint
  *   STRIPE_PRICE_LOOKUP_KEY  lookup_key of the recurring price (rysflo_monthly_29)
  *   STRIPE_TERM_MONTHS       device term; the schedule releases after this (12)
@@ -35,7 +37,7 @@ const BREATH_CREDIT_PER_DAY_MINOR = 20;   // $0.20 per reading-day
 const BREATH_CREDIT_CAP_MINOR = 600;      // $6.00 per billing month
 const BREATH_CREDIT_FULL_DAYS = 30;       // a "full" month; Feb reaches the cap at 28
 
-const isLive = STRIPE_SECRET_KEY.startsWith("sk_live_");
+const isLive = /^(sk|rk)_live_/.test(STRIPE_SECRET_KEY);
 
 if (STRIPE_SECRET_KEY === "") {
   console.warn("STRIPE_SECRET_KEY is not set — Stripe endpoints will fail closed.");
@@ -51,7 +53,7 @@ if (isLive && process.env.NODE_ENV !== "production") {
 
 const stripe = STRIPE_SECRET_KEY
   ? new Stripe(STRIPE_SECRET_KEY, {
-      apiVersion: "2025-08-27.basil",
+      // SDK default (2026-08-26.dahlia at time of writing); Accounts v2 needs it.
       maxNetworkRetries: 2,
       timeout: 20000,
       appInfo: { name: "respyr-metabolism-web-nodejs", version: "1.0.0" },

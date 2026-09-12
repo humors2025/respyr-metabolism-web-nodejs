@@ -22,8 +22,12 @@ const { _helpers: H } = require("./admin-invite-trainer");
 const PAYEE_ROLES = ["admin", "facility_admin", "trainer"];
 const STALE_MS = 60 * 60 * 1000;
 
+// Stripe requires HTTPS for both onboarding URLs, even in test mode.
 const PAYOUT_SETUP_URL =
   String(process.env.FRONTEND_PAYOUT_SETUP_URL || "https://admin.rysflo.com/payout-setup").trim();
+if (!/^https:\/\//i.test(PAYOUT_SETUP_URL)) {
+  console.warn("FRONTEND_PAYOUT_SETUP_URL must be https:// — Stripe rejects http onboarding URLs.");
+}
 
 function publicAccount(row) {
   if (!row) return null;
@@ -61,7 +65,8 @@ const stripeConnectStatus = async (req, res) => {
     const userId = resolved.actorEmail;
 
     let row = await connect.getAccountRow(userId);
-    if (row && (!row.last_synced_at || Date.now() - new Date(row.last_synced_at).getTime() > STALE_MS)) {
+    const force = req.body?.force_sync === true; // the payout-setup page passes this on ?return=1
+    if (row && (force || !row.last_synced_at || Date.now() - new Date(row.last_synced_at).getTime() > STALE_MS)) {
       row = await connect.syncAccount(userId, row.stripe_account_id);
     }
 
@@ -104,6 +109,7 @@ const stripeConnectOnboardingLink = async (req, res) => {
       role: actor.role,
       partner_code: actor.partner_code,
       facility_id: actor.facility_id,
+      display_name: actor.name || undefined,
     });
 
     const url = await connect.createOnboardingLink(row.stripe_account_id, {

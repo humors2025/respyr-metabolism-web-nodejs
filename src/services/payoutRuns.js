@@ -17,6 +17,7 @@
 
 const pool = require("../config/db");
 const { requireStripe } = require("../config/stripe");
+const connect = require("./stripeConnectAccounts");
 
 const MIN_PAYOUT_MINOR = Math.max(0, parseInt(process.env.PAYOUT_MIN_MINOR, 10) || 2500); // $25
 
@@ -96,6 +97,15 @@ async function runPayouts({ now = new Date(), periodEnd = null, initiatedBy = "s
 
     if (dryRun) {
       item.dry_run = true;
+      summary.items.push(item);
+      continue;
+    }
+
+    // Our copy of the capability can be stale (v2 accounts push thin events we
+    // do not consume yet). Re-check with Stripe before moving money.
+    if (!(await connect.canReceiveTransfers(g.stripe_account_id))) {
+      await connect.syncAccount(payee, g.stripe_account_id);
+      item.skipped = "stripe_transfers capability not active";
       summary.items.push(item);
       continue;
     }

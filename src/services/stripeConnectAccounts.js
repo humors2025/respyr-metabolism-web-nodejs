@@ -1,10 +1,21 @@
 "use strict";
 
 /**
- * Stripe Connect Express accounts for payees (facility admins; trainers with a
- * commission split). We store only the account id and its verification state.
- * Stripe collects identity, bank and tax (W-9 / 1099) details on its own
- * hosted onboarding — no SSN / EIN ever touches this system.
+ * Stripe Connect accounts for payees (facility admins; trainers with a
+ * commission split). Accounts v2, "recipient" configuration only — the gym can
+ * receive Transfers from Rysflo's balance and nothing else. Stripe's hosted
+ * onboarding collects identity, bank and tax (W-9 / 1099) details; we store
+ * only the account id and its capability state.
+ *
+ * Readiness is the v2 capability status
+ *   configuration.recipient.capabilities.stripe_balance.stripe_transfers.status === "active"
+ * (payouts_enabled / charges_enabled are v1 fields and are not used).
+ *
+ * v2 accounts emit v2 "thin" events (v2.core.account[requirements].updated)
+ * rather than the classic account.updated webhook, so status is pulled:
+ *   - when the user returns from onboarding (status endpoint, force=true)
+ *   - when our copy is older than STALE_MS
+ *   - always, right before a Transfer (payoutRuns.js)
  */
 
 const pool = require("../config/db");
@@ -15,29 +26,62 @@ function lower(v) {
   return typeof v === "string" ? v.trim().toLowerCase() : "";
 }
 
-function statusFromAccount(acct) {
-  const due = acct.requirements?.currently_due || [];
-  const pastDue = acct.requirements?.past_due || [];
-  const disabled = acct.requirements?.disabled_reason || null;
+const ACCOUNT_INCLUDE = ["configuration.recipient", "identity", "requirements"];
 
-  if (disabled && !acct.payouts_enabled) return "disabled";
-  if (acct.payouts_enabled && acct.details_submitted && due.length === 0) return "verified";
-  if (acct.details_submitted && (due.length > 0 || pastDue.length > 0)) return "action_required";
+/** Map a v2 Account to our onboarding_status. */
+function statusFromAccount(acct) {
+  const cap = acct.configuration?.recipient?.capabilities?.stripe_balance?.stripe_transfers;
+  const capStatus = cap?.status || "unsupported";
+  const code = cap?.status_details?.code || null;
+  const entries = acct.requirements?.entries || [];
+  const due = entries.filter((e) => ["currently_due", "past_due"].includes(e?.minimum_deadline?.status));
+  const pastDue = entries.some((e) => e?.minimum_deadline?.status === "past_due");
+
+  if (capStatus === "active" && due.length === 0) return "verified";
+  if (capStatus === "active") return "action_required";      // active but new requirements are due
+  if (pastDue || code === "requirements_past_due") return "action_required";
+  if (["restricted", "unsupported"].includes(capStatus) && code && code !== "requirements_pending") return "disabled";
   return "pending";
+}
+
+function transfersActive(acct) {
+  return acct.configuration?.recipient?.capabilities?.stripe_balance?.stripe_transfers?.status === "active";
+}
+
+function requirementsSummary(acct) {
+  const entries = acct.requirements?.entries || [];
+  const byStatus = (s) =>
+    entries
+      .filter((e) => e?.minimum_deadline?.status === s)
+      .map((e) => (e.impact?.restricts_capabilities ? "capability" : null) || e.errors?.[0]?.code || e.name || e.type || "requirement");
+  return {
+    currently_due: byStatus("currently_due"),
+    past_due: byStatus("past_due"),
+    eventually_due: byStatus("eventually_due"),
+    capability_status: acct.configuration?.recipient?.capabilities?.stripe_balance?.stripe_transfers?.status || null,
+    capability_code: acct.configuration?.recipient?.capabilities?.stripe_balance?.stripe_transfers?.status_details?.code || null,
+  };
 }
 
 async function upsertFromAccount(userId, acct) {
   const status = statusFromAccount(acct);
+  const active = transfersActive(acct);
+  // "Submitted" = nothing is currently or past due (the form was completed),
+  // even if Stripe is still verifying. Drives the "Manage in Stripe" button.
+  const outstanding = (acct.requirements?.entries || []).some((e) =>
+    ["currently_due", "past_due"].includes(e?.minimum_deadline?.status)
+  );
+  const detailsSubmitted = active || !outstanding ? 1 : 0;
+
   await pool.execute(
     `
       INSERT INTO partner_payout_accounts (
         user_id, stripe_account_id, onboarding_status, details_submitted,
         charges_enabled, payouts_enabled, requirements_json, last_synced_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP())
+      ) VALUES (?, ?, ?, ?, 0, ?, ?, UTC_TIMESTAMP())
       ON DUPLICATE KEY UPDATE
         onboarding_status = VALUES(onboarding_status),
         details_submitted = VALUES(details_submitted),
-        charges_enabled   = VALUES(charges_enabled),
         payouts_enabled   = VALUES(payouts_enabled),
         requirements_json = VALUES(requirements_json),
         last_synced_at    = UTC_TIMESTAMP()
@@ -46,26 +90,19 @@ async function upsertFromAccount(userId, acct) {
       lower(userId),
       acct.id,
       status,
-      acct.details_submitted ? 1 : 0,
-      acct.charges_enabled ? 1 : 0,
-      acct.payouts_enabled ? 1 : 0,
-      JSON.stringify({
-        currently_due: acct.requirements?.currently_due || [],
-        past_due: acct.requirements?.past_due || [],
-        pending_verification: acct.requirements?.pending_verification || [],
-        disabled_reason: acct.requirements?.disabled_reason || null,
-      }),
+      detailsSubmitted,
+      active ? 1 : 0,               // payouts_enabled column now means "stripe_transfers active"
+      JSON.stringify(requirementsSummary(acct)),
     ]
   );
 
-  if (acct.payouts_enabled) {
+  if (active) {
     await ledger.releaseHeldForPayee(userId);
   }
 
   return status;
 }
 
-/** Row for a user, or null. */
 async function getAccountRow(userId) {
   const [rows] = await pool.execute(
     `SELECT * FROM partner_payout_accounts WHERE LOWER(user_id) = ? LIMIT 1`,
@@ -75,24 +112,30 @@ async function getAccountRow(userId) {
 }
 
 /**
- * Create the Express account on first use, or return the existing one.
- * `user` is the app_user_roles row (+ email). Business type is left for the
- * owner to choose inside Stripe onboarding (company for a gym, individual for
- * a trainer) — we only prefill what we know.
+ * Create the recipient account on first use, or return the existing row.
+ * `user` = { user_id, role, partner_code, facility_id, display_name? }.
+ * Entity type (company vs individual) is chosen by the owner inside Stripe
+ * onboarding; we do not prefill anything we would have to store.
  */
 async function getOrCreateAccount(user) {
   const existing = await getAccountRow(user.user_id);
   if (existing) return existing;
 
   const stripe = requireStripe();
-  const acct = await stripe.accounts.create(
+  const acct = await stripe.v2.core.accounts.create(
     {
-      type: "express",
-      country: "US",
-      email: lower(user.user_id),
-      capabilities: { transfers: { requested: true } },
-      business_profile: {
-        product_description: "Rysflo referral commission",
+      contact_email: lower(user.user_id),
+      display_name: user.display_name || lower(user.user_id),
+      dashboard: "express",
+      identity: { country: "us" },
+      configuration: {
+        recipient: {
+          capabilities: { stripe_balance: { stripe_transfers: { requested: true } } },
+        },
+      },
+      defaults: {
+        currency: "usd",
+        responsibilities: { fees_collector: "application", losses_collector: "application" },
       },
       metadata: {
         user_id: lower(user.user_id),
@@ -100,6 +143,7 @@ async function getOrCreateAccount(user) {
         partner_code: user.partner_code || "",
         facility_id: user.facility_id == null ? "" : String(user.facility_id),
       },
+      include: ACCOUNT_INCLUDE,
     },
     { idempotencyKey: `connect-create-${lower(user.user_id)}` }
   );
@@ -108,14 +152,19 @@ async function getOrCreateAccount(user) {
   return getAccountRow(user.user_id);
 }
 
-/** One-time hosted onboarding URL. */
+/** Single-use hosted onboarding URL. Both URLs must be HTTPS (Stripe rule). */
 async function createOnboardingLink(stripeAccountId, { refreshUrl, returnUrl }) {
   const stripe = requireStripe();
-  const link = await stripe.accountLinks.create({
+  const link = await stripe.v2.core.accountLinks.create({
     account: stripeAccountId,
-    type: "account_onboarding",
-    refresh_url: refreshUrl,
-    return_url: returnUrl,
+    use_case: {
+      type: "account_onboarding",
+      account_onboarding: {
+        configurations: ["recipient"],
+        refresh_url: refreshUrl,
+        return_url: returnUrl,
+      },
+    },
   });
   return link.url;
 }
@@ -127,15 +176,22 @@ async function createDashboardLink(stripeAccountId) {
   return link.url;
 }
 
-/** Refresh our copy from Stripe (used by the status endpoint when stale). */
+/** Pull the account from Stripe and refresh our copy. Returns the row. */
 async function syncAccount(userId, stripeAccountId) {
   const stripe = requireStripe();
-  const acct = await stripe.accounts.retrieve(stripeAccountId);
+  const acct = await stripe.v2.core.accounts.retrieve(stripeAccountId, { include: ACCOUNT_INCLUDE });
   await upsertFromAccount(userId, acct);
   return getAccountRow(userId);
 }
 
-/** Webhook: account.updated carries the full account object. */
+/** Live check used immediately before moving money. */
+async function canReceiveTransfers(stripeAccountId) {
+  const stripe = requireStripe();
+  const acct = await stripe.v2.core.accounts.retrieve(stripeAccountId, { include: ["configuration.recipient"] });
+  return transfersActive(acct);
+}
+
+/** Classic account.updated (v1 accounts only) — kept for accounts created before v2. */
 async function syncAccountFromStripeObject(acct) {
   const [rows] = await pool.execute(
     `SELECT user_id FROM partner_payout_accounts WHERE stripe_account_id = ? LIMIT 1`,
@@ -143,7 +199,7 @@ async function syncAccountFromStripeObject(acct) {
   );
   const userId = rows[0]?.user_id || acct.metadata?.user_id;
   if (!userId) return;
-  await upsertFromAccount(userId, acct);
+  await syncAccount(userId, acct.id);
 }
 
 module.exports = {
@@ -152,6 +208,8 @@ module.exports = {
   createOnboardingLink,
   createDashboardLink,
   syncAccount,
+  canReceiveTransfers,
   syncAccountFromStripeObject,
   statusFromAccount,
+  transfersActive,
 };
