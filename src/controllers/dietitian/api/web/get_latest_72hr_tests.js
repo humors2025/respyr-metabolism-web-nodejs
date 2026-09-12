@@ -64,8 +64,16 @@
  *  - limit/cursor are rejected when non-numeric rather than silently coerced to 0.
  *    The PHP's (int) cast turned a typo'd cursor into 0, silently restarting the
  *    whole export from the beginning — expensive and easy to miss.
- *  - The habits sub-select is narrowed from `uh1.*` to the three columns actually
+ *  - The habits sub-select is narrowed from `uh1.*` to the columns actually
  *    used (minimum necessary; also less row width to haul).
+ *
+ * Additions over the PHP (2026-09-12, requested for the generator):
+ *  - Each data item also carries `allergies` (string[]) and `food_preferences`
+ *    ({ include: string[], exclude: string[] }), read from the same latest
+ *    user_habits row as activity/food_type. Both are JSON columns added by
+ *    db/migrations/20260912_user_habits_allergies_food_preferences.sql and
+ *    written by habits-manager save_preferences. Missing or malformed values
+ *    degrade to empty lists, never to a skipped row or a 500.
  *
  * HIPAA controls:
  *  - Minimum-necessary columns; test_json is read to extract the macro summary but
@@ -162,6 +170,48 @@ function extractFoodType(raw) {
     diet_type: decoded.diet_type ?? null,
     primary_cuisine: decoded.primary_cuisine ?? null,
     secondary_cuisine: decoded.secondary_cuisine ?? null,
+  };
+}
+
+/**
+ * Normalise a stored JSON list of food names into a clean string[]: only
+ * non-empty strings survive, trimmed and de-duplicated, order preserved. Anything
+ * that is not a list (null, "", a scalar, an object) becomes []. The generator
+ * consumes these verbatim, so a malformed row must degrade to "no constraint",
+ * never to a 500.
+ */
+function toStringList(value) {
+  if (!Array.isArray(value)) return [];
+  const seen = new Set();
+  const out = [];
+  for (const item of value) {
+    if (typeof item !== "string") continue;
+    const text = item.trim();
+    if (text === "" || seen.has(text)) continue;
+    seen.add(text);
+    out.push(text);
+  }
+  return out;
+}
+
+/** user_habits.allergies (JSON list) → string[]; always an array. */
+function extractAllergies(raw) {
+  return toStringList(decodeJsonColumn(raw));
+}
+
+/**
+ * user_habits.food_preferences (JSON object) → { include: string[], exclude: string[] }.
+ * Always both keys, always arrays, so the generator never has to null-check.
+ */
+function extractFoodPreferences(raw) {
+  const decoded = decodeJsonColumn(raw);
+  const source =
+    decoded !== null && typeof decoded === "object" && !Array.isArray(decoded)
+      ? decoded
+      : {};
+  return {
+    include: toStringList(source.include),
+    exclude: toStringList(source.exclude),
   };
 }
 
@@ -338,7 +388,9 @@ const getLatest72hrTests = async (req, res) => {
           c.location,
 
           uh.activity,
-          uh.food_type
+          uh.food_type,
+          uh.allergies,
+          uh.food_preferences
 
         FROM table_test_data t
 
@@ -359,7 +411,12 @@ const getLatest72hrTests = async (req, res) => {
             ON c.profile_id = t.profile_id
 
         LEFT JOIN (
-            SELECT uh1.profile_id, uh1.activity, uh1.food_type
+            SELECT
+                uh1.profile_id,
+                uh1.activity,
+                uh1.food_type,
+                uh1.allergies,
+                uh1.food_preferences
             FROM user_habits uh1
             INNER JOIN (
                 SELECT profile_id, MAX(id) AS latest_habit_id
@@ -416,6 +473,8 @@ const getLatest72hrTests = async (req, res) => {
         location: row.location ?? null,
         activity: row.activity ?? null,
         food_type: extractFoodType(row.food_type),
+        allergies: extractAllergies(row.allergies),
+        food_preferences: extractFoodPreferences(row.food_preferences),
 
         digestive_score: scoreFloat(row.digestive_score),
         recovery_score: scoreFloat(row.recovery_score),
