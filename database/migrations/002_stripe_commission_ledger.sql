@@ -143,7 +143,9 @@ CREATE TABLE IF NOT EXISTS `payouts` (
   `currency`            CHAR(3)         NOT NULL,
   `status`              ENUM('scheduled','processing','paid','failed','reversed') NOT NULL DEFAULT 'scheduled',
   `failure_reason`      VARCHAR(512)    NULL,
-  `idempotency_key`     VARCHAR(64)     NOT NULL,
+  `idempotency_key`     VARCHAR(64)     NOT NULL,                  -- one row per payee/currency/period
+  `attempts`            INT UNSIGNED    NOT NULL DEFAULT 0,
+  `attempt_key`         VARCHAR(100)    NULL,                      -- Stripe idempotency key of the latest attempt
   `initiated_by`        VARCHAR(150)    NOT NULL,                  -- 'scheduler' or a super_admin email
   `created_at`          DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
   `paid_at`             DATETIME        NULL,

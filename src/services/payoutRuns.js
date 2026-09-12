@@ -118,15 +118,21 @@ async function runPayouts({ now = new Date(), periodEnd = null, initiatedBy = "s
       // Create (or reuse, on re-run) the payout row.
       await conn.execute(
         `
-          INSERT IGNORE INTO payouts
+          INSERT INTO payouts
             (payee_user_id, stripe_account_id, period_start, period_end, entry_count,
              amount_minor, currency, status, idempotency_key, initiated_by)
           VALUES (?, ?, ?, ?, ?, ?, ?, 'processing', ?, ?)
+          ON DUPLICATE KEY UPDATE
+            status = IF(status = 'paid', status, 'processing'),
+            entry_count = IF(status = 'paid', entry_count, VALUES(entry_count)),
+            amount_minor = IF(status = 'paid', amount_minor, VALUES(amount_minor)),
+            failure_reason = IF(status = 'paid', failure_reason, NULL),
+            updated_at = UTC_TIMESTAMP()
         `,
         [payee, g.stripe_account_id, ymd(new Date(g.first_paid_at)), ymd(end), item.entries, netMinor, currency, idem, initiatedBy]
       );
       const [prow] = await conn.execute(
-        `SELECT id, stripe_transfer_id, status FROM payouts WHERE idempotency_key = ? FOR UPDATE`,
+        `SELECT id, stripe_transfer_id, status, attempts FROM payouts WHERE idempotency_key = ? FOR UPDATE`,
         [idem]
       );
       const payout = prow[0];
@@ -137,6 +143,19 @@ async function runPayouts({ now = new Date(), periodEnd = null, initiatedBy = "s
         summary.items.push(item);
         continue;
       }
+
+      // Resume safety: if a previous attempt created the Transfer but crashed
+      // before committing, find it by transfer_group instead of paying twice.
+      const existing = await stripe.transfers.list({ transfer_group: `payout_${payout.id}`, limit: 1 });
+      let transfer = existing.data[0] || null;
+
+      // Stripe binds an idempotency key to the first request's parameters for
+      // 24h, so each attempt gets its own key, persisted before the call.
+      const attemptKey = `${idem}-a${Number(payout.attempts) + 1}`;
+      await conn.execute(
+        `UPDATE payouts SET attempts = attempts + 1, attempt_key = ?, updated_at = UTC_TIMESTAMP() WHERE id = ?`,
+        [attemptKey, payout.id]
+      );
 
       // Attach entries to this payout before calling Stripe so a crash between
       // the transfer and the commit is recoverable by the idempotency key.
@@ -159,17 +178,19 @@ async function runPayouts({ now = new Date(), periodEnd = null, initiatedBy = "s
         [String(payout.id), payee, currency]
       );
 
-      const transfer = await stripe.transfers.create(
-        {
-          amount: netMinor,
-          currency: currency.toLowerCase(),
-          destination: g.stripe_account_id,
-          description: `Rysflo referral commission through ${ymd(end)}`,
-          transfer_group: `payout_${payout.id}`,
-          metadata: { payout_id: String(payout.id), payee_user_id: payee, period_end: ymd(end) },
-        },
-        { idempotencyKey: idem }
-      );
+      if (!transfer) {
+        transfer = await stripe.transfers.create(
+          {
+            amount: netMinor,
+            currency: currency.toLowerCase(),
+            destination: g.stripe_account_id,
+            description: `Rysflo referral commission through ${ymd(end)}`,
+            transfer_group: `payout_${payout.id}`,
+            metadata: { payout_id: String(payout.id), payee_user_id: payee, period_end: ymd(end) },
+          },
+          { idempotencyKey: attemptKey }
+        );
+      }
 
       await conn.execute(
         `
@@ -190,10 +211,21 @@ async function runPayouts({ now = new Date(), periodEnd = null, initiatedBy = "s
       item.stripe_transfer_id = transfer.id;
     } catch (err) {
       await conn.rollback();
-      // Leave the payout row (if any) as 'failed' so the super_admin sees it.
+      // The rollback also discarded the payouts row created in this attempt.
+      // Record the failure outside the transaction so it is visible on the
+      // super_admin Payouts page; a later successful run reuses this row via
+      // the idempotency key.
       await pool.execute(
-        `UPDATE payouts SET status = 'failed', failure_reason = ?, updated_at = UTC_TIMESTAMP() WHERE idempotency_key = ? AND status = 'processing'`,
-        [String(err?.message || "transfer failed").slice(0, 500), idem]
+        `
+          INSERT INTO payouts
+            (payee_user_id, stripe_account_id, period_start, period_end, entry_count,
+             amount_minor, currency, status, failure_reason, idempotency_key, initiated_by)
+          VALUES (?, ?, ?, ?, ?, ?, ?, 'failed', ?, ?, ?)
+          ON DUPLICATE KEY UPDATE
+            status = 'failed', failure_reason = VALUES(failure_reason), updated_at = UTC_TIMESTAMP()
+        `,
+        [payee, g.stripe_account_id, ymd(new Date(g.first_paid_at)), ymd(end), item.entries, netMinor, currency,
+         String(err?.message || "transfer failed").slice(0, 500), idem, initiatedBy]
       );
       await pool.execute(
         `UPDATE commission_entries ce JOIN payouts p ON p.id = ce.payout_id

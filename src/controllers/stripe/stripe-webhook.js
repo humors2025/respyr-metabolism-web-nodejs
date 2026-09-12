@@ -99,13 +99,18 @@ async function onCheckoutSessionCompleted(stripe, session) {
 
   // Device term: after STRIPE_TERM_MONTHS invoices the schedule releases the
   // subscription, which then continues month-to-month until cancelled.
-  if (!subscription.schedule) {
-    const schedule = await stripe.subscriptionSchedules.create(
-      { from_subscription: subscription.id },
-      { idempotencyKey: `sched-create-${subscription.id}` }
-    );
+  // Self-healing: if a schedule already exists (earlier partial run), reuse it
+  // and only apply the term if it has not been applied yet.
+  let schedule = subscription.schedule
+    ? await stripe.subscriptionSchedules.retrieve(String(subscription.schedule))
+    : await stripe.subscriptionSchedules.create(
+        { from_subscription: subscription.id },
+        { idempotencyKey: `sched-create-${subscription.id}` }
+      );
+
+  if (schedule.metadata?.rysflo_term_months !== String(STRIPE_TERM_MONTHS)) {
     const phase = schedule.phases[0];
-    await stripe.subscriptionSchedules.update(
+    schedule = await stripe.subscriptionSchedules.update(
       schedule.id,
       {
         end_behavior: "release",
@@ -113,18 +118,20 @@ async function onCheckoutSessionCompleted(stripe, session) {
           {
             items: phase.items.map((i) => ({ price: i.price, quantity: i.quantity })),
             start_date: phase.start_date,
-            iterations: STRIPE_TERM_MONTHS,
+            duration: { interval: "month", interval_count: STRIPE_TERM_MONTHS },
             metadata: md,
           },
         ],
+        metadata: { ...md, rysflo_term_months: String(STRIPE_TERM_MONTHS) },
       },
-      { idempotencyKey: `sched-term-${subscription.id}` }
-    );
-    await pool.execute(
-      `UPDATE referral_subscriptions SET stripe_schedule_id = ? WHERE stripe_subscription_id = ?`,
-      [schedule.id, subscription.id]
+      { idempotencyKey: `sched-term-${subscription.id}-${STRIPE_TERM_MONTHS}` }
     );
   }
+
+  await pool.execute(
+    `UPDATE referral_subscriptions SET stripe_schedule_id = ? WHERE stripe_subscription_id = ?`,
+    [schedule.id, subscription.id]
+  );
 
   // Stripe does not order events: invoice.paid for the first invoice usually
   // arrives before this one and found no subscription to attribute. Backfill
