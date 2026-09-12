@@ -51,7 +51,7 @@ const pool = require("../../../../config/db");
 const SECURITY_PEPPER =
   process.env.SECURITY_PEPPER || process.env.JWT_SECRET || "";
 
-const VALID_ACTOR_ROLES = new Set(["super_admin", "admin", "trainer"]);
+const VALID_ACTOR_ROLES = new Set(["super_admin", "admin", "facility_admin", "trainer"]);
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -204,6 +204,7 @@ async function resolveActorFromToken(req) {
         aur.role,
         aur.partner_code,
         aur.parent_user_id,
+        aur.facility_id,
         aur.status,
         aur.email_verified_at
       FROM table_dietician td
@@ -423,6 +424,9 @@ async function getExistingTrainersForAdmin(adminEmail) {
         aur.email_verified_at,
         aur.created_at,
         aur.updated_at,
+        aur.facility_id,
+        aur.commission_split_pct,
+        aur.commission_split_updated_at,
 
         td.dietician_id,
         td.name,
@@ -466,6 +470,10 @@ async function getExistingTrainersForAdmin(adminEmail) {
 
       trainers_count:    0,
       clients_count:     clientsCount,
+      facility_id:       row.facility_id == null ? null : Number(row.facility_id),
+      commission_split_pct:
+        row.commission_split_pct == null ? 0 : Number(row.commission_split_pct),
+      commission_split_updated_at: toMysqlDateTime(row.commission_split_updated_at),
 
       override_monthly:  null,
       created_at:        toMysqlDateTime(row.created_at),
@@ -641,8 +649,11 @@ const listAdminTrainerUsersJwt = async (req, res) => {
       });
     }
 
-    // ── 4. admin branch ─────────────────────────────────────────────────────
-    if (actorRole === "admin") {
+    // ── 4. admin / facility_admin branch ─────────────────────────────────────
+    //    Both list the trainers whose parent_user_id is the actor. A facility
+    //    admin's trainers are exactly the ones they invited, so the scoping
+    //    query is shared; only the labels differ.
+    if (actorRole === "admin" || actorRole === "facility_admin") {
       const [acceptedTrainers, pendingTrainers] = await Promise.all([
         getExistingTrainersForAdmin(actorEmail),
         getPendingInvites("trainer", actorEmail),
@@ -657,17 +668,20 @@ const listAdminTrainerUsersJwt = async (req, res) => {
         partnerCode:   actor.partner_code ?? null,
         identifier:    actorEmail,
         success:       true,
-        failureReason: "Admin viewed trainer list",
+        failureReason: actorRole === "facility_admin"
+          ? "Facility admin viewed trainer list"
+          : "Admin viewed trainer list",
       });
 
       return res.status(200).json({
         ok:    true,
-        mode:  "admin_trainers",
+        mode:  actorRole === "facility_admin" ? "facility_admin_trainers" : "admin_trainers",
         actor: {
           user_id:        actorEmail,
           role:           actorRole,
           partner_code:   actor.partner_code   ?? null,
           parent_user_id: actor.parent_user_id ?? null,
+          facility_id:    actor.facility_id == null ? null : Number(actor.facility_id),
         },
         title:           "Trainers",
         existing:        acceptedTrainers,

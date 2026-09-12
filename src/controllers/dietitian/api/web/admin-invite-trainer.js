@@ -42,6 +42,17 @@ const RETURN_INVITE_LINK_FOR_TESTING =
     process.env.RETURN_INVITE_LINK_FOR_TESTING || ""
   ).toLowerCase() === "true";
 
+/**
+ * Local development only: skip the outbound Resend call and treat the email
+ * as delivered. Ignored in production regardless of the env value, so a
+ * mis-set flag can never silently swallow real invites.
+ */
+const SKIP_OUTBOUND_EMAIL =
+  process.env.NODE_ENV !== "production" &&
+  String(
+    process.env.SKIP_OUTBOUND_EMAIL || ""
+  ).toLowerCase() === "true";
+
 const PARTNER_CODE_PREFIX = "TRN";
 const PARTNER_CODE_RANDOM_LEN = 7;
 const PARTNER_CODE_MAX_ATTEMPTS = 10;
@@ -225,6 +236,11 @@ async function resolveActorFromToken(
   req,
   requiredRole = "admin"
 ) {
+  const allowedRoles =
+    Array.isArray(requiredRole)
+      ? requiredRole.map(String)
+      : [String(requiredRole)];
+
   const payload =
     req.user || {};
 
@@ -272,11 +288,14 @@ async function resolveActorFromToken(
             td.id,
             td.dietician_id,
             td.email,
+            td.name,
 
             aur.user_id,
             aur.role,
             aur.partner_code,
             aur.parent_user_id,
+            aur.facility_id,
+            aur.commission_split_pct,
             aur.status
 
           FROM table_dietician td
@@ -303,11 +322,14 @@ async function resolveActorFromToken(
             td.id,
             td.dietician_id,
             td.email,
+            td.name,
 
             aur.user_id,
             aur.role,
             aur.partner_code,
             aur.parent_user_id,
+            aur.facility_id,
+            aur.commission_split_pct,
             aur.status
 
           FROM table_dietician td
@@ -364,8 +386,9 @@ async function resolveActorFromToken(
   }
 
   if (
-    String(actor.role) !==
-    requiredRole
+    !allowedRoles.includes(
+      String(actor.role)
+    )
   ) {
     return {
       error: {
@@ -699,6 +722,8 @@ async function createPendingInvite({
   partnerCode,
   invitedByUserId,
   parentUserId,
+  facilityId = null,
+  facilityName = null,
   tokenHash,
   expiresAt,
 }) {
@@ -718,6 +743,8 @@ async function createPendingInvite({
           partner_code,
           invited_by_user_id,
           parent_user_id,
+            facility_id,
+            facility_name,
           token_hash,
           status,
           expires_at,
@@ -736,7 +763,9 @@ async function createPendingInvite({
           ?,
           ?,
           ?,
-          'pending',
+          ?,
+            ?,
+            'pending',
           ?,
           UTC_TIMESTAMP(),
           UTC_TIMESTAMP()
@@ -752,6 +781,8 @@ async function createPendingInvite({
         partnerCode,
         invitedByUserId,
         parentUserId,
+          facilityId,
+          facilityName,
         tokenHash,
         expiresAt,
       ]
@@ -834,6 +865,14 @@ async function sendResendTemplateEmail(
   templateId,
   vars
 ) {
+  if (SKIP_OUTBOUND_EMAIL) {
+    return {
+      ok: true,
+      status: 0,
+      skipped: true,
+    };
+  }
+
   if (
     !RESEND_API_KEY
   ) {
@@ -1012,7 +1051,10 @@ const adminInviteTrainer =
       const resolved =
         await resolveActorFromToken(
           req,
-          "admin"
+          [
+            "admin",
+            "facility_admin",
+          ]
         );
 
       if (
@@ -1354,6 +1396,16 @@ const adminInviteTrainer =
             invitedRole:
               "trainer",
 
+            facilityId:
+              String(actor.role) ===
+                "facility_admin" &&
+              actor.facility_id !=
+                null
+                ? Number(
+                    actor.facility_id
+                  )
+                : null,
+
             partnerCode,
 
             invitedByUserId:
@@ -1679,6 +1731,27 @@ const adminInviteTrainer =
 
 module.exports = {
   adminInviteTrainer,
+
+  // Shared helpers, reused by admin-invite-facility-admin.js.
+  _helpers: {
+    normalizeEmail,
+    secureHash,
+    toUtcMysqlDateTime,
+    writeAuthLogSafe,
+    resolveActorFromToken,
+    validateInviteInput,
+    ensureInviteCanBeCreated,
+    createPendingInvite,
+    generateUniquePartnerCode,
+    markInviteRevoked,
+    markInviteSent,
+    sendResendTemplateEmail,
+    FRONTEND_ACCEPT_INVITE_URL,
+    INVITE_EXPIRY_HOURS,
+    RESEND_INVITE_TEMPLATE_ID,
+    RETURN_INVITE_LINK_FOR_TESTING,
+    APP_DEBUG,
+  },
 };
 
 
