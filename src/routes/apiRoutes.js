@@ -287,6 +287,10 @@ const {
   adminInviteFacilityAdmin,
 } = require("../controllers/dietitian/api/web/admin-invite-facility-admin");
 
+const {
+  setTrainerCommissionSplit,
+} = require("../controllers/dietitian/api/web/set-trainer-commission-split");
+
 
 const {
   superAdminInviteTrainer,
@@ -985,6 +989,13 @@ router.post(
   "/dietitian/api/web/admin-invite-facility-admin",
   authMiddleware,
   adminInviteFacilityAdmin
+);
+
+
+router.post(
+  "/dietitian/api/web/set-trainer-commission-split",
+  authMiddleware,
+  setTrainerCommissionSplit
 );
 
 
