@@ -283,6 +283,10 @@ const {
   adminInviteTrainer,
 } = require("../controllers/dietitian/api/web/admin-invite-trainer");
 
+const {
+  adminInviteFacilityAdmin,
+} = require("../controllers/dietitian/api/web/admin-invite-facility-admin");
+
 
 const {
   superAdminInviteTrainer,
@@ -974,6 +978,13 @@ router.post(
   "/dietitian/api/web/admin-invite-trainer",
   authMiddleware,
   adminInviteTrainer
+);
+
+
+router.post(
+  "/dietitian/api/web/admin-invite-facility-admin",
+  authMiddleware,
+  adminInviteFacilityAdmin
 );
 
 

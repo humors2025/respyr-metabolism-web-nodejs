@@ -773,6 +773,9 @@ const acceptInvite =
               invited_role,
               partner_code,
               parent_user_id,
+              invited_by_user_id,
+              facility_id,
+              facility_name,
               status,
 
               (
@@ -1573,6 +1576,8 @@ const acceptInvite =
         role !==
           "admin" &&
         role !==
+          "facility_admin" &&
+        role !==
           "trainer"
       ) {
         return await fail409(
@@ -1945,6 +1950,89 @@ const acceptInvite =
       |--------------------------------------------------------------------------
       */
 
+      /*
+      |--------------------------------------------------------------------------
+      | Facility
+      |--------------------------------------------------------------------------
+      | facility_admin: the facility row is created here, at acceptance, so an
+      | unaccepted / revoked invite never leaves an orphan facility behind. Its
+      | partner_code is the owner's code (the wall / front-desk QR code).
+      |
+      | trainer: inherits the facility_id stamped on the invite by the
+      | facility_admin who sent it (NULL for trainers invited by a Rysflo admin).
+      */
+
+      let facilityId =
+        invite.facility_id ==
+        null
+          ? null
+          : Number(
+              invite.facility_id
+            );
+
+      if (
+        role ===
+        "facility_admin"
+      ) {
+        const facilityName =
+          String(
+            invite.facility_name ||
+              ""
+          ).trim();
+
+        if (
+          facilityName === "" ||
+          facilityName.length >
+            150
+        ) {
+          return await fail409(
+            "Invalid facility name on invitation",
+            "invalid_facility_name"
+          );
+        }
+
+        const [
+          facilityResult,
+        ] = await conn.execute(
+          `
+            INSERT INTO facilities (
+              name,
+              partner_code,
+              facility_admin_user_id,
+              parent_admin_user_id,
+              created_by_user_id,
+              status,
+              created_at
+            )
+
+            VALUES (
+              ?,
+              ?,
+              ?,
+              ?,
+              ?,
+              'active',
+              UTC_TIMESTAMP()
+            )
+          `,
+          [
+            facilityName,
+            partnerCode,
+            email,
+            parentUserId,
+            String(
+              invite.invited_by_user_id ||
+                parentUserId
+            ),
+          ]
+        );
+
+        facilityId =
+          Number(
+            facilityResult.insertId
+          );
+      }
+
       await conn.execute(
         `
           INSERT INTO app_user_roles (
@@ -1952,6 +2040,7 @@ const acceptInvite =
             role,
             partner_code,
             parent_user_id,
+            facility_id,
             status,
             email_verified_at,
             created_at,
@@ -1959,6 +2048,7 @@ const acceptInvite =
           )
 
           VALUES (
+            ?,
             ?,
             ?,
             ?,
@@ -1974,6 +2064,7 @@ const acceptInvite =
           role,
           partnerCode,
           parentUserId,
+          facilityId,
         ]
       );
 
