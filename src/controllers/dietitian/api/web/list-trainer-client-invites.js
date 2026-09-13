@@ -58,7 +58,7 @@ const pool   = require("../../../../config/db");
 const SECURITY_PEPPER =
   process.env.SECURITY_PEPPER || process.env.JWT_SECRET || "";
 
-const VALID_ACTOR_ROLES = new Set(["super_admin", "admin", "trainer"]);
+const VALID_ACTOR_ROLES = new Set(["super_admin", "admin", "facility_admin", "trainer"]);
 
 const APP_DEBUG = process.env.NODE_ENV !== "production";
 
@@ -313,6 +313,33 @@ async function getAllowedTrainerCodesForActor(actor) {
       // Non-fatal: a query failure here should fall back to the codes we
       // already collected for the actor, not 500 the whole list view.
       console.error("LIST_CHILD_TRAINER_CODES_FAILED:", err?.code || err?.message);
+    }
+  }
+
+  // A facility admin owns one facility. Trainers are scoped by facility_id,
+  // not by parent_user_id, so another facility's codes can never be reached.
+  if (role === "facility_admin" && actor.facility_id != null) {
+    try {
+      const [facilityRows] = await pool.execute(
+        `
+          SELECT partner_code
+          FROM app_user_roles
+          WHERE role         = 'trainer'
+            AND status       = 'active'
+            AND partner_code IS NOT NULL
+            AND partner_code <> ''
+            AND facility_id  = ?
+        `,
+        [Number(actor.facility_id)]
+      );
+
+      for (const row of facilityRows) {
+        if (row.partner_code) {
+          codes.add(String(row.partner_code).toUpperCase());
+        }
+      }
+    } catch (err) {
+      console.error("LIST_FACILITY_TRAINER_CODES_FAILED:", err?.code || err?.message);
     }
   }
 

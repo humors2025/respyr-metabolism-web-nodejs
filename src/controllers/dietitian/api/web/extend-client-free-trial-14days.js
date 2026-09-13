@@ -69,7 +69,7 @@ const SECURITY_PEPPER =
 
 const APP_DEBUG = process.env.NODE_ENV !== "production";
 
-const VALID_ACTOR_ROLES = new Set(["super_admin", "admin", "trainer"]);
+const VALID_ACTOR_ROLES = new Set(["super_admin", "admin", "facility_admin", "trainer"]);
 
 const DEFAULT_REASON = "Free trial extended to 14 days";
 const MAX_REASON_LEN = 1000;     // stored capped; audit column caps again at 255
@@ -358,6 +358,26 @@ async function getAllowedCodesForActor(conn, actor, actorEmail) {
           AND aur.status = 'active'
           AND LOWER(aur.parent_user_id) = LOWER(?)`,
       [actorEmail]
+    );
+    for (const row of rows) {
+      if (normalizeCode(row.code) !== "") codes.add(normalizeCode(row.code));
+    }
+    return [...codes];
+  }
+
+  // Facility admins reach only the trainers stamped with their own facility.
+  if (role === "facility_admin") {
+    if (actor.facility_id == null) return [...codes];
+
+    const [rows] = await conn.execute(
+      `SELECT COALESCE(NULLIF(aur.partner_code, ''), NULLIF(td.dietician_id, '')) AS code
+         FROM app_user_roles aur
+         LEFT JOIN table_dietician td
+           ON LOWER(td.email) = LOWER(aur.user_id)
+        WHERE aur.role = 'trainer'
+          AND aur.status = 'active'
+          AND aur.facility_id = ?`,
+      [Number(actor.facility_id)]
     );
     for (const row of rows) {
       if (normalizeCode(row.code) !== "") codes.add(normalizeCode(row.code));
