@@ -74,6 +74,11 @@ const FRONTEND_ACCEPT_INVITE_URL =
   process.env.FRONTEND_ACCEPT_INVITE_URL ||
   "https://api.rysflo.com/signup";
 
+// Dev/test only: skip email delivery (same flag as admin-invite-trainer.js).
+const SKIP_OUTBOUND_EMAIL =
+  process.env.NODE_ENV !== "production" &&
+  String(process.env.SKIP_OUTBOUND_EMAIL || "").toLowerCase() === "true";
+
 const RESEND_API_KEY =
   process.env.RESEND_API_KEY || "";
 
@@ -94,7 +99,7 @@ const ALLOWED_ACTOR_ROLES =
   new Set([
     "super_admin",
     "admin",
-    // "trainer",
+    "facility_admin", // gym owner: own trainer invites (ownership check below)
   ]);
 
 // ─── Generic Helpers ─────────────────────────────────────────────────────────
@@ -784,6 +789,10 @@ async function sendResendTemplateEmail(
   templateId,
   vars
 ) {
+  if (SKIP_OUTBOUND_EMAIL) {
+    return { ok: true, status: 0, skipped: true };
+  }
+
   if (
     !RESEND_API_KEY
   ) {

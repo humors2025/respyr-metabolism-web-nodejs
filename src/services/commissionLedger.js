@@ -328,4 +328,104 @@ async function releaseHeldForPayee(userId) {
   return { released: res.affectedRows };
 }
 
-module.exports = { recordInvoicePaid, reverseInvoice, releaseHeldForPayee, rebuildHeldForActivatedPayees, allocate, resolvePayees };
+/**
+ * Re-split every commission entry that has not left the platform yet
+ * (status pending/held) for sales attributed to `trainerUserId`'s code, using
+ * the trainer's *current* commission_split_pct. Called when a facility admin
+ * changes the split, so the change is visible immediately on both dashboards.
+ *
+ * Entries that are already scheduled or paid are never touched: an invoice is
+ * only rebuilt when all of its entries are still unpaid. Rate, net amount and
+ * gym commission are carried over from the existing rows — only the share
+ * between trainer and facility changes.
+ */
+async function reallocateUnpaidForTrainer(trainerUserId) {
+  const trainer = lower(trainerUserId);
+  const conn = await pool.getConnection();
+  let rebuilt = 0;
+  let skipped = 0;
+  try {
+    await conn.beginTransaction();
+
+    const [subs] = await conn.execute(
+      `SELECT * FROM referral_subscriptions WHERE LOWER(attributed_user_id) = ?`,
+      [trainer]
+    );
+    if (!subs.length) {
+      await conn.commit();
+      return { rebuilt, skipped };
+    }
+    const payees = await resolvePayees(conn, subs[0]);
+
+    for (const sub of subs) {
+      const [rows] = await conn.execute(
+        `SELECT * FROM commission_entries WHERE stripe_subscription_id = ? FOR UPDATE`,
+        [sub.stripe_subscription_id]
+      );
+      const byInvoice = new Map();
+      for (const r of rows) {
+        if (!byInvoice.has(r.stripe_invoice_id)) byInvoice.set(r.stripe_invoice_id, []);
+        byInvoice.get(r.stripe_invoice_id).push(r);
+      }
+
+      for (const [invoiceId, entries] of byInvoice) {
+        if (entries.some((e) => !["pending", "held"].includes(String(e.status)))) {
+          skipped += 1;
+          continue;
+        }
+        if (!payees.length) {
+          skipped += 1;
+          continue;
+        }
+        const base = entries[0];
+        const amounts = allocate(Number(base.gym_commission_minor), payees);
+
+        await conn.execute(`DELETE FROM commission_entries WHERE stripe_invoice_id = ? AND status IN ('pending','held')`, [invoiceId]);
+
+        for (let i = 0; i < payees.length; i++) {
+          const p = payees[i];
+          const canPay = await payeeCanBePaid(conn, p.user_id);
+          await conn.execute(
+            `
+              INSERT INTO commission_entries (
+                stripe_invoice_id, stripe_subscription_id, referral_subscription_id,
+                payee_user_id, payee_role, facility_id, attributed_partner_code,
+                invoice_paid_at, invoice_net_minor, commission_rate_pct, gym_commission_minor,
+                share_pct, amount_minor, currency, status, hold_reason
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            `,
+            [
+              invoiceId,
+              base.stripe_subscription_id,
+              base.referral_subscription_id,
+              p.user_id,
+              p.role,
+              p.facility_id,
+              base.attributed_partner_code,
+              base.invoice_paid_at,
+              base.invoice_net_minor,
+              base.commission_rate_pct,
+              base.gym_commission_minor,
+              Number(p.share_pct).toFixed(2),
+              amounts[i],
+              base.currency,
+              canPay ? "pending" : "held",
+              canPay ? null : "payee has not completed Stripe payout setup",
+            ]
+          );
+        }
+        rebuilt += 1;
+      }
+    }
+
+    await conn.commit();
+    return { rebuilt, skipped };
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
+}
+
+module.exports = { recordInvoicePaid, reverseInvoice, releaseHeldForPayee, rebuildHeldForActivatedPayees, reallocateUnpaidForTrainer, allocate, resolvePayees };
