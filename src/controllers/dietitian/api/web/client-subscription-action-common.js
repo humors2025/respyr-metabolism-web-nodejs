@@ -71,6 +71,7 @@ const VALID_ACTOR_ROLES =
   new Set([
     "super_admin",
     "admin",
+    "facility_admin",
     "trainer",
   ]);
 
@@ -498,6 +499,66 @@ async function allowedCodes(
 
     for (
       const row of rows
+    ) {
+      if (
+        code(
+          row.partner_code
+        ) !== ""
+      ) {
+        codes.add(
+          code(
+            row.partner_code
+          )
+        );
+      }
+    }
+
+    return [
+      ...codes,
+    ];
+  }
+
+  // Facility admins reach only the trainers stamped with their own facility.
+  if (
+    role === "facility_admin"
+  ) {
+    if (
+      actor.facility_id ==
+      null
+    ) {
+      return [
+        ...codes,
+      ];
+    }
+
+    const [facilityRows] =
+      await db.execute(
+        `SELECT
+           partner_code
+
+         FROM app_user_roles
+
+         WHERE role =
+               'trainer'
+
+           AND status =
+               'active'
+
+           AND partner_code
+               IS NOT NULL
+
+           AND partner_code <> ''
+
+           AND facility_id = ?`,
+        [
+          Number(
+            actor.facility_id
+          ),
+        ]
+      );
+
+    for (
+      const row of facilityRows
     ) {
       if (
         code(

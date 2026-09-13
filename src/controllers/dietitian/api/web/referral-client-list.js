@@ -78,6 +78,7 @@ const VALID_ACTOR_ROLES =
   new Set([
     "super_admin",
     "admin",
+    "facility_admin",
     "trainer",
   ]);
 
@@ -872,6 +873,72 @@ async function getAllowedCodes(actor) {
 
     for (
       const row of childRows
+    ) {
+      addCode(
+        codes,
+        row.code
+      );
+    }
+
+    return [
+      ...codes.values(),
+    ];
+  }
+
+  // A facility admin owns exactly one facility. Scope by facility_id rather
+  // than parent_user_id: trainers are stamped with the facility they belong
+  // to, and a facility admin must never see another facility's clients.
+  if (
+    role ===
+    "facility_admin"
+  ) {
+    if (
+      actor.facility_id ==
+      null
+    ) {
+      return [
+        ...codes.values(),
+      ];
+    }
+
+    const [facilityRows] =
+      await pool.execute(
+        `
+          SELECT
+            COALESCE(
+              NULLIF(
+                aur.partner_code,
+                ''
+              ),
+              NULLIF(
+                td.dietician_id,
+                ''
+              )
+            ) AS code
+
+          FROM app_user_roles aur
+
+          LEFT JOIN table_dietician td
+            ON LOWER(td.email) =
+               LOWER(aur.user_id)
+
+          WHERE aur.role =
+                'trainer'
+
+            AND aur.status =
+                'active'
+
+            AND aur.facility_id = ?
+        `,
+        [
+          Number(
+            actor.facility_id
+          ),
+        ]
+      );
+
+    for (
+      const row of facilityRows
     ) {
       addCode(
         codes,

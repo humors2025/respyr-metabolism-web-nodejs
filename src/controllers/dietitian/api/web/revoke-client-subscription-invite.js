@@ -60,7 +60,7 @@ const SECURITY_PEPPER =
 
 const APP_DEBUG = process.env.NODE_ENV !== "production";
 
-const VALID_ACTOR_ROLES = new Set(["super_admin", "admin", "trainer"]);
+const VALID_ACTOR_ROLES = new Set(["super_admin", "admin", "facility_admin", "trainer"]);
 
 const DEFAULT_REVOKE_REASON = "Client subscription invite revoked";
 const MAX_REASON_LEN = 1000;
@@ -275,6 +275,26 @@ async function getAllowedCodesForActor(conn, actor, actorEmail) {
           AND partner_code <> ''
           AND LOWER(parent_user_id) = LOWER(?)`,
       [actorEmail]
+    );
+    for (const row of rows) {
+      if (normalizeCode(row.partner_code) !== "") codes.add(normalizeCode(row.partner_code));
+    }
+    return [...codes];
+  }
+
+  // Facility admins reach only the trainers stamped with their own facility.
+  if (role === "facility_admin") {
+    if (actor.facility_id == null) return [...codes];
+
+    const [rows] = await conn.execute(
+      `SELECT partner_code
+         FROM app_user_roles
+        WHERE role = 'trainer'
+          AND status = 'active'
+          AND partner_code IS NOT NULL
+          AND partner_code <> ''
+          AND facility_id = ?`,
+      [Number(actor.facility_id)]
     );
     for (const row of rows) {
       if (normalizeCode(row.partner_code) !== "") codes.add(normalizeCode(row.partner_code));
