@@ -61,8 +61,10 @@ app.use((req, res, next) => {
   if (isLocal) {
     const allowedOrigins = [
       "http://localhost:3000",
+      "https://localhost:3000", // next dev --experimental-https (Stripe return URLs must be https)
       "http://localhost:3001",
       "http://localhost:5173",
+      "http://localhost:8080", // static marketing site (Website/) served locally
       "http://127.0.0.1:3000",
       "http://127.0.0.1:3001",
     ];
@@ -163,8 +165,10 @@ app.use((req, res, next) => {
 // Example:
 // /v1/dietitian/api/web/... -> /dietitian/api/web/...
 // =====================================================
+// Also applied locally so the dashboard's /v1-prefixed calls work against
+// `npm run dev` without a separate config.
 app.use((req, res, next) => {
-  if (isLambda && (req.url === "/v1" || req.url.startsWith("/v1/"))) {
+  if (req.url === "/v1" || req.url.startsWith("/v1/")) {
     req.url = req.url.replace(/^\/v1/, "") || "/";
   }
 

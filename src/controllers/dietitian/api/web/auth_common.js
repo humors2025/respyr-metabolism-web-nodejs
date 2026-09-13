@@ -1522,7 +1522,7 @@ async function createPendingInvite({
     ).trim();
 
   if (
-    !/^(ADM|TRN)[A-Z2-9]{7}$/.test(
+    !/^(ADM|TRN|FAC)[A-Z2-9]{7}$/.test(
       safePartnerCode
     )
   ) {
@@ -1899,7 +1899,7 @@ async function sendResendTemplateEmail(
     ).trim();
 
   if (
-    !/^(ADM|TRN)[A-Z2-9]{7}$/.test(
+    !/^(ADM|TRN|FAC)[A-Z2-9]{7}$/.test(
       templatePartnerCode
     )
   ) {

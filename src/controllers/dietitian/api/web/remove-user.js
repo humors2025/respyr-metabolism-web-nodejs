@@ -112,12 +112,13 @@ const SECURITY_PEPPER =
 
 const APP_DEBUG = process.env.NODE_ENV !== "production";
 
-const VALID_ACTOR_ROLES = new Set(["super_admin", "admin", "trainer"]);
+const VALID_ACTOR_ROLES = new Set(["super_admin", "admin", "facility_admin", "trainer"]);
 
 // Condition 1–3 permission matrix: actor role → removable target types.
 const PERMISSION_MATRIX = {
   super_admin: new Set(["admin", "trainer", "client"]),
   admin: new Set(["trainer", "client"]),
+  facility_admin: new Set(["trainer", "client"]),
   trainer: new Set(["client"]),
 };
 
@@ -265,6 +266,7 @@ async function resolveActorFromToken(req) {
         aur.role,
         aur.partner_code,
         aur.parent_user_id,
+        aur.facility_id,
         aur.status
       FROM table_dietician td
       INNER JOIN app_user_roles aur
@@ -309,9 +311,28 @@ async function getActiveAdminEmailsUnderSuperAdmin(conn, superAdminEmail) {
     `,
     [superAdminEmail]
   );
-  return rows
+  const adminEmails = rows
     .map((r) => normalizeEmail(r.user_id))
     .filter((e) => e !== "");
+
+  if (adminEmails.length === 0) return adminEmails;
+
+  // Facility admins sit under admins; their trainers are in the super_admin's
+  // network too.
+  const [faRows] = await conn.execute(
+    `
+      SELECT user_id
+      FROM app_user_roles
+      WHERE role   = 'facility_admin'
+        AND status = 'active'
+        AND LOWER(parent_user_id) IN (${buildInPlaceholders(adminEmails)})
+    `,
+    adminEmails
+  );
+  return [
+    ...adminEmails,
+    ...faRows.map((r) => normalizeEmail(r.user_id)).filter((e) => e !== ""),
+  ];
 }
 
 /**
@@ -378,10 +399,11 @@ async function removeRoleUser(conn, {
   targetType,          // 'admin' | 'trainer'
   targetEmail,
   allowedParentEmails, // lower-cased emails
+  actorEmail,          // recorded on client_reassignments rows
 }) {
   const [rows] = await conn.execute(
     `
-      SELECT id, user_id, role, partner_code, parent_user_id, status
+      SELECT id, user_id, role, partner_code, parent_user_id, facility_id, status
       FROM app_user_roles
       WHERE LOWER(user_id) = LOWER(?)
         AND role = ?
@@ -471,6 +493,18 @@ async function removeRoleUser(conn, {
   // Kill live sessions: access JWTs expire within 15 minutes; refresh dies now.
   await revokeRefreshTokensByEmail(conn, targetEmail);
 
+  // A removed trainer's clients (and their future referral commission) revert
+  // to whoever the trainer reported to — the facility admin for gym trainers,
+  // the Rysflo admin otherwise. Same transaction, so a failure here rolls the
+  // removal back rather than leaving orphaned clients.
+  let reassignment = null;
+  if (targetType === "trainer") {
+    reassignment = await reassignTrainerClientsToParent(conn, {
+      trainer: target,
+      actorEmail,
+    });
+  }
+
   return {
     status: 200,
     body: {
@@ -485,8 +519,118 @@ async function removeRoleUser(conn, {
         partner_code: target.partner_code ?? null,
         previous_status: "active",
         new_status: "removed",
+        ...(reassignment && { client_reassignment: reassignment }),
       },
     },
+  };
+}
+
+// ─── Client reassignment on trainer removal ──────────────────────────────────
+
+/**
+ * Re-key everything that attributes a client to the removed trainer's partner
+ * code onto the parent's partner code, and write one client_reassignments row
+ * per client for the audit trail. Historical readings/tests stay keyed by
+ * profile_id and are untouched. Runs inside the caller's transaction.
+ *
+ * Returns a summary, or null when there is no code to move from / to.
+ */
+async function reassignTrainerClientsToParent(conn, { trainer, actorEmail }) {
+  const fromCode = normalizeCode(trainer.partner_code);
+  const parentEmail = normalizeEmail(trainer.parent_user_id);
+
+  if (fromCode === "" || parentEmail === "") return null;
+
+  const [parentRows] = await conn.execute(
+    `
+      SELECT partner_code, role, facility_id
+      FROM app_user_roles
+      WHERE LOWER(user_id) = LOWER(?)
+        AND status = 'active'
+      LIMIT 1
+    `,
+    [parentEmail]
+  );
+  const parent = parentRows[0];
+  const toCode = parent ? normalizeCode(parent.partner_code) : "";
+
+  if (toCode === "" || toCode === fromCode) return null;
+
+  const facilityId =
+    trainer.facility_id != null ? Number(trainer.facility_id) : null;
+  const trainerEmail = normalizeEmail(trainer.user_id);
+
+  // HIPAA: a trainer's *self* client (they invited themselves to see their own
+  // readings) is their personal health data, not the facility's. It is never
+  // handed to the parent — it stays keyed to the removed code, which no active
+  // user holds, so nobody can open it.
+  const [selfRows] = await conn.execute(
+    `
+      SELECT COUNT(*) AS n
+      FROM table_clients
+      WHERE UPPER(dietician_id) = ? AND LOWER(email) = ?
+    `,
+    [fromCode, trainerEmail]
+  );
+  const selfClientsRetained = Number(selfRows[0]?.n || 0);
+
+  // Audit rows first — they describe the assignment being replaced.
+  await conn.execute(
+    `
+      INSERT INTO client_reassignments
+        (profile_id, from_partner_code, to_partner_code, facility_id, reason, actor_user_id)
+      SELECT profile_id, ?, ?, ?, 'trainer_removed', ?
+      FROM table_clients
+      WHERE UPPER(dietician_id) = ? AND LOWER(email) <> ?
+    `,
+    [fromCode, toCode, facilityId, actorEmail, fromCode, trainerEmail]
+  );
+
+  const [clients] = await conn.execute(
+    `
+      UPDATE table_clients
+      SET dietician_id = ?
+      WHERE UPPER(dietician_id) = ? AND LOWER(email) <> ?
+    `,
+    [toCode, fromCode, trainerEmail]
+  );
+
+  // Subscriptions attribute future commission; move them with the client.
+  const [subs] = await conn.execute(
+    `UPDATE client_subscriptions SET dietician_id = ? WHERE UPPER(dietician_id) = ?`,
+    [toCode, fromCode]
+  );
+
+  // Unredeemed invites / plan codes the trainer sent land with the parent
+  // instead of dying with the trainer.
+  const [planSubs] = await conn.execute(
+    `
+      UPDATE trainer_client_plan_subscriptions
+      SET trainer_id = ?, trainer_code = ?
+      WHERE UPPER(trainer_code) = ? AND status = 'sent'
+    `,
+    [toCode, toCode, fromCode]
+  );
+  const [invites] = await conn.execute(
+    `
+      UPDATE trainer_client_invites
+      SET trainer_id = ?, trainer_code = ?
+      WHERE UPPER(trainer_code) = ? AND status = 'sent'
+    `,
+    [toCode, toCode, fromCode]
+  );
+
+  return {
+    from_partner_code: fromCode,
+    to_partner_code: toCode,
+    to_user_id: parentEmail,
+    to_role: parent.role,
+    facility_id: facilityId,
+    clients_moved: clients.affectedRows,
+    self_clients_retained: selfClientsRetained,
+    subscriptions_moved: subs.affectedRows,
+    pending_plan_invites_moved: planSubs.affectedRows,
+    pending_client_invites_moved: invites.affectedRows,
   };
 }
 
@@ -671,6 +815,9 @@ const removeUser = async (req, res) => {
 
   const targetEmail = normalizeEmail(body.target_user_id);
   const targetProfileId = String(body.target_profile_id ?? "").trim();
+  // Optional disambiguator for emails that are both a role user and a client
+  // (a trainer who invited themselves as their own client is the common case).
+  const requestedTargetType = String(body.target_type ?? "").trim().toLowerCase();
   const targetDieticianId = String(body.target_dietician_id ?? "").trim();
 
   let reason = String(body.reason ?? "").trim();
@@ -693,6 +840,16 @@ const removeUser = async (req, res) => {
       ok: false,
       message:
         "Provide target_user_id (email) or target_profile_id (client) to remove a user",
+    });
+  }
+
+  if (
+    requestedTargetType !== "" &&
+    !["admin", "trainer", "client"].includes(requestedTargetType)
+  ) {
+    return res.status(422).json({
+      ok: false,
+      message: "target_type must be one of admin, trainer, client",
     });
   }
 
@@ -741,6 +898,26 @@ const removeUser = async (req, res) => {
     if (hasProfileId) {
       // profile_ids exist only for clients.
       targetType = "client";
+    } else if (requestedTargetType !== "") {
+      // Caller named the account type. It must be one this actor may remove;
+      // existence and network scope are still enforced by the removal itself,
+      // so an out-of-scope guess yields the same 403/404 as any other probe.
+      if (!allowedTargets.has(requestedTargetType)) {
+        await writeAuthLogSafe(req, {
+          eventType: "user_remove_denied",
+          userId: actorEmail,
+          role: actorRole,
+          partnerCode: actorCode,
+          identifier: auditIdentifier,
+          success: false,
+          failureReason: `actor may not remove target_type '${requestedTargetType}'`,
+        });
+        return res.status(403).json({
+          ok: false,
+          message: "You are not allowed to remove this type of account",
+        });
+      }
+      targetType = requestedTargetType;
     } else {
       const matchedTypes = [];
 
@@ -814,6 +991,7 @@ const removeUser = async (req, res) => {
         targetType: "admin",
         targetEmail,
         allowedParentEmails: [actorEmail],
+        actorEmail,
       });
     } else if (targetType === "trainer") {
       // Conditions 1 & 2: super_admin → self + active admins under them;
@@ -832,6 +1010,7 @@ const removeUser = async (req, res) => {
         targetType: "trainer",
         targetEmail,
         allowedParentEmails,
+        actorEmail,
       });
     } else {
       // Conditions 1–3: client removal.
@@ -840,7 +1019,7 @@ const removeUser = async (req, res) => {
       if (actorRole === "trainer") {
         const own = normalizeCode(getActorEffectiveCode(actor));
         actorNetworkCodes = own === "" ? [] : [own];
-      } else if (actorRole === "admin") {
+      } else if (actorRole === "admin" || actorRole === "facility_admin") {
         actorNetworkCodes = await getAdminNetworkCodes(conn, actor, actorEmail);
       }
 

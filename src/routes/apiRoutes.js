@@ -283,6 +283,44 @@ const {
   adminInviteTrainer,
 } = require("../controllers/dietitian/api/web/admin-invite-trainer");
 
+const {
+  adminInviteFacilityAdmin,
+} = require("../controllers/dietitian/api/web/admin-invite-facility-admin");
+
+const {
+  setTrainerCommissionSplit,
+} = require("../controllers/dietitian/api/web/set-trainer-commission-split");
+
+const {
+  createCheckoutSession,
+} = require("../controllers/dietitian/api/web/create-checkout-session");
+
+const {
+  stripeWebhook,
+} = require("../controllers/stripe/stripe-webhook");
+
+const {
+  stripeConnectStatus,
+  stripeConnectOnboardingLink,
+  stripeConnectDashboardLink,
+} = require("../controllers/dietitian/api/web/stripe-connect");
+
+const {
+  getCommissionRate,
+  setCommissionRate,
+} = require("../controllers/dietitian/api/web/commission-rate");
+
+const { earningsSummary } = require("../controllers/dietitian/api/web/earnings-summary");
+const referralOps = require("../controllers/dietitian/api/web/referral-ops");
+const { listFacilities } = require("../controllers/dietitian/api/web/list-facilities");
+
+const {
+  runBreathCreditsEndpoint,
+  runPayoutsEndpoint,
+  listPayouts,
+  commissionOverview,
+} = require("../controllers/dietitian/api/web/commission-ops");
+
 
 const {
   superAdminInviteTrainer,
@@ -979,6 +1017,65 @@ router.post(
   authMiddleware,
   adminInviteTrainer
 );
+
+
+router.post(
+  "/dietitian/api/web/admin-invite-facility-admin",
+  authMiddleware,
+  adminInviteFacilityAdmin
+);
+
+
+router.post(
+  "/dietitian/api/web/set-trainer-commission-split",
+  authMiddleware,
+  setTrainerCommissionSplit
+);
+
+
+// Public: starts Stripe Checkout from an /order/<code> link. No JWT; the
+// global rate limiter applies and nothing sensitive is returned.
+router.post(
+  "/dietitian/api/web/create-checkout-session",
+  createCheckoutSession
+);
+
+// Stripe -> us. Authenticated by the Stripe signature over req.rawBody, not
+// by JWT. Mounted at both paths so the Lambda /v1 rewrite and a bare host work.
+router.post(
+  ["/stripe/webhook", "/dietitian/api/web/stripe-webhook"],
+  stripeWebhook
+);
+
+
+router.post("/dietitian/api/web/stripe-connect-status", authMiddleware, stripeConnectStatus);
+router.post("/dietitian/api/web/stripe-connect-onboarding-link", authMiddleware, stripeConnectOnboardingLink);
+router.post("/dietitian/api/web/stripe-connect-dashboard-link", authMiddleware, stripeConnectDashboardLink);
+
+router.post("/dietitian/api/web/get-commission-rate", authMiddleware, getCommissionRate);
+router.post("/dietitian/api/web/set-commission-rate", authMiddleware, setCommissionRate);
+
+router.post("/dietitian/api/web/run-breath-credits", authMiddleware, runBreathCreditsEndpoint);
+router.post("/dietitian/api/web/run-payouts", authMiddleware, runPayoutsEndpoint);
+router.post("/dietitian/api/web/list-payouts", authMiddleware, listPayouts);
+router.post("/dietitian/api/web/commission-overview", authMiddleware, commissionOverview);
+router.post("/dietitian/api/web/earnings-summary", authMiddleware, earningsSummary);
+router.post("/dietitian/api/web/list-facilities", authMiddleware, listFacilities);
+
+// Referral programme v0.3 — public order-page helpers (no JWT) …
+router.post("/dietitian/api/web/order-page-context", referralOps.orderPageContext);
+router.post("/dietitian/api/web/order-session-status", referralOps.orderSessionStatus);
+// … and authenticated operations.
+router.post("/dietitian/api/web/referred-members", authMiddleware, referralOps.referredMembers);
+router.post("/dietitian/api/web/resend-purchase-code", authMiddleware, referralOps.resendPurchaseCode);
+router.post("/dietitian/api/web/qr-generate", authMiddleware, referralOps.qrGenerate);
+router.post("/dietitian/api/web/qr-link", authMiddleware, referralOps.qrLink);
+router.post("/dietitian/api/web/qr-list", authMiddleware, referralOps.qrList);
+router.post("/dietitian/api/web/qr-assign", authMiddleware, referralOps.qrAssign);
+router.post("/dietitian/api/web/qr-setup", authMiddleware, referralOps.qrSetup);
+router.post("/dietitian/api/web/list-trainer-admins", authMiddleware, referralOps.listTrainerAdmins);
+router.post("/dietitian/api/web/get-pricing", authMiddleware, referralOps.getPricing);
+router.post("/dietitian/api/web/set-pricing", authMiddleware, referralOps.setPricingEndpoint);
 
 
 router.post(

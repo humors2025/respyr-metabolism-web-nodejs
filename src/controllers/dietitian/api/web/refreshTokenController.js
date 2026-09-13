@@ -171,6 +171,10 @@ function buildDashboardRoute(role) {
     return '/trainer-admin/overview';
   }
 
+  if (role === 'facility_admin') {
+    return '/facility-admin/overview';
+  }
+
   if (role === 'trainer') {
     return '/trainer/clients';
   }
@@ -337,6 +341,7 @@ exports.refreshToken = async (req, res) => {
          aur.role,
          aur.partner_code,
          aur.parent_user_id,
+         aur.facility_id,
          aur.status,
          aur.email_verified_at
 
@@ -422,6 +427,7 @@ exports.refreshToken = async (req, res) => {
     if (
       role !== 'super_admin' &&
       role !== 'admin' &&
+      role !== 'facility_admin' &&
       role !== 'trainer'
     ) {
       await conn.rollback();
@@ -441,6 +447,7 @@ exports.refreshToken = async (req, res) => {
     if (
       (
         role === 'admin' ||
+        role === 'facility_admin' ||
         role === 'trainer'
       ) &&
       String(
@@ -467,6 +474,7 @@ exports.refreshToken = async (req, res) => {
     if (
       (
         role === 'admin' ||
+        role === 'facility_admin' ||
         role === 'trainer'
       ) &&
       String(
@@ -493,6 +501,7 @@ exports.refreshToken = async (req, res) => {
     if (
       (
         role === 'admin' ||
+        role === 'facility_admin' ||
         role === 'trainer'
       ) &&
       !user.email_verified_at
@@ -524,6 +533,11 @@ exports.refreshToken = async (req, res) => {
             user.parent_user_id
           ).toLowerCase()
         : null;
+
+    const facilityId =
+      user.facility_id == null
+        ? null
+        : Number(user.facility_id);
 
     const dashboardRoute =
       buildDashboardRoute(role);
@@ -568,6 +582,7 @@ exports.refreshToken = async (req, res) => {
       role,
       partner_code: partnerCode,
       parent_user_id: parentUserId,
+      facility_id: facilityId,
     };
 
     /*
@@ -711,6 +726,9 @@ exports.refreshToken = async (req, res) => {
 
       parent_user_id:
         parentUserId,
+
+      facility_id:
+        facilityId,
 
       dashboard_route:
         dashboardRoute,
