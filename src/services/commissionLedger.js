@@ -55,9 +55,12 @@ async function rateAt(conn, at) {
 async function resolvePayees(conn, sub) {
   const [rows] = await conn.execute(
     `
-      SELECT user_id, role, status, parent_user_id, facility_id, commission_split_pct
-      FROM app_user_roles
-      WHERE LOWER(user_id) = ?
+      SELECT aur.user_id, aur.role, aur.status, aur.parent_user_id, aur.facility_id,
+             COALESCE(tcs.commission_split_pct, 0.00) AS commission_split_pct
+      FROM app_user_roles aur
+      LEFT JOIN trainer_commission_splits tcs
+        ON LOWER(tcs.user_id) = LOWER(aur.user_id)
+      WHERE LOWER(aur.user_id) = ?
       LIMIT 1
     `,
     [lower(sub.attributed_user_id)]
@@ -68,9 +71,12 @@ async function resolvePayees(conn, sub) {
   while (row && String(row.status) !== "active" && row.parent_user_id && hops < 4) {
     const [p] = await conn.execute(
       `
-        SELECT user_id, role, status, parent_user_id, facility_id, commission_split_pct
-        FROM app_user_roles
-        WHERE LOWER(user_id) = ?
+        SELECT aur.user_id, aur.role, aur.status, aur.parent_user_id, aur.facility_id,
+               COALESCE(tcs.commission_split_pct, 0.00) AS commission_split_pct
+        FROM app_user_roles aur
+        LEFT JOIN trainer_commission_splits tcs
+          ON LOWER(tcs.user_id) = LOWER(aur.user_id)
+        WHERE LOWER(aur.user_id) = ?
         LIMIT 1
       `,
       [lower(row.parent_user_id)]
