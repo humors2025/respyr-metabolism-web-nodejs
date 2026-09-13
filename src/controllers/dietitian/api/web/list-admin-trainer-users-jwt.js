@@ -425,8 +425,8 @@ async function getExistingTrainersForAdmin(adminEmail) {
         aur.created_at,
         aur.updated_at,
         aur.facility_id,
-        aur.commission_split_pct,
-        aur.commission_split_updated_at,
+        COALESCE(tcs.commission_split_pct, 0.00) AS commission_split_pct,
+        tcs.updated_at AS commission_split_updated_at,
 
         td.dietician_id,
         td.name,
@@ -437,6 +437,8 @@ async function getExistingTrainersForAdmin(adminEmail) {
       FROM app_user_roles aur
       LEFT JOIN table_dietician td
         ON LOWER(td.email) = LOWER(aur.user_id)
+      LEFT JOIN trainer_commission_splits tcs
+        ON LOWER(tcs.user_id) = LOWER(aur.user_id)
       WHERE aur.role = 'trainer'
         AND LOWER(aur.parent_user_id) = LOWER(?)
       ORDER BY aur.created_at DESC, aur.id DESC

@@ -98,8 +98,7 @@ const setTrainerCommissionSplit = async (req, res) => {
             role,
             status,
             parent_user_id,
-            facility_id,
-            commission_split_pct
+            facility_id
           FROM app_user_roles
           WHERE LOWER(user_id) = LOWER(?)
           LIMIT 1
@@ -134,20 +133,37 @@ const setTrainerCommissionSplit = async (req, res) => {
         });
       }
 
-      const previous = Number(trainer.commission_split_pct || 0);
+      // Current split lives in trainer_commission_splits; a trainer who has
+      // never had one set simply has no row yet, which reads as 0.
+      const [prevRows] = await conn.execute(
+        `
+          SELECT commission_split_pct
+          FROM trainer_commission_splits
+          WHERE LOWER(user_id) = LOWER(?)
+          LIMIT 1
+          FOR UPDATE
+        `,
+        [trainer.user_id]
+      );
+      const previous = Number(prevRows[0]?.commission_split_pct || 0);
 
       await conn.execute(
         `
-          UPDATE app_user_roles
-          SET
-            commission_split_pct        = ?,
-            commission_split_updated_at = UTC_TIMESTAMP(),
-            commission_split_updated_by = ?,
-            updated_at                  = UTC_TIMESTAMP()
-          WHERE id = ?
-          LIMIT 1
+          INSERT INTO trainer_commission_splits
+            (user_id, facility_id, commission_split_pct, updated_at, updated_by)
+          VALUES (?, ?, ?, UTC_TIMESTAMP(), ?)
+          ON DUPLICATE KEY UPDATE
+            facility_id          = VALUES(facility_id),
+            commission_split_pct = VALUES(commission_split_pct),
+            updated_at           = UTC_TIMESTAMP(),
+            updated_by           = VALUES(updated_by)
         `,
-        [split.value.toFixed(2), actorEmail, trainer.id]
+        [
+          trainer.user_id,
+          trainer.facility_id ?? null,
+          split.value.toFixed(2),
+          actorEmail,
+        ]
       );
 
       await conn.commit();

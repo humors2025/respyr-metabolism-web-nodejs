@@ -107,14 +107,16 @@ const earningsSummary = async (req, res) => {
     if (role === "facility_admin" && actor.facility_id != null) {
       const [rows] = await pool.execute(
         `
-          SELECT aur.user_id, td.name, aur.partner_code, aur.commission_split_pct,
+          SELECT aur.user_id, td.name, aur.partner_code,
+                 COALESCE(tcs.commission_split_pct, 0.00) AS commission_split_pct,
                  COALESCE(SUM(CASE WHEN ce.invoice_paid_at >= ? AND ce.invoice_paid_at < ? AND ce.status <> 'reversed' THEN ce.amount_minor END), 0) AS this_month_minor,
                  COALESCE(SUM(CASE WHEN ce.status IN ('pending','held','scheduled') THEN ce.amount_minor END), 0) AS pending_minor
           FROM app_user_roles aur
           LEFT JOIN table_dietician td ON LOWER(td.email) = LOWER(aur.user_id)
+          LEFT JOIN trainer_commission_splits tcs ON LOWER(tcs.user_id) = LOWER(aur.user_id)
           LEFT JOIN commission_entries ce ON LOWER(ce.payee_user_id) = LOWER(aur.user_id)
           WHERE aur.role = 'trainer' AND aur.facility_id = ? AND aur.status = 'active'
-          GROUP BY aur.user_id, td.name, aur.partner_code, aur.commission_split_pct
+          GROUP BY aur.user_id, td.name, aur.partner_code, tcs.commission_split_pct
           ORDER BY td.name
         `,
         [sqlDt(thisStart), sqlDt(nextStart), Number(actor.facility_id)]

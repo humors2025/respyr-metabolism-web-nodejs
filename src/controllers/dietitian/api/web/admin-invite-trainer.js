@@ -295,7 +295,7 @@ async function resolveActorFromToken(
             aur.partner_code,
             aur.parent_user_id,
             aur.facility_id,
-            aur.commission_split_pct,
+            COALESCE(tcs.commission_split_pct, 0.00) AS commission_split_pct,
             aur.status
 
           FROM table_dietician td
@@ -303,6 +303,10 @@ async function resolveActorFromToken(
           INNER JOIN app_user_roles aur
             ON LOWER(aur.user_id) =
                LOWER(td.email)
+
+          LEFT JOIN trainer_commission_splits tcs
+            ON LOWER(tcs.user_id) =
+               LOWER(aur.user_id)
 
           WHERE td.dietician_id = ?
 
@@ -329,7 +333,7 @@ async function resolveActorFromToken(
             aur.partner_code,
             aur.parent_user_id,
             aur.facility_id,
-            aur.commission_split_pct,
+            COALESCE(tcs.commission_split_pct, 0.00) AS commission_split_pct,
             aur.status
 
           FROM table_dietician td
@@ -337,6 +341,10 @@ async function resolveActorFromToken(
           INNER JOIN app_user_roles aur
             ON LOWER(aur.user_id) =
                LOWER(td.email)
+
+          LEFT JOIN trainer_commission_splits tcs
+            ON LOWER(tcs.user_id) =
+               LOWER(aur.user_id)
 
           WHERE LOWER(td.email) =
                 LOWER(?)
