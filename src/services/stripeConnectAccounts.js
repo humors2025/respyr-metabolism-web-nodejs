@@ -28,6 +28,22 @@ function lower(v) {
 
 const ACCOUNT_INCLUDE = ["configuration.recipient", "identity", "requirements"];
 
+/**
+ * Accounts v2 rejects empty metadata values ("must be between 1 and 500
+ * characters"), so drop null/empty keys instead of sending "". Trainers
+ * without a facility, for example, have facility_id = null.
+ */
+function compactMetadata(obj) {
+  const out = {};
+  for (const [k, v] of Object.entries(obj)) {
+    if (v === null || v === undefined) continue;
+    const str = String(v).trim();
+    if (str === "") continue;
+    out[k] = str.slice(0, 500);
+  }
+  return out;
+}
+
 /** Map a v2 Account to our onboarding_status. */
 function statusFromAccount(acct) {
   const cap = acct.configuration?.recipient?.capabilities?.stripe_balance?.stripe_transfers;
@@ -137,12 +153,12 @@ async function getOrCreateAccount(user) {
         currency: "usd",
         responsibilities: { fees_collector: "application", losses_collector: "application" },
       },
-      metadata: {
+      metadata: compactMetadata({
         user_id: lower(user.user_id),
         role: String(user.role),
-        partner_code: user.partner_code || "",
-        facility_id: user.facility_id == null ? "" : String(user.facility_id),
-      },
+        partner_code: user.partner_code,
+        facility_id: user.facility_id,
+      }),
       include: ACCOUNT_INCLUDE,
     },
     { idempotencyKey: `connect-create-${lower(user.user_id)}` }
