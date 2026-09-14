@@ -6820,6 +6820,13 @@ const trainerUpdateWeeklyFoodJsonNewtest =
       // 11. SERIALIZE
       // =====================================================================
 
+      // Mark the plan as trainer-edited. The dashboard shows an "Edited" badge
+      // while this is present; reset-weekly-food-json-newtest restores the
+      // unstamped original_food_json, which clears it. Underscore-prefixed
+      // like the generator's own _request / _saved_to keys.
+      foodJson._trainer_edited_at =
+        new Date().toISOString();
+
       let updatedFoodJson;
 
       try {
