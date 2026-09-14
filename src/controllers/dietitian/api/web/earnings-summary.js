@@ -129,6 +129,23 @@ const earningsSummary = async (req, res) => {
       }));
     }
 
+    // Printed stickers currently mapped to this payee's code. The dashboard
+    // shows these as "your QR code" so what the owner sees is pixel-identical
+    // to what the trainer admin printed and stuck on the wall.
+    let stickers = [];
+    if (actor.partner_code) {
+      const [st] = await pool.execute(
+        `
+          SELECT id, target_label, scans, linked_at
+          FROM qr_codes
+          WHERE UPPER(partner_code) = UPPER(?) AND status = 'assigned'
+          ORDER BY linked_at ASC
+        `,
+        [String(actor.partner_code)]
+      );
+      stickers = st.map((r) => ({ id: r.id, label: r.target_label, scans: Number(r.scans || 0), linked_at: r.linked_at }));
+    }
+
     const [recent] = await pool.execute(
       `
         SELECT ce.invoice_paid_at, ce.amount_minor, ce.status, ce.attributed_partner_code, ce.payee_role, ce.share_pct,
@@ -166,6 +183,7 @@ const earningsSummary = async (req, res) => {
         ? { onboarding_status: acct.onboarding_status, payouts_enabled: Number(acct.payouts_enabled) === 1 }
         : null,
       facility,
+      stickers,
       ...(trainers && { trainers }),
       // referred_by: "Direct" when the sale came through the payee's own code,
       // otherwise the trainer (or facility) whose code was used.
