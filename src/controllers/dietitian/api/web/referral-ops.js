@@ -116,6 +116,14 @@ const orderSessionStatus = guard(async (req, res) => {
 const referredMembers = guard(async (req, res) => {
   const a = await actor(req, res, PAYEES);
   if (!a) return;
+  // Pick up any purchase codes redeemed in the app since the nightly
+  // breath-credits job last ran, so "App linked" is current on every load
+  // (two cheap UPDATEs, no-ops when nothing is pending).
+  try {
+    await purchaseCodes.linkProfiles();
+  } catch (e) {
+    console.warn("REFERRED_MEMBERS_LINK_SKIPPED:", e?.message);
+  }
   const role = String(a.actor.role);
   const ownCode = String(a.actor.partner_code || "").toUpperCase();
   const isOwner = role === "facility_admin" && a.actor.facility_id != null;
