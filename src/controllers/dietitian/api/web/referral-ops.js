@@ -126,10 +126,12 @@ const referredMembers = guard(async (req, res) => {
   if (isOwner) {
     const [tr] = await pool.execute(
       `
-        SELECT aur.user_id, aur.partner_code, aur.status, aur.commission_split_pct,
+        SELECT aur.user_id, aur.partner_code, aur.status,
+               COALESCE(tcs.commission_split_pct, 0.00) AS commission_split_pct,
                COALESCE(td.name, aur.user_id) AS name
         FROM app_user_roles aur
         LEFT JOIN table_dietician td ON LOWER(td.email) = LOWER(aur.user_id)
+        LEFT JOIN trainer_commission_splits tcs ON LOWER(tcs.user_id) = LOWER(aur.user_id)
         WHERE aur.role = 'trainer' AND aur.facility_id = ? AND aur.partner_code IS NOT NULL
         ORDER BY name
       `,
