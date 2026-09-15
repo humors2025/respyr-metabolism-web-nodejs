@@ -117,53 +117,185 @@ const referredMembers = guard(async (req, res) => {
   const a = await actor(req, res, PAYEES);
   if (!a) return;
   const role = String(a.actor.role);
-  let codes = [String(a.actor.partner_code || "").toUpperCase()].filter(Boolean);
-  if (role === "facility_admin" && a.actor.facility_id != null) {
+  const ownCode = String(a.actor.partner_code || "").toUpperCase();
+  const isOwner = role === "facility_admin" && a.actor.facility_id != null;
+
+  // Facility admin: own code (wall QR) + every trainer in the facility,
+  // including removed trainers so their historical sales still show.
+  let trainers = [];
+  if (isOwner) {
     const [tr] = await pool.execute(
-      `SELECT partner_code FROM app_user_roles WHERE role = 'trainer' AND facility_id = ? AND partner_code IS NOT NULL`,
+      `
+        SELECT aur.user_id, aur.partner_code, aur.status, aur.commission_split_pct,
+               COALESCE(td.name, aur.user_id) AS name
+        FROM app_user_roles aur
+        LEFT JOIN table_dietician td ON LOWER(td.email) = LOWER(aur.user_id)
+        WHERE aur.role = 'trainer' AND aur.facility_id = ? AND aur.partner_code IS NOT NULL
+        ORDER BY name
+      `,
       [Number(a.actor.facility_id)]
     );
-    codes = codes.concat(tr.map((r) => String(r.partner_code).toUpperCase()));
+    trainers = tr.map((r) => ({
+      user_id: String(r.user_id).toLowerCase(),
+      name: r.name,
+      code: String(r.partner_code).toUpperCase(),
+      status: r.status,
+      split_pct: Number(r.commission_split_pct || 0),
+    }));
   }
-  if (!codes.length) return res.status(200).json({ ok: true, items: [], totals: { total: 0, linked: 0, unlinked: 0 } });
+  const codes = [ownCode, ...trainers.map((t) => t.code)].filter(Boolean);
+  const empty = { ok: true, items: [], groups: [], totals: { total: 0, linked: 0, unlinked: 0, active: 0, charged_minor: 0, breath_credit_minor: 0, commission_minor: 0, my_share_minor: 0 } };
+  if (!codes.length) return res.status(200).json(empty);
 
   const [rows] = await pool.query(
     `
-      SELECT rs.stripe_subscription_id, rs.purchaser_email, rs.profile_id, rs.linked_via, rs.linked_at,
-             rs.attributed_partner_code, rs.attributed_role, rs.qr_id, rs.status,
-             rs.purchase_code, rs.purchase_code_email_sent_at, rs.created_at, rs.current_period_end,
-             td.name AS trainer_name,
-             (SELECT COALESCE(SUM(ce.invoice_net_minor),0) FROM commission_entries ce
-               WHERE ce.stripe_subscription_id = rs.stripe_subscription_id AND ce.payee_user_id = ? AND ce.status <> 'reversed') AS net_sales_minor
+      SELECT rs.stripe_subscription_id, rs.purchaser_email, rs.purchaser_name, rs.profile_id, rs.linked_via, rs.linked_at,
+             rs.attributed_partner_code, rs.attributed_role, rs.qr_id, rs.status, rs.currency, rs.unit_amount_minor,
+             rs.purchase_code, rs.purchase_code_email_sent_at, rs.created_at, rs.current_period_start, rs.current_period_end,
+             tc.profile_name
       FROM referral_subscriptions rs
-      LEFT JOIN app_user_roles aur ON UPPER(aur.partner_code) = UPPER(rs.attributed_partner_code)
-      LEFT JOIN table_dietician td ON LOWER(td.email) = LOWER(aur.user_id)
+      LEFT JOIN table_clients tc ON rs.profile_id IS NOT NULL AND tc.profile_id = rs.profile_id
       WHERE UPPER(rs.attributed_partner_code) IN (?)
       ORDER BY rs.created_at DESC
       LIMIT 500
     `,
-    [a.actorEmail, codes]
+    [codes]
   );
-  const items = rows.map((r) => ({
-    stripe_subscription_id: r.stripe_subscription_id,
-    email: r.purchaser_email,
-    linked: !!r.profile_id,
-    linked_via: r.linked_via,
-    linked_at: r.linked_at,
-    code: r.attributed_partner_code,
-    via_trainer: r.attributed_role === "trainer" ? r.trainer_name || r.attributed_partner_code : null,
-    qr_id: r.qr_id,
-    status: r.status,
-    purchase_code: r.profile_id ? null : r.purchase_code,
-    code_email_sent_at: r.purchase_code_email_sent_at,
-    since: r.created_at,
-    renews: r.current_period_end,
-  }));
-  return res.status(200).json({
-    ok: true,
-    items,
-    totals: { total: items.length, linked: items.filter((i) => i.linked).length, unlinked: items.filter((i) => !i.linked).length },
+  if (!rows.length) return res.status(200).json(empty);
+  const subIds = rows.map((r) => r.stripe_subscription_id);
+
+  // One line per paid invoice: what the member was charged, the commission it
+  // produced and how that commission was split. Reversed (refunded) entries
+  // are shown but excluded from totals.
+  const [entries] = await pool.query(
+    `
+      SELECT stripe_subscription_id, stripe_invoice_id, MIN(invoice_paid_at) AS paid_at,
+             MAX(invoice_net_minor) AS net_minor, MAX(gym_commission_minor) AS commission_minor,
+             MAX(commission_rate_pct) AS rate_pct,
+             SUM(CASE WHEN payee_role = 'trainer' THEN amount_minor ELSE 0 END) AS trainer_minor,
+             SUM(CASE WHEN payee_role <> 'trainer' THEN amount_minor ELSE 0 END) AS facility_minor,
+             SUM(CASE WHEN LOWER(payee_user_id) = ? THEN amount_minor ELSE 0 END) AS my_minor,
+             MIN(status) AS status
+      FROM commission_entries
+      WHERE stripe_subscription_id IN (?)
+      GROUP BY stripe_subscription_id, stripe_invoice_id
+      ORDER BY paid_at DESC
+    `,
+    [a.actorEmail, subIds]
+  );
+  const [credits] = await pool.query(
+    `
+      SELECT stripe_subscription_id, period_start, period_end, credit_minor, applied_at
+      FROM breath_credits
+      WHERE stripe_subscription_id IN (?) AND applied_at IS NOT NULL
+    `,
+    [subIds]
+  );
+
+  // A credit posted for period N is applied to the invoice paid at the start
+  // of period N+1, i.e. on (or within a couple of days of) credit.period_end.
+  const creditsBySub = new Map();
+  for (const c of credits) {
+    if (!creditsBySub.has(c.stripe_subscription_id)) creditsBySub.set(c.stripe_subscription_id, []);
+    creditsBySub.get(c.stripe_subscription_id).push(c);
+  }
+  function creditFor(subId, paidAt) {
+    const list = creditsBySub.get(subId) || [];
+    const t = new Date(paidAt).getTime();
+    let best = null;
+    for (const c of list) {
+      const diff = Math.abs(new Date(c.period_end + "T00:00:00Z").getTime() - t);
+      if (diff <= 3 * 86400000 && (!best || diff < best.diff)) best = { diff, c };
+    }
+    return best ? Number(best.c.credit_minor) : 0;
+  }
+
+  const invoicesBySub = new Map();
+  for (const e of entries) {
+    if (!invoicesBySub.has(e.stripe_subscription_id)) invoicesBySub.set(e.stripe_subscription_id, []);
+    invoicesBySub.get(e.stripe_subscription_id).push({
+      invoice_id: e.stripe_invoice_id,
+      paid_at: e.paid_at,
+      charged_minor: Number(e.net_minor),
+      breath_credit_minor: creditFor(e.stripe_subscription_id, e.paid_at),
+      commission_minor: Number(e.commission_minor),
+      rate_pct: Number(e.rate_pct),
+      trainer_minor: Number(e.trainer_minor),
+      facility_minor: Number(e.facility_minor),
+      my_minor: Number(e.my_minor),
+      status: e.status,
+    });
+  }
+
+  const trainerByCode = new Map(trainers.map((t) => [t.code, t]));
+  const totals = { total: 0, linked: 0, unlinked: 0, active: 0, charged_minor: 0, breath_credit_minor: 0, commission_minor: 0, my_share_minor: 0 };
+
+  const items = rows.map((r) => {
+    const code = String(r.attributed_partner_code || "").toUpperCase();
+    const trainer = trainerByCode.get(code) || null;
+    const invoices = invoicesBySub.get(r.stripe_subscription_id) || [];
+    const live = invoices.filter((i) => i.status !== "reversed");
+    const sum = (k) => live.reduce((acc, i) => acc + i[k], 0);
+    const item = {
+      stripe_subscription_id: r.stripe_subscription_id,
+      name: r.profile_name || r.purchaser_name || null,
+      email: r.purchaser_email,
+      linked: !!r.profile_id,
+      linked_via: r.linked_via,
+      linked_at: r.linked_at,
+      code,
+      via_trainer: r.attributed_role === "trainer" ? (trainer ? trainer.name : code) : null,
+      trainer_user_id: trainer ? trainer.user_id : null,
+      qr_id: r.qr_id,
+      status: r.status,
+      currency: r.currency,
+      list_price_minor: Number(r.unit_amount_minor || 0),
+      purchase_code: r.profile_id ? null : r.purchase_code,
+      code_email_sent_at: r.purchase_code_email_sent_at,
+      since: r.created_at,
+      period_start: r.current_period_start,
+      renews: r.current_period_end,
+      months_paid: live.length,
+      charged_minor: sum("charged_minor"),
+      breath_credit_minor: sum("breath_credit_minor"),
+      commission_minor: sum("commission_minor"),
+      my_share_minor: sum("my_minor"),
+      last_charged_minor: live[0] ? live[0].charged_minor : null,
+      invoices,
+    };
+    totals.total += 1;
+    if (item.linked) totals.linked += 1; else totals.unlinked += 1;
+    if (["active", "trialing", "past_due"].includes(String(item.status))) totals.active += 1;
+    totals.charged_minor += item.charged_minor;
+    totals.breath_credit_minor += item.breath_credit_minor;
+    totals.commission_minor += item.commission_minor;
+    totals.my_share_minor += item.my_share_minor;
+    return item;
   });
+
+  // Facility admin view: one group per trainer (accordion) + the wall QR.
+  let groups = [];
+  if (isOwner) {
+    const groupOf = (key, meta, members) => ({
+      key,
+      ...meta,
+      members,
+      totals: {
+        members: members.length,
+        active: members.filter((m) => ["active", "trialing", "past_due"].includes(String(m.status))).length,
+        charged_minor: members.reduce((s, m) => s + m.charged_minor, 0),
+        breath_credit_minor: members.reduce((s, m) => s + m.breath_credit_minor, 0),
+        commission_minor: members.reduce((s, m) => s + m.commission_minor, 0),
+        my_share_minor: members.reduce((s, m) => s + m.my_share_minor, 0),
+      },
+    });
+    groups.push(groupOf("facility", { kind: "facility", name: "Facility QR (direct)", code: ownCode, split_pct: 0, status: "active" }, items.filter((m) => m.code === ownCode)));
+    for (const t of trainers) {
+      groups.push(groupOf(t.user_id, { kind: "trainer", name: t.name, user_id: t.user_id, code: t.code, split_pct: t.split_pct, status: t.status }, items.filter((m) => m.code === t.code)));
+    }
+  }
+
+  return res.status(200).json({ ok: true, items, groups, totals, rate_pct: entries[0] ? Number(entries[0].rate_pct) : null });
 });
 
 const resendPurchaseCode = guard(async (req, res) => {

@@ -66,6 +66,7 @@ async function onCheckoutSessionCompleted(stripe, session) {
   }
 
   const purchaserEmail = lower(session.customer_details?.email || session.customer_email);
+  const purchaserName = String(session.customer_details?.name || "").trim().slice(0, 150) || null;
 
   // Link to an app profile if the buyer already has one; otherwise the credit
   // job keeps trying by email.
@@ -82,14 +83,15 @@ async function onCheckoutSessionCompleted(stripe, session) {
     `
       INSERT INTO referral_subscriptions (
         stripe_subscription_id, stripe_customer_id, stripe_checkout_session_id,
-        purchaser_email, profile_id, linked_via, linked_at,
+        purchaser_email, purchaser_name, profile_id, linked_via, linked_at,
         attributed_partner_code, attributed_user_id, attributed_role, qr_id, stripe_promotion_code_id, facility_id,
         plan_code, price_id, currency, unit_amount_minor, status,
         current_period_start, current_period_end
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON DUPLICATE KEY UPDATE
         stripe_checkout_session_id = VALUES(stripe_checkout_session_id),
         purchaser_email = COALESCE(purchaser_email, VALUES(purchaser_email)),
+        purchaser_name  = COALESCE(purchaser_name, VALUES(purchaser_name)),
         profile_id      = COALESCE(profile_id, VALUES(profile_id)),
         linked_via      = COALESCE(linked_via, VALUES(linked_via)),
         linked_at       = COALESCE(linked_at, VALUES(linked_at)),
@@ -107,6 +109,7 @@ async function onCheckoutSessionCompleted(stripe, session) {
       String(subscription.customer),
       session.id,
       purchaserEmail,
+      purchaserName,
       profileId,
       profileId ? "email" : null,
       profileId ? new Date().toISOString().slice(0, 19).replace("T", " ") : null,

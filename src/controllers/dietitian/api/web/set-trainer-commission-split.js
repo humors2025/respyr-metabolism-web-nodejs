@@ -23,6 +23,7 @@
  */
 
 const pool = require("../../../../config/db");
+const ledger = require("../../../../services/commissionLedger");
 const {
   _helpers: H,
 } = require("./admin-invite-trainer");
@@ -168,6 +169,15 @@ const setTrainerCommissionSplit = async (req, res) => {
 
       await conn.commit();
 
+      // The new split applies to every commission not yet paid out, so the
+      // change shows on both dashboards immediately (paid/scheduled untouched).
+      let reallocated = { rebuilt: 0, skipped: 0 };
+      try {
+        reallocated = await ledger.reallocateUnpaidForTrainer(trainerUserId);
+      } catch (err) {
+        console.error("COMMISSION_SPLIT_REALLOCATE_ERROR:", { trainer: trainerUserId, message: err?.message });
+      }
+
       await H.writeAuthLogSafe(req, {
         eventType: "trainer_commission_split_set",
         userId: actorEmail,
@@ -187,6 +197,7 @@ const setTrainerCommissionSplit = async (req, res) => {
           previous_split_pct: previous,
           split_pct: split.value,
           updated_by: actorEmail,
+          reallocated_invoices: reallocated.rebuilt,
         },
       });
     } catch (err) {
