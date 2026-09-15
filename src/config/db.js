@@ -19,6 +19,12 @@ const poolConfig = {
   waitForConnections: true,
   connectionLimit: 2,
   queueLimit: 0,
+  // Give idle sockets back instead of holding them until MySQL's
+  // wait_timeout: every warm Lambda container keeps its own pool, so idle
+  // connections from quiet or recycled containers were piling up on the
+  // server (dozens of Sleep rows from the app user).
+  maxIdle: 1,
+  idleTimeout: 60000,
 };
 
 if (isLambda) {
