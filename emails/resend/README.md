@@ -11,6 +11,7 @@ before the templates exist.
 | `payment_received.html`  | `RESEND_PAYMENT_RECEIPT_TEMPLATE_ID` | `payment_received`    | `checkout.session.completed`                                       |
 | `payment_failed.html`    | `RESEND_PAYMENT_FAILED_TEMPLATE_ID`  | `payment_failed`      | `payment_intent.payment_failed`, `checkout.session.async_payment_failed` |
 | `renewal_failed.html`    | `RESEND_RENEWAL_FAILED_TEMPLATE_ID`  | `renewal_failed`      | `invoice.payment_failed` (month 2+)                                |
+| `purchase_code.html`     | `RESEND_PURCHASE_CODE_TEMPLATE_ID`   | `purchase_code`       | `checkout.session.completed` (new app users) and the resend-purchase-code endpoint — sent by `src/services/purchaseCodes.js` |
 
 Subject and from are set by the code on every send (they override the
 template's defaults), so the subject you type in Resend is just a placeholder.
@@ -50,6 +51,16 @@ code; use triple braces `{{{VAR}}}` so Resend does not escape them twice.
 | `AMOUNT`        | `$29.00`                                    |
 | `REASON`        | `Your card was declined.`                   |
 | `SUPPORT_EMAIL` | `support@rysflo.com`                        |
+
+### purchase_code
+| Variable         | Example                                                        |
+|------------------|----------------------------------------------------------------|
+| `PURCHASE_CODE`  | `RSP7V7RTEE`                                                   |
+| `MEMBER_EMAIL`   | the buyer's email (the app account must use the same one)      |
+| `APP_STORE_URL`  | `APP_STORE_URL` env                                            |
+| `PLAY_STORE_URL` | `PLAY_STORE_URL` env                                           |
+| `EXPIRY_DAYS`    | `30` (`PURCHASE_CODE_EXPIRY_DAYS` env)                         |
+| `SUPPORT_EMAIL`  | `support@rysflo.com`                                           |
 
 ## Stripe side
 

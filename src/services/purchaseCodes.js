@@ -30,6 +30,9 @@ const SKIP_OUTBOUND_EMAIL =
 const CODE_EXPIRY_DAYS = Math.max(1, parseInt(process.env.PURCHASE_CODE_EXPIRY_DAYS, 10) || 30);
 const APP_STORE_URL = process.env.APP_STORE_URL || "https://apps.apple.com/app/rysflo";
 const PLAY_STORE_URL = process.env.PLAY_STORE_URL || "https://play.google.com/store/apps/details?id=com.rysflo";
+const SUPPORT_EMAIL = process.env.SUPPORT_EMAIL || "support@rysflo.com";
+// Published Resend template (emails/resend/purchase_code.html). Unset → inline HTML below.
+const RESEND_PURCHASE_CODE_TEMPLATE_ID = process.env.RESEND_PURCHASE_CODE_TEMPLATE_ID || "";
 
 const PAID_PLAN = { plan_code: "rysflo_monthly", plan_name: "Rysflo Membership", plan_price_label: "Paid" };
 
@@ -126,9 +129,33 @@ async function sendPurchaseCodeEmail({ stripeSubscriptionId, force = false }) {
   }
   if (!RESEND_API_KEY) return { ok: false, reason: "RESEND_API_KEY not configured" };
 
+  // Resend rejects a template send that is missing any variable the template
+  // uses (and html alongside template), so every variable is always supplied.
+  const body = RESEND_PURCHASE_CODE_TEMPLATE_ID
+    ? {
+        template: {
+          id: RESEND_PURCHASE_CODE_TEMPLATE_ID,
+          variables: {
+            PURCHASE_CODE: code,
+            MEMBER_EMAIL: escapeHtml(sub.purchaser_email),
+            APP_STORE_URL,
+            PLAY_STORE_URL,
+            EXPIRY_DAYS: String(CODE_EXPIRY_DAYS),
+            SUPPORT_EMAIL,
+          },
+        },
+      }
+    : { html };
   const res = await axios.post(
     "https://api.resend.com/emails",
-    { from: RESEND_FROM_EMAIL, to: [sub.purchaser_email], subject: `Your Rysflo Referral Code: ${sub.purchase_code}`, html },
+    {
+      from: RESEND_FROM_EMAIL,
+      to: [sub.purchaser_email],
+      subject: `Your Rysflo Referral Code: ${sub.purchase_code}`,
+      ...body,
+      headers: { "X-Entity-Ref-ID": `purchase-code-${stripeSubscriptionId}` },
+      tags: [{ name: "kind", value: "purchase_code" }, { name: "template_id", value: RESEND_PURCHASE_CODE_TEMPLATE_ID || "inline" }],
+    },
     { headers: { Authorization: `Bearer ${RESEND_API_KEY}`, "Content-Type": "application/json" }, timeout: 15000, validateStatus: () => true }
   );
   if (res.status >= 200 && res.status < 300) {
