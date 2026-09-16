@@ -11,6 +11,11 @@
  *
  * Events handled:
  *   checkout.session.completed   -> referral_subscriptions row (attribution)
+ *                                   + "payment received" email to the buyer
+ *   payment_intent.payment_failed
+ *   invoice.payment_failed
+ *   checkout.session.async_payment_failed
+ *                                -> "payment failed" email to the buyer
  *   customer.subscription.*      -> keep status / period in sync
  *   invoice.paid                 -> commission_entries (the ledger)
  *   charge.refunded              -> reverse ledger entries for that invoice
@@ -29,6 +34,7 @@ const ledger = require("../../services/commissionLedger");
 const connect = require("../../services/stripeConnectAccounts");
 const pricing = require("../../services/pricing");
 const purchaseCodes = require("../../services/purchaseCodes");
+const paymentEmails = require("../../services/paymentEmails");
 const { resolvePartnerCode } = require("../../utils/partnerCodeResolver");
 
 function toMysqlDateTime(unixSeconds) {
@@ -179,13 +185,83 @@ async function onCheckoutSessionCompleted(stripe, session) {
 
   // Purchase code for the app (skipped when the buyer is already a linked app
   // user — they bought in-app or by email match, nothing to redeem).
+  let purchaseCodeSent = false;
   if (!profileId) {
     const pc = await purchaseCodes.ensurePurchaseCode({ stripeSubscriptionId: subscription.id });
     if (pc?.created) {
       const mail = await purchaseCodes.sendPurchaseCodeEmail({ stripeSubscriptionId: subscription.id });
+      purchaseCodeSent = !!mail.ok;
       if (!mail.ok) console.warn("PURCHASE_CODE_EMAIL_NOT_SENT:", { subscription: subscription.id, reason: mail.reason });
     }
   }
+
+  // Payment confirmation to the buyer (once per session).
+  const receipt = await paymentEmails.sendPaymentReceipt({ session, subscription, partnerCode: md.attributed_partner_code || null, purchaseCodeSent });
+  if (!receipt.ok) console.warn("PAYMENT_RECEIPT_EMAIL_NOT_SENT:", { session: session.id, reason: receipt.reason });
+}
+
+/**
+ * Card declined on the order page (initial Checkout attempt). Renewal declines
+ * come through invoice.payment_failed and are skipped here so the member is
+ * not told twice.
+ */
+async function onPaymentIntentFailed(stripe, pi) {
+  let invoice = null;
+  if (pi.invoice) {
+    invoice = await stripe.invoices.retrieve(String(pi.invoice));
+    if (!paymentEmails.invoiceIsOurs(invoice)) return;
+    if (invoice.billing_reason && invoice.billing_reason !== "subscription_create") return;
+  } else if (pi.metadata?.plan_code !== PLAN_CODE) {
+    // Not from this programme's checkout (in-app purchases share the account).
+    console.warn("PAYMENT_FAILED_EMAIL_SKIPPED:", { payment_intent: pi.id, reason: "no invoice / plan metadata" });
+    return;
+  }
+  const err = pi.last_payment_error || {};
+  let to = pi.receipt_email || err.payment_method?.billing_details?.email || invoice?.customer_email || null;
+  if (!to && pi.customer) {
+    const customer = await stripe.customers.retrieve(String(pi.customer));
+    to = customer?.email || null;
+  }
+  const md = invoice?.parent?.subscription_details?.metadata || invoice?.subscription_details?.metadata || pi.metadata || {};
+  const mail = await paymentEmails.sendPaymentFailed({
+    to,
+    reason: err.message,
+    amountMinor: pi.amount,
+    currency: pi.currency,
+    retryUrl: paymentEmails.retryUrlFor(md.link_partner_code || md.attributed_partner_code || null),
+    objectId: pi.id,
+  });
+  if (!mail.ok) console.warn("PAYMENT_FAILED_EMAIL_NOT_SENT:", { payment_intent: pi.id, reason: mail.reason });
+}
+
+/** Renewal payment failed (Stripe keeps retrying per the dunning settings). */
+async function onInvoicePaymentFailed(invoice) {
+  if (!paymentEmails.invoiceIsOurs(invoice)) return;
+  if (invoice.billing_reason === "subscription_create") return; // handled by onPaymentIntentFailed
+  const mail = await paymentEmails.sendPaymentFailed({
+    to: invoice.customer_email,
+    reason: null,
+    amountMinor: invoice.amount_due,
+    currency: invoice.currency,
+    objectId: invoice.id,
+    renewal: true,
+  });
+  if (!mail.ok) console.warn("PAYMENT_FAILED_EMAIL_NOT_SENT:", { invoice: invoice.id, reason: mail.reason });
+}
+
+/** Delayed payment method (e.g. bank debit) failed after Checkout completed. */
+async function onAsyncPaymentFailed(session) {
+  const md = session.metadata || {};
+  if (md.plan_code && md.plan_code !== PLAN_CODE) return;
+  const mail = await paymentEmails.sendPaymentFailed({
+    to: session.customer_details?.email || session.customer_email,
+    reason: null,
+    amountMinor: session.amount_total,
+    currency: session.currency,
+    retryUrl: paymentEmails.retryUrlFor(md.link_partner_code || md.attributed_partner_code || null),
+    objectId: session.id,
+  });
+  if (!mail.ok) console.warn("PAYMENT_FAILED_EMAIL_NOT_SENT:", { session: session.id, reason: mail.reason });
 }
 
 /** promo_… id on a subscription's discount, if any (current and legacy shapes). */
@@ -330,6 +406,15 @@ const stripeWebhook = async (req, res) => {
         break;
       case "invoice.paid":
         await onInvoicePaid(obj);
+        break;
+      case "payment_intent.payment_failed":
+        await onPaymentIntentFailed(stripe, obj);
+        break;
+      case "invoice.payment_failed":
+        await onInvoicePaymentFailed(obj);
+        break;
+      case "checkout.session.async_payment_failed":
+        await onAsyncPaymentFailed(obj);
         break;
       case "charge.refunded":
         await onChargeRefunded(stripe, obj);
