@@ -31,6 +31,7 @@ const { resolvePartnerCode, normalizeCode } = require("../../../../utils/partner
 const crypto = require("crypto");
 const { generateUniqueFacilityCode, validateFacilityName } = require("./admin-invite-facility-admin");
 const { escapeHtml } = require("../../../../utils/securityValidation");
+const { reserveEmailResendSlot } = require("../../../../utils/emailResendRateGuard");
 
 const ALL_ROLES = ["super_admin", "admin", "facility_admin", "trainer"];
 const PAYEES = ["admin", "facility_admin", "trainer"];
@@ -327,7 +328,7 @@ const resendPurchaseCode = guard(async (req, res) => {
   if (!sid) return res.status(422).json({ ok: false, message: "stripe_subscription_id is required" });
   // Scope: only subscriptions attributed to the caller (or their facility's trainers).
   const [rows] = await pool.execute(
-    `SELECT rs.attributed_partner_code, rs.facility_id, rs.profile_id FROM referral_subscriptions rs WHERE rs.stripe_subscription_id = ? LIMIT 1`,
+    `SELECT rs.attributed_partner_code, rs.facility_id, rs.profile_id, rs.purchaser_email FROM referral_subscriptions rs WHERE rs.stripe_subscription_id = ? LIMIT 1`,
     [sid]
   );
   const sub = rows[0];
@@ -335,9 +336,41 @@ const resendPurchaseCode = guard(async (req, res) => {
   const inFacility = sub && String(a.actor.role) === "facility_admin" && a.actor.facility_id != null && Number(sub.facility_id) === Number(a.actor.facility_id);
   if (!sub || !(own || inFacility)) return res.status(404).json({ ok: false, message: "Subscription not found" });
   if (sub.profile_id) return res.status(409).json({ ok: false, message: "This member is already linked" });
+  if (!sub.purchaser_email) return res.status(409).json({ ok: false, message: "No email on file for this member" });
+
+  // Email-bombing guard, same policy as the invite resends: per recipient a
+  // cooldown and a per-hour cap, per actor a per-hour cap. The slot is
+  // reserved inside a transaction (row locks) and committed BEFORE the email
+  // goes out, so parallel clicks cannot all see a free slot.
+  const conn = await pool.getConnection();
+  let rateLimit;
+  try {
+    await conn.beginTransaction();
+    rateLimit = await reserveEmailResendSlot(conn, { targetEmail: sub.purchaser_email, actorUserId: a.actorEmail });
+    if (rateLimit.allowed) await conn.commit();
+    else await conn.rollback();
+  } catch (err) {
+    await conn.rollback().catch(() => {});
+    throw err;
+  } finally {
+    conn.release();
+  }
+  if (!rateLimit.allowed) {
+    const retryAfterSeconds = Math.max(1, Number(rateLimit.retryAfterSeconds) || 1);
+    res.setHeader("Retry-After", String(retryAfterSeconds));
+    await H.writeAuthLogSafe(req, { eventType: "purchase_code_resend_rate_limited", userId: a.actorEmail, role: String(a.actor.role), partnerCode: a.actor.partner_code || null, identifier: sid, success: false, failureReason: rateLimit.reason || "email_resend_rate_limited" });
+    return res.status(429).json({
+      ok: false,
+      message: rateLimit.reason === "recipient_cooldown" ? "Please wait before resending this code." : "Too many resend requests. Please try again later.",
+      retry_after_seconds: retryAfterSeconds,
+      rate_limit_reason: rateLimit.reason,
+    });
+  }
+
   await purchaseCodes.ensurePurchaseCode({ stripeSubscriptionId: sid });
   const r = await purchaseCodes.sendPurchaseCodeEmail({ stripeSubscriptionId: sid, force: true });
   if (!r.ok) return res.status(502).json({ ok: false, message: r.reason || "Email could not be sent" });
+  await H.writeAuthLogSafe(req, { eventType: "purchase_code_resent", userId: a.actorEmail, role: String(a.actor.role), partnerCode: a.actor.partner_code || null, identifier: sid, success: true, failureReason: null });
   return res.status(200).json({ ok: true, message: "Code re-sent" });
 });
 
