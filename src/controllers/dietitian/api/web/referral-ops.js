@@ -88,10 +88,22 @@ const orderSessionStatus = guard(async (req, res) => {
   const sid = typeof req.body?.session_id === "string" ? req.body.session_id.trim() : "";
   if (!/^cs_(test|live)_[A-Za-z0-9]+$/.test(sid)) return res.status(422).json({ ok: false, message: "Invalid session" });
   const [rows] = await pool.execute(
-    `SELECT purchaser_email, purchase_code, profile_id FROM referral_subscriptions WHERE stripe_checkout_session_id = ? LIMIT 1`,
+    `SELECT stripe_subscription_id, purchaser_email, purchase_code, purchase_code_email_sent_at, profile_id
+     FROM referral_subscriptions WHERE stripe_checkout_session_id = ? LIMIT 1`,
     [sid]
   );
   if (rows[0]) {
+    // The success page promises "we've emailed it". If the webhook's send
+    // failed (Resend down, sender rejected…) retry here; the sent_at stamp
+    // makes this a no-op once the email is out.
+    if (rows[0].purchase_code && !rows[0].profile_id && !rows[0].purchase_code_email_sent_at) {
+      try {
+        const mail = await purchaseCodes.sendPurchaseCodeEmail({ stripeSubscriptionId: rows[0].stripe_subscription_id });
+        if (!mail.ok) console.warn("PURCHASE_CODE_EMAIL_NOT_SENT:", { subscription: rows[0].stripe_subscription_id, reason: mail.reason });
+      } catch (e) {
+        console.warn("PURCHASE_CODE_EMAIL_NOT_SENT:", { subscription: rows[0].stripe_subscription_id, reason: e?.message });
+      }
+    }
     return res.status(200).json({
       ok: true,
       paid: true,

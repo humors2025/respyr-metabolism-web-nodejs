@@ -21,7 +21,10 @@ const csi = require("../controllers/dietitian/api/web/client-subscription-action
 const { escapeHtml } = require("../utils/securityValidation");
 
 const RESEND_API_KEY = process.env.RESEND_API_KEY || "";
-const RESEND_FROM_EMAIL = process.env.RESEND_FROM_EMAIL || "Rysflo <no-reply@rysflo.com>";
+// Same fallback sender as the rest of the backend: the domain has to be
+// verified in Resend, and rysflo.com is not (Resend answers 403 and the
+// code never reaches the member).
+const RESEND_FROM_EMAIL = process.env.RESEND_FROM_EMAIL || "Rysflo <no-reply@respyr.ai>";
 const SKIP_OUTBOUND_EMAIL =
   process.env.NODE_ENV !== "production" && String(process.env.SKIP_OUTBOUND_EMAIL || "").toLowerCase() === "true";
 const CODE_EXPIRY_DAYS = Math.max(1, parseInt(process.env.PURCHASE_CODE_EXPIRY_DAYS, 10) || 30);
@@ -87,7 +90,11 @@ async function ensurePurchaseCode({ stripeSubscriptionId }) {
   }
 }
 
-/** Plain HTML email with the purchase code. Returns { ok, skipped? }. */
+/**
+ * Plain HTML email with the purchase code. Returns { ok, skipped? }.
+ * Idempotent: a second call is a no-op once purchase_code_email_sent_at is
+ * stamped, so callers may retry freely (webhook, success-page poll, resend).
+ */
 async function sendPurchaseCodeEmail({ stripeSubscriptionId, force = false }) {
   const [subs] = await pool.execute(
     `SELECT purchaser_email, purchase_code, purchase_code_email_sent_at, attributed_partner_code
@@ -101,12 +108,12 @@ async function sendPurchaseCodeEmail({ stripeSubscriptionId, force = false }) {
   const code = escapeHtml(sub.purchase_code);
   const html = `
     <div style="font-family:Poppins,Arial,sans-serif;max-width:560px;margin:0 auto;color:#252525">
-      <h2 style="margin:0 0 8px">You're in. Here's your Rysflo code.</h2>
+      <h2 style="margin:0 0 8px">You're in. Here's your Rysflo Referral Code.</h2>
       <p style="color:#535359">Your membership is active and your device is on its way. One last step links your purchase to the app:</p>
       <ol style="color:#535359;line-height:1.6">
         <li>Download Rysflo — <a href="${APP_STORE_URL}">iPhone</a> · <a href="${PLAY_STORE_URL}">Android</a></li>
         <li>Create your account with <strong>this email address</strong></li>
-        <li>When asked for a code, enter:</li>
+        <li>When asked for a referral code, enter:</li>
       </ol>
       <div style="font-size:32px;font-weight:700;letter-spacing:3px;background:#EEF4FE;color:#1F4E8C;padding:16px;text-align:center;border-radius:10px;font-family:monospace">${code}</div>
       <p style="color:#535359;margin-top:16px">Every day you take a reading, 20¢ comes off next month's bill — up to $6.</p>
@@ -121,14 +128,17 @@ async function sendPurchaseCodeEmail({ stripeSubscriptionId, force = false }) {
 
   const res = await axios.post(
     "https://api.resend.com/emails",
-    { from: RESEND_FROM_EMAIL, to: [sub.purchaser_email], subject: `Your Rysflo code: ${sub.purchase_code}`, html },
+    { from: RESEND_FROM_EMAIL, to: [sub.purchaser_email], subject: `Your Rysflo Referral Code: ${sub.purchase_code}`, html },
     { headers: { Authorization: `Bearer ${RESEND_API_KEY}`, "Content-Type": "application/json" }, timeout: 15000, validateStatus: () => true }
   );
   if (res.status >= 200 && res.status < 300) {
     await pool.execute(`UPDATE referral_subscriptions SET purchase_code_email_sent_at = UTC_TIMESTAMP() WHERE stripe_subscription_id = ?`, [stripeSubscriptionId]);
     return { ok: true };
   }
-  return { ok: false, reason: `resend ${res.status}` };
+  // Resend explains rejections in the body (unverified domain, bad key…);
+  // surface that so the webhook warning is actionable.
+  const detail = res.data?.message || res.data?.name || "";
+  return { ok: false, reason: `resend ${res.status}${detail ? `: ${detail}` : ""}` };
 }
 
 /**
