@@ -559,6 +559,58 @@ const qrSetup = guard(async (req, res) => {
   return res.status(201).json(out);
 });
 
+/**
+ * Undo a field setup while the invite is still pending: the invite is revoked
+ * and the sticker goes back to "not set up" in the same TA's hands, so it
+ * can be set up again. Once the invitee has accepted there is a real account
+ * behind the code and the sticker stays live (409).
+ *
+ * body: { qr_id }
+ */
+const qrRevoke = guard(async (req, res) => {
+  const a = await actor(req, res, ["super_admin", "admin"]);
+  if (!a) return;
+  const id = qr.normalizeId(req.body?.qr_id);
+  if (!id) return res.status(422).json({ ok: false, message: "qr_id is required" });
+
+  const sticker = await qr.get(id);
+  if (!sticker) return res.status(404).json({ ok: false, message: "Unknown sticker" });
+  const isSuper = String(a.actor.role) === "super_admin";
+  if (!isSuper && String(sticker.assigned_to_user_id || "").toLowerCase() !== a.actorEmail) {
+    return res.status(403).json({ ok: false, message: "This sticker is not assigned to you" });
+  }
+  if (sticker.status !== "assigned" || !sticker.partner_code || !sticker.invitation_id) {
+    return res.status(409).json({ ok: false, message: "This sticker is not set up — nothing to revoke" });
+  }
+  if (sticker.target_status !== "pending") {
+    return res.status(409).json({ ok: false, message: `${sticker.target_label || sticker.partner_code} has already accepted the invite — the sticker is live` });
+  }
+
+  // Guarded against a concurrent accept: if the invite is no longer pending the accept wins.
+  const [rev] = await pool.execute(
+    `UPDATE app_user_invitations SET status = 'revoked', updated_at = UTC_TIMESTAMP() WHERE id = ? AND status = 'pending' LIMIT 1`,
+    [sticker.invitation_id]
+  );
+  if (!rev.affectedRows) {
+    return res.status(409).json({ ok: false, message: "Invite is no longer pending — refresh and try again" });
+  }
+
+  await pool.execute(
+    `INSERT INTO qr_code_links (qr_id, from_partner_code, to_partner_code, actor_user_id) VALUES (?, ?, NULL, ?)`,
+    [id, sticker.partner_code, a.actorEmail]
+  );
+  await pool.execute(
+    `UPDATE qr_codes
+     SET status = 'unassigned', partner_code = NULL, target_type = NULL, target_label = NULL, invitation_id = NULL, target_status = NULL,
+         facility_id = NULL, linked_user_id = NULL, linked_by = ?, linked_at = UTC_TIMESTAMP()
+     WHERE id = ? AND invitation_id = ?`,
+    [a.actorEmail, id, sticker.invitation_id]
+  );
+
+  await H.writeAuthLogSafe(req, { eventType: "qr_revoked", userId: a.actorEmail, role: String(a.actor.role), partnerCode: null, identifier: id, success: true, failureReason: `${sticker.partner_code} invite ${sticker.invitation_id} revoked` });
+  return res.status(200).json({ ok: true, qr: await qr.get(id), partner_code: sticker.partner_code, invitation_id: sticker.invitation_id });
+});
+
 // ── Pricing ──────────────────────────────────────────────────────────────────
 
 const getPricing = guard(async (req, res) => {
@@ -587,4 +639,4 @@ const setPricingEndpoint = guard(async (req, res) => {
   return res.status(200).json({ ok: true, current: { currency: row.currency, list_price_minor: Number(row.list_price_minor), referred_price_minor: Number(row.referred_price_minor) } });
 });
 
-module.exports = { orderPageContext, orderSessionStatus, referredMembers, resendPurchaseCode, qrGenerate, qrLink, qrList, qrAssign, qrSetup, listTrainerAdmins, getPricing, setPricingEndpoint };
+module.exports = { orderPageContext, orderSessionStatus, referredMembers, resendPurchaseCode, qrGenerate, qrLink, qrList, qrAssign, qrSetup, qrRevoke, listTrainerAdmins, getPricing, setPricingEndpoint };
