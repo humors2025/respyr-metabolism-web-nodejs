@@ -54,11 +54,11 @@ const listFacilities = async (req, res) => {
 
     const [pending] = await pool.execute(
       `
-        SELECT i.id, i.invited_email, i.invited_first_name, i.invited_last_name, i.facility_name, i.partner_code,
+        SELECT i.id, i.invited_email, i.invited_first_name, i.invited_last_name, i.invited_role, i.facility_name, i.partner_code,
                i.invited_by_user_id, i.parent_user_id, i.status, i.expires_at, i.sent_at, i.created_at,
                (SELECT q.id FROM qr_codes q WHERE q.invitation_id = i.id AND q.status = 'assigned' LIMIT 1) AS qr_id
         FROM app_user_invitations i
-        WHERE i.invited_role = 'facility_admin' AND i.status = 'pending'
+        WHERE i.invited_role IN ('facility_admin', 'trainer') AND i.status = 'pending'
           ${isSuper ? "" : "AND LOWER(i.parent_user_id) = ?"}
         ORDER BY i.created_at DESC
       `,
@@ -87,6 +87,7 @@ const listFacilities = async (req, res) => {
         id: Number(p.id),
         invited_email: String(p.invited_email).toLowerCase(),
         invited_name: `${p.invited_first_name || ""} ${p.invited_last_name || ""}`.trim(),
+        invited_role: p.invited_role, // facility_admin (business owner) | trainer (personal trainer)
         facility_name: p.facility_name,
         partner_code: p.partner_code,
         qr_id: p.qr_id || null,
