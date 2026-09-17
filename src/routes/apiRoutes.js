@@ -1074,6 +1074,7 @@ router.post("/dietitian/api/web/qr-list", authMiddleware, referralOps.qrList);
 router.post("/dietitian/api/web/qr-assign", authMiddleware, referralOps.qrAssign);
 router.post("/dietitian/api/web/qr-setup", authMiddleware, referralOps.qrSetup);
 router.post("/dietitian/api/web/qr-revoke", authMiddleware, referralOps.qrRevoke);
+router.post("/dietitian/api/web/invite-revoke", authMiddleware, referralOps.inviteRevoke);
 router.post("/dietitian/api/web/list-trainer-admins", authMiddleware, referralOps.listTrainerAdmins);
 router.post("/dietitian/api/web/get-pricing", authMiddleware, referralOps.getPricing);
 router.post("/dietitian/api/web/set-pricing", authMiddleware, referralOps.setPricingEndpoint);

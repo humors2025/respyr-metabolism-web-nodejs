@@ -54,12 +54,13 @@ const listFacilities = async (req, res) => {
 
     const [pending] = await pool.execute(
       `
-        SELECT id, invited_email, invited_first_name, invited_last_name, facility_name, partner_code,
-               invited_by_user_id, parent_user_id, status, expires_at, sent_at, created_at
-        FROM app_user_invitations
-        WHERE invited_role = 'facility_admin' AND status = 'pending'
-          ${isSuper ? "" : "AND LOWER(parent_user_id) = ?"}
-        ORDER BY created_at DESC
+        SELECT i.id, i.invited_email, i.invited_first_name, i.invited_last_name, i.facility_name, i.partner_code,
+               i.invited_by_user_id, i.parent_user_id, i.status, i.expires_at, i.sent_at, i.created_at,
+               (SELECT q.id FROM qr_codes q WHERE q.invitation_id = i.id AND q.status = 'assigned' LIMIT 1) AS qr_id
+        FROM app_user_invitations i
+        WHERE i.invited_role = 'facility_admin' AND i.status = 'pending'
+          ${isSuper ? "" : "AND LOWER(i.parent_user_id) = ?"}
+        ORDER BY i.created_at DESC
       `,
       params
     );
@@ -88,6 +89,7 @@ const listFacilities = async (req, res) => {
         invited_name: `${p.invited_first_name || ""} ${p.invited_last_name || ""}`.trim(),
         facility_name: p.facility_name,
         partner_code: p.partner_code,
+        qr_id: p.qr_id || null,
         invited_by_user_id: String(p.invited_by_user_id).toLowerCase(),
         status: p.status,
         expires_at: toMysqlDateTime(p.expires_at),

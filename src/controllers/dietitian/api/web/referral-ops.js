@@ -620,28 +620,76 @@ const qrRevoke = guard(async (req, res) => {
   }
 
   // Guarded against a concurrent accept: if the invite is no longer pending the accept wins.
-  const [rev] = await pool.execute(
-    `UPDATE app_user_invitations SET status = 'revoked', updated_at = UTC_TIMESTAMP() WHERE id = ? AND status = 'pending' LIMIT 1`,
-    [sticker.invitation_id]
-  );
-  if (!rev.affectedRows) {
+  if (!(await revokePendingInvitation(sticker.invitation_id))) {
     return res.status(409).json({ ok: false, message: "Invite is no longer pending — refresh and try again" });
   }
+  await releaseSticker(sticker, a.actorEmail);
 
+  await H.writeAuthLogSafe(req, { eventType: "qr_revoked", userId: a.actorEmail, role: String(a.actor.role), partnerCode: null, identifier: id, success: true, failureReason: `${sticker.partner_code} invite ${sticker.invitation_id} revoked` });
+  return res.status(200).json({ ok: true, qr: await qr.get(id), partner_code: sticker.partner_code, invitation_id: sticker.invitation_id });
+});
+
+/** status pending → revoked; false when a concurrent accept got there first. */
+async function revokePendingInvitation(invitationId) {
+  const [rev] = await pool.execute(
+    `UPDATE app_user_invitations SET status = 'revoked', updated_at = UTC_TIMESTAMP() WHERE id = ? AND status = 'pending' LIMIT 1`,
+    [invitationId]
+  );
+  return rev.affectedRows > 0;
+}
+
+/** Put a sticker back to "not set up" in the same TA's hands, recording the unlink. */
+async function releaseSticker(sticker, actorEmail) {
   await pool.execute(
     `INSERT INTO qr_code_links (qr_id, from_partner_code, to_partner_code, actor_user_id) VALUES (?, ?, NULL, ?)`,
-    [id, sticker.partner_code, a.actorEmail]
+    [sticker.id, sticker.partner_code, actorEmail]
   );
   await pool.execute(
     `UPDATE qr_codes
      SET status = 'unassigned', partner_code = NULL, target_type = NULL, target_label = NULL, invitation_id = NULL, target_status = NULL,
          facility_id = NULL, linked_user_id = NULL, linked_by = ?, linked_at = UTC_TIMESTAMP()
      WHERE id = ? AND invitation_id = ?`,
-    [a.actorEmail, id, sticker.invitation_id]
+    [actorEmail, sticker.id, sticker.invitation_id]
   );
+}
 
-  await H.writeAuthLogSafe(req, { eventType: "qr_revoked", userId: a.actorEmail, role: String(a.actor.role), partnerCode: null, identifier: id, success: true, failureReason: `${sticker.partner_code} invite ${sticker.invitation_id} revoked` });
-  return res.status(200).json({ ok: true, qr: await qr.get(id), partner_code: sticker.partner_code, invitation_id: sticker.invitation_id });
+/**
+ * Revoke a pending owner / trainer invite from the Facilities page — the
+ * invite-first counterpart of qrRevoke. Works whether or not a sticker was
+ * bound at invite time; a bound sticker is released back to "not set up".
+ * Trainer admins may revoke invites parented to them; super admin any.
+ *
+ * body: { invite_id }
+ */
+const inviteRevoke = guard(async (req, res) => {
+  const a = await actor(req, res, ["super_admin", "admin"]);
+  if (!a) return;
+  const inviteId = Number.parseInt(req.body?.invite_id, 10);
+  if (!Number.isInteger(inviteId) || inviteId <= 0) return res.status(422).json({ ok: false, message: "invite_id is required" });
+
+  const [[inv]] = await pool.execute(
+    `SELECT id, invited_email, invited_role, partner_code, status, parent_user_id, invited_by_user_id
+     FROM app_user_invitations WHERE id = ? LIMIT 1`,
+    [inviteId]
+  );
+  if (!inv || !["facility_admin", "trainer"].includes(String(inv.invited_role))) {
+    return res.status(404).json({ ok: false, message: "Unknown invite" });
+  }
+  const isSuper = String(a.actor.role) === "super_admin";
+  const mine = [inv.parent_user_id, inv.invited_by_user_id].some((u) => String(u || "").toLowerCase() === a.actorEmail);
+  if (!isSuper && !mine) return res.status(403).json({ ok: false, message: "This invite is not yours to revoke" });
+  if (inv.status !== "pending") {
+    return res.status(409).json({ ok: false, message: inv.status === "accepted" ? `${inv.invited_email} has already accepted the invite` : "Invite is already revoked" });
+  }
+
+  if (!(await revokePendingInvitation(inviteId))) {
+    return res.status(409).json({ ok: false, message: "Invite is no longer pending — refresh and try again" });
+  }
+  const [stickers] = await pool.execute(`SELECT * FROM qr_codes WHERE invitation_id = ? AND status = 'assigned'`, [inviteId]);
+  for (const s of stickers) await releaseSticker(s, a.actorEmail);
+
+  await H.writeAuthLogSafe(req, { eventType: "invite_revoked", userId: a.actorEmail, role: String(a.actor.role), partnerCode: null, identifier: String(inviteId), success: true, failureReason: `${inv.partner_code || inv.invited_email} invite revoked; stickers released: ${stickers.map((s) => s.id).join(",") || "none"}` });
+  return res.status(200).json({ ok: true, invitation_id: inviteId, partner_code: inv.partner_code, released_qr_ids: stickers.map((s) => s.id) });
 });
 
 // ── Pricing ──────────────────────────────────────────────────────────────────
@@ -672,4 +720,4 @@ const setPricingEndpoint = guard(async (req, res) => {
   return res.status(200).json({ ok: true, current: { currency: row.currency, list_price_minor: Number(row.list_price_minor), referred_price_minor: Number(row.referred_price_minor) } });
 });
 
-module.exports = { orderPageContext, orderSessionStatus, referredMembers, resendPurchaseCode, qrGenerate, qrLink, qrList, qrAssign, qrSetup, qrRevoke, listTrainerAdmins, getPricing, setPricingEndpoint };
+module.exports = { orderPageContext, orderSessionStatus, referredMembers, resendPurchaseCode, qrGenerate, qrLink, qrList, qrAssign, qrSetup, qrRevoke, inviteRevoke, listTrainerAdmins, getPricing, setPricingEndpoint };
