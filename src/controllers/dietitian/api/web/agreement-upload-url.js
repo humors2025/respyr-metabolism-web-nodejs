@@ -14,7 +14,11 @@ const {
   secureHash,
 } = require("./auth_common");
 
-const { s3, AGREEMENT_S3_BUCKET } = require("../../../../config/s3");
+const {
+  s3,
+  AGREEMENT_S3_BUCKET,
+  AGREEMENT_STORAGE_SKIPPED,
+} = require("../../../../config/s3");
 
 const MAX_BYTES =
   parseInt(process.env.AGREEMENT_UPLOAD_MAX_BYTES || "10485760", 10);
@@ -24,7 +28,7 @@ const agreementUploadUrl = async (req, res) => {
 
   if (ensurePostOrReject(req, res)) return;
 
-  if (!AGREEMENT_S3_BUCKET) {
+  if (!AGREEMENT_S3_BUCKET && !AGREEMENT_STORAGE_SKIPPED) {
     return sendJson(res, 500, {
       ok: false,
       message: "Agreement S3 bucket is not configured",
@@ -107,6 +111,21 @@ const agreementUploadUrl = async (req, res) => {
     }
 
     const key = `agreements/pending/${invite.id}/${crypto.randomUUID()}.pdf`;
+
+    // UAT ONLY (see config/s3.js): no upload link is issued. The key is still
+    // returned so the frontend can complete accept-invite with the same shape.
+    if (AGREEMENT_STORAGE_SKIPPED) {
+      return sendJson(res, 200, {
+        ok: true,
+        message: "Agreement upload skipped (UAT: storage disabled)",
+        data: {
+          upload_url: null,
+          key,
+          expires_in_seconds: 0,
+          storage_skipped: true,
+        },
+      });
+    }
 
     const command = new PutObjectCommand({
       Bucket: AGREEMENT_S3_BUCKET,

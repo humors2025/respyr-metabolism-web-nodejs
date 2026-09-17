@@ -45,14 +45,14 @@ const pool = require("../../../../config/db");
 const { GetObjectCommand } = require("@aws-sdk/client-s3");
 const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
 
-const { s3, AGREEMENT_S3_BUCKET } = require("../../../../config/s3");
+const { s3, AGREEMENT_S3_BUCKET, AGREEMENT_SKIPPED_BUCKET } = require("../../../../config/s3");
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
 const SECURITY_PEPPER =
   process.env.SECURITY_PEPPER || process.env.JWT_SECRET || "";
 
-const VALID_ACTOR_ROLES = new Set(["super_admin", "admin", "trainer"]);
+const VALID_ACTOR_ROLES = new Set(["super_admin", "admin", "facility_admin", "trainer"]);
 
 const DOWNLOAD_URL_EXPIRES_SECONDS = 600;
 
@@ -298,6 +298,8 @@ async function getAcceptedAgreements(scopeParentEmail) {
  */
 async function buildDownloadUrl(bucket, key) {
   if (!bucket || !key) return null;
+  // UAT ONLY: rows recorded while storage was skipped have no file to link to.
+  if (bucket === AGREEMENT_SKIPPED_BUCKET) return null;
 
   try {
     const command = new GetObjectCommand({
@@ -375,6 +377,11 @@ const listAcceptedAgreements = async (req, res) => {
       scopeParentEmail = null;            // no filter — sees everything
     } else if (actorRole === "admin") {
       scopeParentEmail = actorEmail;      // only their own network
+    } else if (actorRole === "facility_admin") {
+      // A facility admin issues the invites for their own trainers, so those
+      // rows carry parent_user_id = the facility admin. Same filter as admin;
+      // it cannot reach another facility's invites.
+      scopeParentEmail = actorEmail;
     } else {
       // trainer (or anything else) may not view the agreements report
       writeAuthLogSafe(req, {

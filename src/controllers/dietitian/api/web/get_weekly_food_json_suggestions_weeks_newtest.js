@@ -3,7 +3,10 @@
  *
  * Cloned from: get_weekly_food_json_suggestions_weeks.js — identical logic, but the
  * business table is weekly_food_json_suggestions_newtest instead of
- * weekly_food_json_suggestions. Keep the two files in sync.
+ * weekly_food_json_suggestions. Keep the two files in sync — with ONE
+ * intended difference: this file also returns `original_food_json` (the
+ * generator's untouched plan that "Reset week" restores). That column exists
+ * only on the _newtest table, so the original file must NOT get this change.
  */
 
 const pool = require("../../../../config/db");
@@ -344,6 +347,7 @@ const get_weekly_food_json_suggestions_weeks_newtest = async (req, res) => {
           source_api_date,
           status,
           food_json,
+          original_food_json,
           created_at,
           updated_at
         FROM weekly_food_json_suggestions_newtest
@@ -396,6 +400,23 @@ const get_weekly_food_json_suggestions_weeks_newtest = async (req, res) => {
       });
     }
 
+    // original_food_json is the generator's untouched copy of the plan — the
+    // one "Reset week" restores. Parsed leniently on purpose: rows stored before
+    // the column was populated (2026-09-09) hold NULL, and a missing or
+    // unreadable backup must never break the editor, so it comes back as null
+    // instead of failing the request like food_json does above.
+    const parsedOriginalFoodJson = parseJsonColumn(row.original_food_json);
+
+    if (!parsedOriginalFoodJson.ok && !parsedOriginalFoodJson.empty) {
+      console.warn("Invalid weekly original_food_json (returned as null):", {
+        profile_id: access.profileId,
+        dietitian_id: access.dieticianId,
+        week_start_date: weekStartDate,
+        week_end_date: weekEndDate,
+        error: parsedOriginalFoodJson.error,
+      });
+    }
+
     const rowWeekStartDate = formatDateOnly(row.week_start_date);
     const rowWeekEndDate = formatDateOnly(row.week_end_date);
 
@@ -416,6 +437,9 @@ const get_weekly_food_json_suggestions_weeks_newtest = async (req, res) => {
         source_api_date: formatDateOnly(row.source_api_date),
         status_value: Number(row.status),
         food_json: parsedFoodJson.data,
+        // null when the row predates the column or the stored backup is unreadable
+        original_food_json: parsedOriginalFoodJson.ok ? parsedOriginalFoodJson.data : null,
+        has_original_food_json: parsedOriginalFoodJson.ok,
         created_at: formatDateTime(row.created_at),
         updated_at: formatDateTime(row.updated_at),
       },

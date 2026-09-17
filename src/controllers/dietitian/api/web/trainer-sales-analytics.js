@@ -63,7 +63,7 @@ const SECURITY_PEPPER =
 
 const APP_DEBUG = process.env.NODE_ENV !== "production";
 
-const VALID_ACTOR_ROLES = new Set(["super_admin", "admin", "trainer"]);
+const VALID_ACTOR_ROLES = new Set(["super_admin", "admin", "facility_admin", "trainer"]);
 
 const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
 
@@ -389,6 +389,27 @@ async function getAllowedCodes(actor, actorEmail) {
           AND LOWER(aur.parent_user_id) = LOWER(?)
       `,
       [actorEmail]
+    );
+    for (const row of rows) addCode(codes, row.code);
+    return [...codes];
+  }
+
+  // A facility admin owns one facility: scope by facility_id so they can only
+  // reach analytics for trainers stamped with their own facility.
+  if (role === "facility_admin") {
+    if (actor.facility_id == null) return [...codes];
+
+    const [rows] = await pool.execute(
+      `
+        SELECT COALESCE(NULLIF(aur.partner_code, ''), NULLIF(td.dietician_id, '')) AS code
+        FROM app_user_roles aur
+        LEFT JOIN table_dietician td
+          ON LOWER(td.email) = LOWER(aur.user_id)
+        WHERE aur.role = 'trainer'
+          AND aur.status = 'active'
+          AND aur.facility_id = ?
+      `,
+      [Number(actor.facility_id)]
     );
     for (const row of rows) addCode(codes, row.code);
     return [...codes];

@@ -1,0 +1,231 @@
+"use strict";
+
+/**
+ * POST /dietitian/api/web/set-trainer-commission-split
+ *
+ * The facility admin decides what share (0–100 %) of the facility's referral
+ * commission each of their trainers receives. No default is imposed — it is
+ * entirely the owner's call (product decision, 11 Sep 2026).
+ *
+ * The value is a *future* rule: the commission ledger snapshots the split in
+ * force when an invoice is paid, so changing it never rewrites history.
+ *
+ * Body:
+ *  {
+ *    "trainer_user_id": "<trainer email>",
+ *    "split_pct":       50          // number, 0..100, at most 2 decimals
+ *  }
+ *
+ * Scope (BOLA guard): a facility_admin may only touch trainers whose
+ * parent_user_id is themselves AND whose facility_id matches their own.
+ * super_admin may set any trainer's split (support / correction path) and the
+ * change is audited either way.
+ */
+
+const pool = require("../../../../config/db");
+const ledger = require("../../../../services/commissionLedger");
+const {
+  _helpers: H,
+} = require("./admin-invite-trainer");
+
+const ALLOWED_ROLES = ["facility_admin", "super_admin"];
+
+function parseSplitPct(raw) {
+  if (typeof raw === "string" && raw.trim() !== "") {
+    raw = Number(raw);
+  }
+
+  if (typeof raw !== "number" || !Number.isFinite(raw)) {
+    return { ok: false, message: "split_pct must be a number" };
+  }
+
+  if (raw < 0 || raw > 100) {
+    return { ok: false, message: "split_pct must be between 0 and 100" };
+  }
+
+  // Reject more than two decimals rather than silently rounding money rules.
+  if (Math.round(raw * 100) !== raw * 100) {
+    return { ok: false, message: "split_pct may have at most 2 decimal places" };
+  }
+
+  return { ok: true, value: raw };
+}
+
+const setTrainerCommissionSplit = async (req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  res.setHeader("Pragma", "no-cache");
+
+  if (req.method !== "POST") {
+    return res.status(405).json({ ok: false, message: "Method not allowed" });
+  }
+
+  let actorEmail = null;
+  let actorRole = null;
+
+  try {
+    const resolved = await H.resolveActorFromToken(req, ALLOWED_ROLES);
+
+    if (resolved.error) {
+      return res.status(resolved.error.status).json(resolved.error.body);
+    }
+
+    const { actor } = resolved;
+    actorEmail = resolved.actorEmail;
+    actorRole = String(actor.role);
+
+    const trainerUserId = H.normalizeEmail(req.body?.trainer_user_id);
+
+    if (trainerUserId === "" || trainerUserId.length > 150) {
+      return res.status(422).json({ ok: false, message: "trainer_user_id is required" });
+    }
+
+    const split = parseSplitPct(req.body?.split_pct);
+
+    if (!split.ok) {
+      return res.status(422).json({ ok: false, message: split.message });
+    }
+
+    const conn = await pool.getConnection();
+
+    try {
+      await conn.beginTransaction();
+
+      // Lock the trainer row so two concurrent edits cannot interleave.
+      const [rows] = await conn.execute(
+        `
+          SELECT
+            id,
+            user_id,
+            role,
+            status,
+            parent_user_id,
+            facility_id
+          FROM app_user_roles
+          WHERE LOWER(user_id) = LOWER(?)
+          LIMIT 1
+          FOR UPDATE
+        `,
+        [trainerUserId]
+      );
+
+      const trainer = rows[0];
+
+      // Out-of-scope and not-found are deliberately indistinguishable so a
+      // facility admin cannot probe which emails exist elsewhere.
+      const inScope =
+        trainer &&
+        String(trainer.role) === "trainer" &&
+        (actorRole === "super_admin" ||
+          (String(trainer.parent_user_id || "").toLowerCase() === actorEmail &&
+            actor.facility_id != null &&
+            trainer.facility_id != null &&
+            Number(trainer.facility_id) === Number(actor.facility_id)));
+
+      if (!inScope) {
+        await conn.rollback();
+        return res.status(404).json({ ok: false, message: "Trainer not found" });
+      }
+
+      if (String(trainer.status) !== "active") {
+        await conn.rollback();
+        return res.status(409).json({
+          ok: false,
+          message: "Commission split can only be set for an active trainer",
+        });
+      }
+
+      // Current split lives in trainer_commission_splits; a trainer who has
+      // never had one set simply has no row yet, which reads as 0.
+      const [prevRows] = await conn.execute(
+        `
+          SELECT commission_split_pct
+          FROM trainer_commission_splits
+          WHERE LOWER(user_id) = LOWER(?)
+          LIMIT 1
+          FOR UPDATE
+        `,
+        [trainer.user_id]
+      );
+      const previous = Number(prevRows[0]?.commission_split_pct || 0);
+
+      await conn.execute(
+        `
+          INSERT INTO trainer_commission_splits
+            (user_id, facility_id, commission_split_pct, updated_at, updated_by)
+          VALUES (?, ?, ?, UTC_TIMESTAMP(), ?)
+          ON DUPLICATE KEY UPDATE
+            facility_id          = VALUES(facility_id),
+            commission_split_pct = VALUES(commission_split_pct),
+            updated_at           = UTC_TIMESTAMP(),
+            updated_by           = VALUES(updated_by)
+        `,
+        [
+          trainer.user_id,
+          trainer.facility_id ?? null,
+          split.value.toFixed(2),
+          actorEmail,
+        ]
+      );
+
+      await conn.commit();
+
+      // The new split applies to every commission not yet paid out, so the
+      // change shows on both dashboards immediately (paid/scheduled untouched).
+      let reallocated = { rebuilt: 0, skipped: 0 };
+      try {
+        reallocated = await ledger.reallocateUnpaidForTrainer(trainerUserId);
+      } catch (err) {
+        console.error("COMMISSION_SPLIT_REALLOCATE_ERROR:", { trainer: trainerUserId, message: err?.message });
+      }
+
+      await H.writeAuthLogSafe(req, {
+        eventType: "trainer_commission_split_set",
+        userId: actorEmail,
+        role: actorRole,
+        partnerCode: actor.partner_code ?? null,
+        identifier: trainerUserId,
+        success: true,
+        failureReason: `split ${previous} -> ${split.value} for ${trainerUserId}`,
+      });
+
+      return res.status(200).json({
+        ok: true,
+        message: "Commission split updated",
+        data: {
+          trainer_user_id: trainerUserId,
+          facility_id: trainer.facility_id == null ? null : Number(trainer.facility_id),
+          previous_split_pct: previous,
+          split_pct: split.value,
+          updated_by: actorEmail,
+          reallocated_invoices: reallocated.rebuilt,
+        },
+      });
+    } catch (err) {
+      await conn.rollback();
+      throw err;
+    } finally {
+      conn.release();
+    }
+  } catch (err) {
+    console.error("SET_TRAINER_COMMISSION_SPLIT_ERROR:", {
+      code: err?.code,
+      errno: err?.errno,
+      sqlState: err?.sqlState,
+      message: err?.message,
+    });
+
+    await H.writeAuthLogSafe(req, {
+      eventType: "trainer_commission_split_error",
+      userId: actorEmail,
+      role: actorRole,
+      partnerCode: null,
+      identifier: actorEmail,
+      success: false,
+      failureReason: err?.code || "internal_error",
+    });
+
+    return res.status(500).json({ ok: false, message: "Internal server error" });
+  }
+};
+
+module.exports = { setTrainerCommissionSplit };

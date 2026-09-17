@@ -574,6 +574,13 @@ function buildDashboardRoute(
 
   if (
     role ===
+    'facility_admin'
+  ) {
+    return '/facility-admin/overview';
+  }
+
+  if (
+    role ===
     'trainer'
   ) {
     return '/trainer/clients';
@@ -857,6 +864,7 @@ exports.login =
                  aur.role,
                  aur.partner_code,
                  aur.parent_user_id,
+                 aur.facility_id,
                  aur.status,
                  aur.email_verified_at
 
@@ -901,6 +909,7 @@ exports.login =
                  aur.role,
                  aur.partner_code,
                  aur.parent_user_id,
+                 aur.facility_id,
                  aur.status,
                  aur.email_verified_at
 
@@ -1046,6 +1055,8 @@ exports.login =
         role !==
           'admin' &&
         role !==
+          'facility_admin' &&
+        role !==
           'trainer'
       ) {
         await writeAuthLogSafe(
@@ -1087,6 +1098,8 @@ exports.login =
         (
           role ===
             'admin' ||
+          role ===
+            'facility_admin' ||
           role ===
             'trainer'
         ) &&
@@ -1376,6 +1389,14 @@ exports.login =
             ).toLowerCase()
           : null;
 
+      const facilityId =
+        user.facility_id ==
+        null
+          ? null
+          : Number(
+              user.facility_id
+            );
+
       const dashboardRoute =
         buildDashboardRoute(
           role
@@ -1434,6 +1455,9 @@ exports.login =
 
           parent_user_id:
             parentUserId,
+
+          facility_id:
+            facilityId,
         };
 
       const now =
@@ -1589,6 +1613,9 @@ exports.login =
 
           parent_user_id:
             parentUserId,
+
+          facility_id:
+            facilityId,
 
           dashboard_route:
             dashboardRoute,
