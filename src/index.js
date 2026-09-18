@@ -67,6 +67,17 @@ app.use((req, res, next) => {
       "http://localhost:8080", // static marketing site (Website/) served locally
       "http://127.0.0.1:3000",
       "http://127.0.0.1:3001",
+      // Public site (order page calls order-page-context / create-checkout-session)
+      "https://rysflo.com",
+      "https://www.rysflo.com",
+      // Dashboards
+      "https://admin.rysflo.com",
+      "https://uat.rysflo.com",
+      // Extra origins per environment, comma-separated (CORS_ALLOWED_ORIGINS)
+      ...String(process.env.CORS_ALLOWED_ORIGINS || "")
+        .split(",")
+        .map((o) => o.trim())
+        .filter(Boolean),
     ];
 
     const origin = req.headers.origin;
