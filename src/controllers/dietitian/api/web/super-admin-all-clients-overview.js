@@ -22,7 +22,7 @@
  *  - never_tested_clients = network clients who never tested even once.
  *  - type filter: all | tested | missed | never_tested (invalid → all).
  *  - Per-row diet_plan.generated_at is resolved from
- *    weekly_food_json_suggestions when that table (and the expected columns)
+ *    weekly_food_json_suggestions_newtest when that table (and the expected columns)
  *    exist — the column names are auto-detected exactly as the PHP did.
  *  - Client identity is masked (name / email / phone / age-band). dob, age,
  *    region, location, profile_image are never returned.
@@ -63,7 +63,7 @@
  *
  * NOTE: No DB tables are added or removed vs. the PHP — same table_dietician,
  * app_user_roles, table_clients, table_test_data, user_habits,
- * weekly_food_json_suggestions, app_auth_logs.
+ * weekly_food_json_suggestions_newtest, app_auth_logs.
  */
 
 const crypto = require("crypto");
@@ -420,7 +420,7 @@ async function getSuperAdminNetworkCodes(actor, actorEmail) {
 // ─── Diet-plan dynamic column detection (PHP sac_build_diet_plan_sql) ────────
 
 /**
- * weekly_food_json_suggestions has drifted across deployments, so the PHP picked
+ * weekly_food_json_suggestions_newtest has drifted across deployments, so the PHP picked
  * the diet / profile / created columns by name at runtime. We reproduce that:
  * the candidate names are matched against INFORMATION_SCHEMA (a fixed allow-list),
  * and the chosen identifiers are backtick-escaped before being inlined — they are
@@ -437,7 +437,7 @@ async function buildDietPlanSql() {
         SELECT COLUMN_NAME
         FROM INFORMATION_SCHEMA.COLUMNS
         WHERE TABLE_SCHEMA = DATABASE()
-          AND TABLE_NAME = 'weekly_food_json_suggestions'
+          AND TABLE_NAME = 'weekly_food_json_suggestions_newtest'
       `
     );
     cols = new Set(rows.map((r) => r.COLUMN_NAME));
@@ -472,7 +472,7 @@ async function buildDietPlanSql() {
           UPPER(${dietColSql}) AS diet_key,
           ${profileColSql} AS profile_id,
           MAX(${createdColSql}) AS generated_at
-        FROM weekly_food_json_suggestions
+        FROM weekly_food_json_suggestions_newtest
         GROUP BY UPPER(${dietColSql}), ${profileColSql}
       ) dp
         ON dp.diet_key = UPPER(tc.dietician_id)
