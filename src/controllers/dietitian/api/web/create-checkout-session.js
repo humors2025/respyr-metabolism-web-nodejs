@@ -22,13 +22,16 @@
  *
  * Response: { ok, checkout_url, session_id, attributed_to: { partner_code, role } | null }
  *
- * Abuse controls: the global API rate limiter applies; every session carries
+ * Abuse controls: an email with a live subscription (active / trialing /
+ * past_due) is refused with 409 already_member so nobody pays twice; the
+ * global API rate limiter applies; every session carries
  * the caller IP hash in metadata for the audit trail; the endpoint never
  * reveals whether a code exists (attributed_to is omitted unless the code is
  * valid, and an invalid code is not an error).
  */
 
 const crypto = require("crypto");
+const pool = require("../../../../config/db");
 const {
   requireStripe,
   ORDER_SUCCESS_URL,
@@ -78,6 +81,30 @@ const createCheckoutSession = async (req, res) => {
         return res.status(422).json({ ok: false, message: "Invalid email address" });
       }
       email = check.value;
+    }
+
+    // One live membership per email: if this address already has a paying
+    // subscription, don't open another Checkout — the member would be charged
+    // twice. Canceled / expired subscriptions may buy again.
+    if (email) {
+      const [dupes] = await pool.execute(
+        `
+          SELECT stripe_subscription_id
+          FROM referral_subscriptions
+          WHERE LOWER(purchaser_email) = LOWER(?)
+            AND status IN ('active','trialing','past_due')
+          LIMIT 1
+        `,
+        [email]
+      );
+      if (dupes.length) {
+        return res.status(409).json({
+          ok: false,
+          code: "already_member",
+          message:
+            "This email already has an active Rysflo membership, so there's nothing to pay. Your referral code is in your receipt email — open the Rysflo app and enter it there.",
+        });
+      }
     }
 
     const pr = await pricing.ensureStripePricing();
