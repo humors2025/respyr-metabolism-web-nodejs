@@ -288,7 +288,7 @@ exports.get_search_clients_details = async (req, res) => {
     }
 
     if (rawSearch !== "") {
-      filterCondition += " AND tc.profile_name LIKE ? ";
+      filterCondition += " AND (tc.profile_name LIKE ? OR tc.profile_id LIKE ?) ";
     }
 
     debugStep = "main_query_build";
@@ -355,7 +355,7 @@ exports.get_search_clients_details = async (req, res) => {
     const params = [selectedDate, dieticianId, dieticianId];
 
     if (rawSearch !== "") {
-      params.push(`%${escapedSearch}%`);
+      params.push(`%${escapedSearch}%`, `%${escapedSearch}%`);
     }
 
     debugStep = "main_query_execute";
