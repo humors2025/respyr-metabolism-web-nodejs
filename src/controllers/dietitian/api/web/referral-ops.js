@@ -27,7 +27,7 @@ const { _helpers: H } = require("./admin-invite-trainer");
 const pricing = require("../../../../services/pricing");
 const qr = require("../../../../services/qrCodes");
 const purchaseCodes = require("../../../../services/purchaseCodes");
-const { resolvePartnerCode, normalizeCode } = require("../../../../utils/partnerCodeResolver");
+const { resolvePartnerCode, normalizeCode, HOUSE_TRAINER_CODE } = require("../../../../utils/partnerCodeResolver");
 const crypto = require("crypto");
 const { generateUniqueFacilityCode, validateFacilityName } = require("./admin-invite-facility-admin");
 const { escapeHtml } = require("../../../../utils/securityValidation");
@@ -140,6 +140,10 @@ const referredMembers = guard(async (req, res) => {
   const role = String(a.actor.role);
   const ownCode = String(a.actor.partner_code || "").toUpperCase();
   const isOwner = role === "facility_admin" && a.actor.facility_id != null;
+  // The house trainer ("Rysflo Support") has no referrals of its own — its
+  // members are the ones who bought on the website without a code. Show them
+  // here so support can see who has linked the app and resend codes.
+  const isHouse = !!HOUSE_TRAINER_CODE && ownCode === HOUSE_TRAINER_CODE;
 
   // Facility admin: own code (wall QR) + every trainer in the facility,
   // including removed trainers so their historical sales still show.
@@ -167,8 +171,8 @@ const referredMembers = guard(async (req, res) => {
     }));
   }
   const codes = [ownCode, ...trainers.map((t) => t.code)].filter(Boolean);
-  const empty = { ok: true, items: [], groups: [], totals: { total: 0, linked: 0, unlinked: 0, active: 0, charged_minor: 0, breath_credit_minor: 0, commission_minor: 0, my_share_minor: 0 } };
-  if (!codes.length) return res.status(200).json(empty);
+  const empty = { ok: true, house: isHouse, items: [], groups: [], totals: { total: 0, linked: 0, unlinked: 0, active: 0, charged_minor: 0, breath_credit_minor: 0, commission_minor: 0, my_share_minor: 0 } };
+  if (!codes.length && !isHouse) return res.status(200).json(empty);
 
   const [rows] = await pool.query(
     `
@@ -178,11 +182,11 @@ const referredMembers = guard(async (req, res) => {
              tc.profile_name
       FROM referral_subscriptions rs
       LEFT JOIN table_clients tc ON rs.profile_id IS NOT NULL AND tc.profile_id = rs.profile_id
-      WHERE UPPER(rs.attributed_partner_code) IN (?)
+      WHERE ${isHouse ? "rs.attributed_partner_code IS NULL" : "UPPER(rs.attributed_partner_code) IN (?)"}
       ORDER BY rs.created_at DESC
       LIMIT 500
     `,
-    [codes]
+    isHouse ? [] : [codes]
   );
   if (!rows.length) return res.status(200).json(empty);
   const subIds = rows.map((r) => r.stripe_subscription_id);
@@ -267,6 +271,7 @@ const referredMembers = guard(async (req, res) => {
       linked_via: r.linked_via,
       linked_at: r.linked_at,
       code,
+      source: isHouse ? "website" : null,
       via_trainer: r.attributed_role === "trainer" ? (trainer ? trainer.name : code) : null,
       trainer_user_id: trainer ? trainer.user_id : null,
       qr_id: r.qr_id,
@@ -283,7 +288,8 @@ const referredMembers = guard(async (req, res) => {
       breath_credit_minor: sum("breath_credit_minor"),
       commission_minor: sum("commission_minor"),
       my_share_minor: sum("my_minor"),
-      last_charged_minor: live[0] ? live[0].charged_minor : null,
+      // Direct members produce no ledger rows, so show the subscription price.
+      last_charged_minor: live[0] ? live[0].charged_minor : isHouse ? Number(r.unit_amount_minor || 0) : null,
       invoices,
     };
     totals.total += 1;
@@ -318,7 +324,7 @@ const referredMembers = guard(async (req, res) => {
     }
   }
 
-  return res.status(200).json({ ok: true, items, groups, totals, rate_pct: entries[0] ? Number(entries[0].rate_pct) : null });
+  return res.status(200).json({ ok: true, house: isHouse, items, groups, totals, rate_pct: entries[0] ? Number(entries[0].rate_pct) : null });
 });
 
 const resendPurchaseCode = guard(async (req, res) => {
@@ -332,9 +338,12 @@ const resendPurchaseCode = guard(async (req, res) => {
     [sid]
   );
   const sub = rows[0];
-  const own = sub && String(sub.attributed_partner_code || "").toUpperCase() === String(a.actor.partner_code || "").toUpperCase();
+  const actorCode = String(a.actor.partner_code || "").toUpperCase();
+  const own = sub && String(sub.attributed_partner_code || "").toUpperCase() === actorCode;
+  // House trainer: direct (unattributed) members are its members.
+  const house = sub && !sub.attributed_partner_code && !!HOUSE_TRAINER_CODE && actorCode === HOUSE_TRAINER_CODE;
   const inFacility = sub && String(a.actor.role) === "facility_admin" && a.actor.facility_id != null && Number(sub.facility_id) === Number(a.actor.facility_id);
-  if (!sub || !(own || inFacility)) return res.status(404).json({ ok: false, message: "Subscription not found" });
+  if (!sub || !(own || inFacility || house)) return res.status(404).json({ ok: false, message: "Subscription not found" });
   if (sub.profile_id) return res.status(409).json({ ok: false, message: "This member is already linked" });
   if (!sub.purchaser_email) return res.status(409).json({ ok: false, message: "No email on file for this member" });
 
