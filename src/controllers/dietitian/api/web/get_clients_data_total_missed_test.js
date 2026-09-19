@@ -197,7 +197,7 @@ const formatClientRows = (rows, selectedDate, baseUrl, dieticianEmail) => {
       last_logged_date: row.last_logged_date,
       last_logged: getLastLoggedText(row.last_logged_date, selectedDate),
 
-      // NEW: latest diet plan generated date from weekly_food_json_suggestions
+      // NEW: latest diet plan generated date from weekly_food_json_suggestions_newtest
       diet_plan_generated_at: dietPlanGeneratedAt,
       diet_plan_generated_date: dietPlanGeneratedAt
         ? toDateOnly(dietPlanGeneratedAt)
@@ -470,7 +470,7 @@ exports.get_clients_data_total_missed_test = async (req, res) => {
           UPPER(TRIM(dietician_id)) AS dietician_id,
           profile_id,
           MAX(created_at) AS diet_plan_generated_at
-        FROM weekly_food_json_suggestions
+        FROM weekly_food_json_suggestions_newtest
         GROUP BY UPPER(TRIM(dietician_id)), profile_id
       ) wfj
         ON wfj.profile_id = tc.profile_id
