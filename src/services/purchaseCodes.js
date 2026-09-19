@@ -17,6 +17,7 @@
 
 const axios = require("axios");
 const pool = require("../config/db");
+const { HOUSE_TRAINER_CODE } = require("../utils/partnerCodeResolver");
 const csi = require("../controllers/dietitian/api/web/client-subscription-action-common");
 const { escapeHtml } = require("../utils/securityValidation");
 
@@ -62,9 +63,11 @@ async function ensurePurchaseCode({ stripeSubscriptionId }) {
     const code = await csi.uniqueRedeemCode(conn);
     const expiresAt = csi.istMysqlDateTime(new Date(Date.now() + CODE_EXPIRY_DAYS * 86400000));
     // trainer_id/trainer_code drive who becomes trainer-of-record when the app
-    // redeems. With no referral there is nobody to link to, so use the
-    // platform sentinel the app treats as "no trainer".
-    const trainerCode = sub.attributed_partner_code || "RYSFLO";
+    // redeems. The app resolves the code together with its trainer, so this
+    // must be a real table_dietician row: with no referral it is the house
+    // trainer (HOUSE_TRAINER_CODE, "Rysflo Support"), which never earns
+    // commission or discounts — see partnerCodeResolver.
+    const trainerCode = sub.attributed_partner_code || HOUSE_TRAINER_CODE || "RYSFLO";
     const email = sub.purchaser_email || "";
 
     const [ins] = await conn.execute(

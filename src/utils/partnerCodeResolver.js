@@ -25,6 +25,19 @@ function normalizeCode(raw) {
   return CODE_RE.test(c) ? c : "";
 }
 
+/**
+ * The house trainer ("Rysflo Support"): the account that members who buy
+ * without a gym / trainer code are attached to when they redeem their purchase
+ * code in the app. It is a real trainer row so the app can redeem, but its code
+ * is never a referral — no discount, no attribution, no commission — so it is
+ * excluded here, which every caller (order page, checkout, webhook, ledger)
+ * goes through. Per environment: HOUSE_TRAINER_CODE=TRN… on the Lambda.
+ */
+const HOUSE_TRAINER_CODE = normalizeCode(process.env.HOUSE_TRAINER_CODE || "");
+if (!HOUSE_TRAINER_CODE) {
+  console.warn("HOUSE_TRAINER_CODE is not set — purchase codes for no-referral sales will not be redeemable in the app.");
+}
+
 async function lookupByCode(code) {
   const [rows] = await pool.execute(
     `
@@ -95,6 +108,7 @@ async function lookupPendingInvitation(code) {
 async function resolvePartnerCode(rawCode, { allowPending = true } = {}) {
   const code = normalizeCode(rawCode);
   if (code === "") return null;
+  if (HOUSE_TRAINER_CODE && code === HOUSE_TRAINER_CODE) return null;
 
   let row = await lookupByCode(code);
   let hops = 0;
@@ -111,4 +125,4 @@ async function resolvePartnerCode(rawCode, { allowPending = true } = {}) {
   return allowPending ? lookupPendingInvitation(code) : null;
 }
 
-module.exports = { resolvePartnerCode, normalizeCode };
+module.exports = { resolvePartnerCode, normalizeCode, HOUSE_TRAINER_CODE };
