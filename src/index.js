@@ -5,6 +5,7 @@ const helmet = require("helmet");
 const rateLimit = require("express-rate-limit");
 
 const apiRoutes = require("./routes/apiRoutes");
+const auditAccessLogMiddleware = require("./middlewares/auditAccessLogMiddleware");
 
 const app = express();
 
@@ -174,6 +175,14 @@ app.use((req, res, next) => {
 
   next();
 });
+
+// =====================================================
+// Global API access audit (app_auth_logs)
+// Mounted AFTER the /v1 strip so paths match the
+// middleware's route sets. Endpoints that already write
+// their own audit rows are skipped inside the middleware.
+// =====================================================
+app.use(auditAccessLogMiddleware);
 
 // =====================================================
 // Health check routes
