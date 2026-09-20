@@ -171,18 +171,6 @@ async function onCheckoutSessionCompleted(stripe, session) {
     [schedule.id, subscription.id]
   );
 
-  // Stripe does not order events: invoice.paid for the first invoice usually
-  // arrives before this one and found no subscription to attribute. Backfill
-  // any paid invoices now — the ledger's unique key makes this idempotent.
-  const paid = await stripe.invoices.list({
-    subscription: subscription.id,
-    status: "paid",
-    limit: 12,
-  });
-  for (const inv of paid.data) {
-    await recordInvoice(inv);
-  }
-
   // Purchase code for the app (skipped when the buyer is already a linked app
   // user — they bought in-app or by email match, nothing to redeem).
   let purchaseCodeSent = false;
@@ -198,6 +186,23 @@ async function onCheckoutSessionCompleted(stripe, session) {
   // Payment confirmation to the buyer (once per session).
   const receipt = await paymentEmails.sendPaymentReceipt({ session, subscription, partnerCode: md.attributed_partner_code || null, purchaseCodeSent });
   if (!receipt.ok) console.warn("PAYMENT_RECEIPT_EMAIL_NOT_SENT:", { session: session.id, reason: receipt.reason });
+
+  // Bookkeeping last, so a ledger problem (missing commission rate, payee
+  // setup…) can never cost the buyer their code or emails. Stripe does not
+  // order events: invoice.paid for the first invoice usually arrives before
+  // this one and found no subscription to attribute, so backfill any paid
+  // invoices now — the ledger's unique key makes this idempotent. The error
+  // is rethrown after the customer steps so the event is still recorded as
+  // 'error' and can be replayed once the ledger is fixed; every step above
+  // is idempotent, so a replay only redoes the bookkeeping.
+  const paid = await stripe.invoices.list({
+    subscription: subscription.id,
+    status: "paid",
+    limit: 12,
+  });
+  for (const inv of paid.data) {
+    await recordInvoice(inv);
+  }
 }
 
 /**
