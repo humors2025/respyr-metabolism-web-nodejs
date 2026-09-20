@@ -440,15 +440,22 @@ const stripeWebhook = async (req, res) => {
     );
     return res.status(200).json({ ok: true });
   } catch (err) {
+    // A MySQL error names the column but not the table; keep the statement
+    // (first line, no bind values) so a schema drift between environments
+    // can be located from webhook_events.error alone.
+    const sqlSnippet = typeof err?.sql === "string" ? err.sql.replace(/\s+/g, " ").trim().slice(0, 600) : null;
     console.error("STRIPE_WEBHOOK_HANDLER_ERROR:", {
       event_id: event.id,
       type: event.type,
       code: err?.code,
+      errno: err?.errno,
       message: err?.message,
+      sql: sqlSnippet,
     });
+    const errorText = sqlSnippet ? `${err.message} | sql: ${sqlSnippet}` : String(err?.message || "handler error");
     await pool.execute(
       `UPDATE webhook_events SET status = 'error', error = ?, processed_at = UTC_TIMESTAMP() WHERE event_id = ?`,
-      [String(err?.message || "handler error").slice(0, 2000), event.id]
+      [errorText.slice(0, 2000), event.id]
     );
     // 200: the event is stored; a super_admin can replay it once the bug is fixed.
     return res.status(200).json({ ok: false, recorded: true });
