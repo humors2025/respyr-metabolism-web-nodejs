@@ -41,9 +41,12 @@
  *
  * Behaviour parity with the PHP:
  *  - Week window is IST (the PHP set date_default_timezone_set("Asia/Kolkata")).
- *    week_start_date = the most recent Sunday (today if today IS Sunday),
- *    week_end_date = week_start + 6 days, month_no/year_no from week_start,
- *    source_api_date = today.
+ *    The week now runs Friday → Thursday (the PHP's was Sunday → Saturday) and
+ *    the generator runs every Thursday, so a call on Thursday targets the week
+ *    that starts TOMORROW: week_start_date = the upcoming Friday when today is
+ *    Thursday, otherwise the most recent Friday (today if today IS Friday).
+ *    week_end_date = week_start + 6 days (a Thursday), month_no/year_no from
+ *    week_start, source_api_date = today.
  *  - Upsert key: (dietician_id, profile_id, week_start_date, week_end_date).
  *  - status is reset to 0 on BOTH insert and update — so regenerating a plan
  *    un-approves it. That is the PHP's behaviour and is preserved deliberately;
@@ -260,22 +263,29 @@ function istNow() {
   return new Date(Date.now() + IST_OFFSET_MS);
 }
 
+const FRIDAY = 5; // Date#getUTCDay(): 0 = Sunday … 5 = Friday, 6 = Saturday
+
 /**
- * PHP:
+ * The PHP ran the generator every Sunday and stored a Sunday → Saturday week:
  *   $today = new DateTime();                       // Asia/Kolkata
  *   if ($today->format('w') != 0) $today->modify('last sunday');
  *   $weekStart = clone $today; $weekEnd = $weekStart + 6 days;
  *
- * i.e. the week runs Sunday → Saturday, and on a Sunday the window starts today.
+ * The generator now runs every Thursday and the week runs Friday → Thursday,
+ * so the plan generated on Thursday is for the week that starts the next day.
+ * Working from "tomorrow" gives that in one rule:
+ *   - Thursday  → tomorrow is Friday, so week_start = tomorrow (the new week);
+ *   - Friday    → week_start = today;
+ *   - Sat … Wed → week_start = the most recent Friday (the week in progress),
+ *                 so a re-run mid-week still lands on the current week's row.
  */
 function computeWeekWindow() {
   const now = istNow();
 
   const weekStart = new Date(now.getTime());
-  const dayOfWeek = now.getUTCDay(); // 0 = Sunday, in IST wall-clock terms
-  if (dayOfWeek !== 0) {
-    weekStart.setUTCDate(weekStart.getUTCDate() - dayOfWeek);
-  }
+  weekStart.setUTCDate(weekStart.getUTCDate() + 1); // tomorrow, IST wall-clock
+  const daysSinceFriday = (weekStart.getUTCDay() - FRIDAY + 7) % 7;
+  weekStart.setUTCDate(weekStart.getUTCDate() - daysSinceFriday);
 
   const weekEnd = new Date(weekStart.getTime());
   weekEnd.setUTCDate(weekEnd.getUTCDate() + 6);
