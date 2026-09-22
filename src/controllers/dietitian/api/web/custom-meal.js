@@ -32,6 +32,7 @@ const axios = require("axios");
 
 const pool = require("../../../../config/db");
 const { requireProfileAccess } = require("../../../../utils/accessControl");
+const { pushUndoSnapshot } = require("../../../../utils/weeklyFoodJsonUndo");
 
 const isProduction =
   process.env.NODE_ENV === "production" ||
@@ -406,6 +407,16 @@ const customMeal = async (req, res) => {
 
     let updateResult;
     try {
+      // one step back: the row as it was, in the same transaction as the write
+      await pushUndoSnapshot(connection, {
+        recordId: recordId,
+        dieticianId: access.dieticianId,
+        profileId: access.profileId,
+        foodJson: row.food_json,
+        label: `made ${String(body.name || "").trim() || "a custom meal"}`.slice(0, 120),
+        undoGroup: body.undo_group,
+      });
+
       [updateResult] = await connection.execute(
         `
           UPDATE weekly_food_json_suggestions_newtest

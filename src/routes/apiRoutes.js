@@ -415,6 +415,18 @@ const {
   "../controllers/dietitian/api/web/search-foods"
 );
 
+// Ingredient-level search (FitChef fc_ingredients / fc_recipes), proxied like search-foods.
+const {
+  searchIngredients,
+  recipesByIngredient,
+} = require("../controllers/dietitian/api/web/search-ingredients");
+
+// One step back for the diet-plan editor (weekly_food_json_undo_newtest).
+const {
+  undoWeeklyFoodJsonNewtest,
+  undoDepthWeeklyFoodJsonNewtest,
+} = require("../controllers/dietitian/api/web/undo-weekly-food-json-newtest");
+
 
 
 const {
@@ -1193,6 +1205,31 @@ router.get(
   ],
   authMiddleware,
   searchFoods
+);
+
+router.get(
+  "/dietitian/api/web/search-ingredients",
+  authMiddleware,
+  searchIngredients
+);
+
+router.get(
+  "/dietitian/api/web/recipes-by-ingredient",
+  authMiddleware,
+  recipesByIngredient
+);
+
+// Undo the last saved edit (trainer update / custom meal); Reset clears the stack.
+router.post(
+  "/dietitian/api/web/undo-weekly-food-json-newtest",
+  authMiddleware,
+  undoWeeklyFoodJsonNewtest
+);
+
+router.get(
+  "/dietitian/api/web/undo-depth-weekly-food-json-newtest",
+  authMiddleware,
+  undoDepthWeeklyFoodJsonNewtest
 );
 
 
