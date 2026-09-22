@@ -71,12 +71,6 @@ const {
   normalizeId,
 } = require("../../../../utils/accessControl");
 
-// One step back (see src/utils/weeklyFoodJsonUndo.js): the row is
-// snapshotted before every write, inside the same transaction.
-const {
-  pushUndoSnapshot,
-} = require("../../../../utils/weeklyFoodJsonUndo");
-
 // Where a food came from, recorded in food_json._swaps like the FitChef
 // trainer dashboard does — "alternative" (one of the plan's own swaps),
 // "search" (the dish bank), "custom" (Make my meal), or "portion" (only the
@@ -6534,41 +6528,6 @@ const trainerUpdateWeeklyFoodJsonNewtest =
           "Stored food_json does not contain days array"
         );
       }
-
-      // =====================================================================
-      // 5b. UNDO SNAPSHOT — the row as it is NOW, before anything changes.
-      //     Same transaction as the write, so the two commit or roll back
-      //     together. `undo_group` folds one dashboard Save (several calls)
-      //     into one step back.
-      // =====================================================================
-
-      const undoLabel =
-        action === "delete"
-          ? "deleted a meal"
-          : action === "add"
-            ? "added " +
-              (foodLabel(
-                payload.food
-              ) || "a meal")
-            : "changed " +
-              (foodLabel(
-                payload.food
-              ) || "a meal");
-
-      await pushUndoSnapshot(
-        connection,
-        {
-          recordId: id,
-          dieticianId:
-            access.dieticianId,
-          profileId:
-            access.profileId,
-          foodJson: row.food_json,
-          label: undoLabel,
-          undoGroup:
-            payload.undo_group,
-        }
-      );
 
       // =====================================================================
       // 6. LOCATE DAY

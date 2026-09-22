@@ -46,7 +46,6 @@ const {
   requireDieticianSelfAccess,
   normalizeId,
 } = require("../../../../utils/accessControl");
-const { clearUndoSnapshots } = require("../../../../utils/weeklyFoodJsonUndo");
 
 // =============================================================================
 // CONSTANTS
@@ -442,12 +441,6 @@ const resetWeeklyFoodJsonNewtest = async (req, res) => {
     if (!updateResult || updateResult.affectedRows !== 1) {
       fail(409, "Diet plan row could not be reset");
     }
-
-    // AND THE UNDO STACK WITH IT. Reset puts the week back to what was
-    // generated; leaving the stack behind would let Undo step back INTO an
-    // edited state the reset just threw away. Nothing to step back to is
-    // the truth after a reset.
-    await clearUndoSnapshots(connection, id);
 
     await connection.commit();
 
