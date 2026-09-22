@@ -71,6 +71,38 @@ const {
   normalizeId,
 } = require("../../../../utils/accessControl");
 
+// Where a food came from, recorded in food_json._swaps like the FitChef
+// trainer dashboard does — "alternative" (one of the plan's own swaps),
+// "search" (the dish bank), "custom" (Make my meal), or "portion" (only the
+// servings changed, which is not a swap and is not recorded).
+const ALLOWED_VIA = new Set([
+  "alternative",
+  "search",
+  "custom",
+  "portion",
+  "manual",
+]);
+
+function foodLabel(food) {
+  if (!isPlainObject(food)) return "";
+  return String(
+    food.food_name ?? food.name ?? ""
+  ).trim();
+}
+
+function foodRecipeId(food) {
+  if (!isPlainObject(food)) return null;
+  const v =
+    food.recipe_id ??
+    food.recipeId ??
+    food.key ??
+    food.fitchef_key ??
+    null;
+  return v === null || v === undefined
+    ? null
+    : String(v);
+}
+
 // =============================================================================
 // CONSTANTS
 // =============================================================================
@@ -6720,11 +6752,14 @@ const trainerUpdateWeeklyFoodJsonNewtest =
          * }
          */
 
+        const beforeFood =
+          meal.get(
+            foodIndex
+          );
+
         const updatedFood =
           patchExistingFood(
-            meal.get(
-              foodIndex
-            ),
+            beforeFood,
             payload.food
           );
 
@@ -6740,6 +6775,80 @@ const trainerUpdateWeeklyFoodJsonNewtest =
           meal.get(
             foodIndex
           );
+
+        // -------------------------------------------------------------------
+        // _swaps AUDIT TRAIL
+        //
+        // The trainer dashboard keeps a list on the plan of every dish that
+        // was replaced — from, to, how — so a week's history can be read
+        // straight off the JSON. A portion change is not a swap; a name
+        // change is, whatever the caller said.
+        // -------------------------------------------------------------------
+
+        const viaRaw = String(
+          payload.via ?? ""
+        )
+          .trim()
+          .toLowerCase();
+
+        const via =
+          ALLOWED_VIA.has(viaRaw)
+            ? viaRaw
+            : "";
+
+        const fromName =
+          foodLabel(beforeFood);
+
+        const toName =
+          foodLabel(changedFood);
+
+        const isSwap =
+          via !== "" &&
+          via !== "portion"
+            ? true
+            : fromName !== "" &&
+              toName !== "" &&
+              fromName.toLowerCase() !==
+                toName.toLowerCase();
+
+        if (isSwap) {
+          if (
+            !Array.isArray(
+              foodJson._swaps
+            )
+          ) {
+            foodJson._swaps = [];
+          }
+
+          foodJson._swaps.push({
+            day: dayIndex + 1,
+            day_code: resolvedDayCode,
+            slot: mealType,
+            from: fromName,
+            to: toName,
+            from_recipeId:
+              foodRecipeId(
+                beforeFood
+              ),
+            to_recipeId:
+              foodRecipeId(
+                changedFood
+              ),
+            via: via || "search",
+            at: new Date().toISOString(),
+          });
+
+          // bounded, like the undo stack — a plan is not a log file
+          if (
+            foodJson._swaps.length >
+            200
+          ) {
+            foodJson._swaps =
+              foodJson._swaps.slice(
+                -200
+              );
+          }
+        }
       }
 
       // ---------------------------------------------------------------------

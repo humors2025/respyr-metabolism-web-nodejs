@@ -415,6 +415,12 @@ const {
   "../controllers/dietitian/api/web/search-foods"
 );
 
+// Ingredient-level search (FitChef fc_ingredients / fc_recipes), proxied like search-foods.
+const {
+  searchIngredients,
+  recipesByIngredient,
+} = require("../controllers/dietitian/api/web/search-ingredients");
+
 
 
 const {
@@ -1193,6 +1199,18 @@ router.get(
   ],
   authMiddleware,
   searchFoods
+);
+
+router.get(
+  "/dietitian/api/web/search-ingredients",
+  authMiddleware,
+  searchIngredients
+);
+
+router.get(
+  "/dietitian/api/web/recipes-by-ingredient",
+  authMiddleware,
+  recipesByIngredient
 );
 
 
