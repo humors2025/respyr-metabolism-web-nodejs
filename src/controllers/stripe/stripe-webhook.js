@@ -11,14 +11,18 @@
  *
  * Events handled:
  *   checkout.session.completed   -> referral_subscriptions row (attribution)
+ *                                   + subscription_shipping_addresses row
  *                                   + "payment received" email to the buyer
  *   payment_intent.payment_failed
- *   invoice.payment_failed
  *   checkout.session.async_payment_failed
  *                                -> "payment failed" email to the buyer
+ *   invoice.payment_failed       -> payment_transactions row (failed)
+ *                                   + "payment failed" email (renewals)
  *   customer.subscription.*      -> keep status / period in sync
- *   invoice.paid                 -> commission_entries (the ledger)
- *   charge.refunded              -> reverse ledger entries for that invoice
+ *   invoice.paid                 -> payment_transactions row
+ *                                   + commission_entries (the ledger)
+ *   charge.refunded              -> payment_transactions refund amount/status
+ *                                   + reverse ledger entries for that invoice
  *   account.updated              -> partner_payout_accounts status
  *   transfer.reversed            -> payouts + ledger entries reversed
  *   (a Transfer settles synchronously on create; there is no transfer.paid)
@@ -35,6 +39,7 @@ const connect = require("../../services/stripeConnectAccounts");
 const pricing = require("../../services/pricing");
 const purchaseCodes = require("../../services/purchaseCodes");
 const paymentEmails = require("../../services/paymentEmails");
+const paymentTransactions = require("../../services/paymentTransactions");
 const { resolvePartnerCode } = require("../../utils/partnerCodeResolver");
 
 function toMysqlDateTime(unixSeconds) {
@@ -187,6 +192,9 @@ async function onCheckoutSessionCompleted(stripe, session) {
   const receipt = await paymentEmails.sendPaymentReceipt({ session, subscription, partnerCode: md.attributed_partner_code || null, purchaseCodeSent });
   if (!receipt.ok) console.warn("PAYMENT_RECEIPT_EMAIL_NOT_SENT:", { session: session.id, reason: receipt.reason });
 
+  // Phone + shipping address for the device, kept out of referral_subscriptions.
+  await paymentTransactions.saveShippingAddress({ session, stripeSubscriptionId: subscription.id });
+
   // Bookkeeping last, so a ledger problem (missing commission rate, payee
   // setup…) can never cost the buyer their code or emails. Stripe does not
   // order events: invoice.paid for the first invoice usually arrives before
@@ -201,6 +209,7 @@ async function onCheckoutSessionCompleted(stripe, session) {
     limit: 12,
   });
   for (const inv of paid.data) {
+    await paymentTransactions.syncInvoice(stripe, inv);
     await recordInvoice(inv);
   }
 }
@@ -240,8 +249,9 @@ async function onPaymentIntentFailed(stripe, pi) {
 }
 
 /** Renewal payment failed (Stripe keeps retrying per the dunning settings). */
-async function onInvoicePaymentFailed(invoice) {
+async function onInvoicePaymentFailed(stripe, invoice) {
   if (!paymentEmails.invoiceIsOurs(invoice)) return;
+  await paymentTransactions.syncInvoice(stripe, invoice, { failure: true });
   if (invoice.billing_reason === "subscription_create") return; // handled by onPaymentIntentFailed
   const mail = await paymentEmails.sendPaymentFailed({
     to: invoice.customer_email,
@@ -315,18 +325,21 @@ async function onSubscriptionChanged(subscription) {
   );
 }
 
-async function onInvoicePaid(invoice) {
+async function onInvoicePaid(stripe, invoice) {
+  await paymentTransactions.syncInvoice(stripe, invoice);
   await recordInvoice(invoice);
 }
 
 async function onChargeRefunded(stripe, charge) {
-  // Find the invoice for this charge and reverse its ledger entries.
+  // Find the invoice for this charge, record the refund and reverse its
+  // ledger entries. Charges no longer carry `invoice` (API 2025-03-31+), so
+  // the link is looked up through the charge's PaymentIntent.
   let invoiceId = charge.invoice ? String(charge.invoice) : null;
   if (!invoiceId && charge.payment_intent) {
-    const invoices = await stripe.invoices.list({ payment_intent: String(charge.payment_intent), limit: 1 });
-    invoiceId = invoices.data[0]?.id || null;
+    invoiceId = await paymentTransactions.invoiceIdForPaymentIntent(stripe, charge.payment_intent);
   }
   if (!invoiceId) return;
+  await paymentTransactions.syncInvoice(stripe, invoiceId);
   await ledger.reverseInvoice({ stripeInvoiceId: invoiceId, reason: `charge.refunded ${charge.id}` });
 }
 
@@ -410,13 +423,13 @@ const stripeWebhook = async (req, res) => {
         await onSubscriptionChanged(obj);
         break;
       case "invoice.paid":
-        await onInvoicePaid(obj);
+        await onInvoicePaid(stripe, obj);
         break;
       case "payment_intent.payment_failed":
         await onPaymentIntentFailed(stripe, obj);
         break;
       case "invoice.payment_failed":
-        await onInvoicePaymentFailed(obj);
+        await onInvoicePaymentFailed(stripe, obj);
         break;
       case "checkout.session.async_payment_failed":
         await onAsyncPaymentFailed(obj);

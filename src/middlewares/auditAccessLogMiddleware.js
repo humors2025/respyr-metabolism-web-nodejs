@@ -97,6 +97,7 @@ const SELF_AUDITED_PATHS = new Set([
   "/dietitian/api/web/list-payouts",
   "/dietitian/api/web/commission-overview",
   "/dietitian/api/web/super-admin-sales-analytics",
+  "/dietitian/api/web/super-admin-orders",
   "/dietitian/api/web/order-page-context",
   "/dietitian/api/web/order-session-status",
   "/dietitian/api/web/referred-members",
