@@ -31,7 +31,11 @@
  *                 (incomplete*); otherwise paid. Refunded/unpaid purchases are
  *                 listed but excluded from sales and purchase counts.
  *
- * Body: { view: "overview" | "purchases", period: week|month|year,
+ * Trainer Admin views: pass trainer_admin (the TA's email) with overview or
+ * purchases to limit every number to that TA's network (see
+ * trainerAdminNetwork). view=trainer_admins lists the TAs to choose from.
+ *
+ * Body: { view: "overview" | "purchases" | "trainer_admins", trainer_admin?, period: week|month|year,
  *         date_from, date_to (YYYY-MM-DD, inclusive, viewer's calendar),
  *         tz_offset_minutes,
  *         purchases only: source, partner_code, subscription_status, payment_status, search, page, limit }
@@ -459,10 +463,121 @@ function primaryCurrency(items) {
   return { currency: top || "USD", others: [...byCurrency.keys()].filter((c) => c !== top) };
 }
 
+// ─── Trainer Admin scope ─────────────────────────────────────────────────────
+
+/**
+ * Trainer Admins offered in the page's view switcher: the active members of
+ * the admin groups (ta_admin_groups), the same list TA Analytics shows.
+ */
+async function trainerAdmins() {
+  const [rows] = await pool.query(
+    `
+      SELECT g.group_name, UPPER(g.dietician_id) AS code,
+             LOWER(COALESCE(NULLIF(td.email, ''), aur.user_id)) AS email,
+             NULLIF(td.name, '') AS name, aur.role
+      FROM ta_admin_groups g
+      LEFT JOIN table_dietician td ON UPPER(td.dietician_id) = UPPER(g.dietician_id)
+      LEFT JOIN app_user_roles aur ON UPPER(aur.partner_code) = UPPER(g.dietician_id)
+      WHERE g.status = 'active'
+      ORDER BY g.added_at ASC, g.id ASC
+    `
+  );
+  const byEmail = new Map();
+  for (const r of rows) {
+    if (!r.email) continue;
+    const ta = byEmail.get(r.email) || { user_id: r.email, name: r.name || r.email, partner_code: r.code, role: r.role || null, groups: [] };
+    if (!ta.groups.includes(r.group_name)) ta.groups.push(r.group_name);
+    byEmail.set(r.email, ta);
+  }
+  return [...byEmail.values()];
+}
+
+/**
+ * Everything that belongs to a Trainer Admin's network: their own code, users
+ * they onboarded (parent_user_id), facilities they onboarded
+ * (facilities.parent_admin_user_id) and those facilities' trainers, walked a
+ * few levels down, plus pending invitations sent by anyone in the network.
+ */
+async function trainerAdminNetwork(taEmail) {
+  const [[ta]] = await pool.query(
+    `SELECT LOWER(user_id) AS email, UPPER(partner_code) AS code, role FROM app_user_roles WHERE LOWER(user_id) = ? LIMIT 1`,
+    [taEmail]
+  );
+  if (!ta) throw httpError(404, "Trainer admin not found");
+
+  const emails = new Set([ta.email]);
+  const codes = new Set(ta.code ? [ta.code] : []);
+  const facilityIds = new Set();
+
+  const [fs] = await pool.query(
+    `SELECT id, UPPER(partner_code) AS code, LOWER(facility_admin_user_id) AS admin FROM facilities WHERE LOWER(parent_admin_user_id) = ?`,
+    [ta.email]
+  );
+  for (const f of fs) {
+    facilityIds.add(Number(f.id));
+    if (f.code) codes.add(f.code);
+    if (f.admin) emails.add(f.admin);
+  }
+
+  for (let depth = 0; depth < 4; depth++) {
+    const before = emails.size + facilityIds.size;
+    const [rows] = await pool.query(
+      `
+        SELECT LOWER(user_id) AS email, UPPER(partner_code) AS code, facility_id
+        FROM app_user_roles
+        WHERE LOWER(parent_user_id) IN (?) OR facility_id IN (?)
+      `,
+      [[...emails], facilityIds.size ? [...facilityIds] : [0]]
+    );
+    for (const r of rows) {
+      emails.add(r.email);
+      if (r.code) codes.add(r.code);
+      if (r.facility_id != null) facilityIds.add(Number(r.facility_id));
+    }
+    if (emails.size + facilityIds.size === before) break;
+  }
+
+  const [inv] = await pool.query(
+    `
+      SELECT UPPER(partner_code) AS code, LOWER(invited_email) AS email
+      FROM app_user_invitations
+      WHERE LOWER(parent_user_id) IN (?) OR facility_id IN (?)
+    `,
+    [[...emails], facilityIds.size ? [...facilityIds] : [0]]
+  );
+  for (const r of inv) {
+    if (r.code) codes.add(r.code);
+    if (r.email) emails.add(r.email);
+  }
+
+  return {
+    email: ta.email,
+    codes,
+    emails,
+    facilityIds,
+    has(i) {
+      const code = i.code || i.linkedCode;
+      if (code && codes.has(code)) return true;
+      const attributedTo = String(i.raw.attributed_user_id || "").toLowerCase();
+      if (attributedTo && emails.has(attributedTo)) return true;
+      return i.raw.facility_id != null && facilityIds.has(Number(i.raw.facility_id));
+    },
+  };
+}
+
+async function scopeFor(body) {
+  const email = String(body.trainer_admin || "").trim().toLowerCase();
+  if (!email) return null;
+  if (email.length > 191 || !/^[^\s@]+@[^\s@]+$/.test(email)) throw httpError(422, "Invalid trainer_admin");
+  return trainerAdminNetwork(email);
+}
+
 // ─── view=overview ───────────────────────────────────────────────────────────
 
-async function overview(p) {
-  const items = await loadPurchases(p);
+async function overview(p, body) {
+  const scope = await scopeFor(body);
+  const all = await loadPurchases(p);
+  const items = scope ? all.filter((i) => scope.has(i)) : all;
   const { currency, others } = primaryCurrency(items);
   const counted = items.filter((i) => i.counts && i.currency === currency);
 
@@ -502,7 +617,17 @@ async function overview(p) {
   const ranked = [...trainers.entries()].sort((a, b) => b[1].net - a[1].net || b[1].purchases - a[1].purchases);
   const directory = await trainerDirectory(ranked.map(([code]) => code), emailsByCode(counted));
   const hierarchy = await trainerHierarchy(ranked.map(([code]) => code), counted);
-  const [[active]] = await pool.query(`SELECT COUNT(*) AS n FROM referral_subscriptions WHERE status = 'active'`);
+  const [[active]] = scope
+    ? await pool.query(
+        `
+          SELECT COUNT(*) AS n
+          FROM referral_subscriptions
+          WHERE status = 'active'
+            AND (UPPER(attributed_partner_code) IN (?) OR LOWER(attributed_user_id) IN (?) OR facility_id IN (?))
+        `,
+        [scope.codes.size ? [...scope.codes] : [""], [...scope.emails], scope.facilityIds.size ? [...scope.facilityIds] : [0]]
+      )
+    : await pool.query(`SELECT COUNT(*) AS n FROM referral_subscriptions WHERE status = 'active'`);
 
   const channel = (c) => ({
     purchases: c.purchases,
@@ -526,6 +651,7 @@ async function overview(p) {
       trainer_code_purchases: bySource.trainer_code.purchases,
       average_order_value: total.purchases ? minorToMajor(total.net / total.purchases) : 0,
       active_paid_subscribers: Number(active.n),
+      ...(scope ? { trainer_admin: scope.email, network_codes: scope.codes.size } : {}),
       excluded_purchases: items.length - items.filter((i) => i.counts).length,
     },
     source_breakdown: { website: channel(bySource.website), trainer_code: channel(bySource.trainer_code) },
@@ -576,7 +702,9 @@ async function purchases(p, body) {
   if (limit < 1) limit = 10;
   if (limit > 100) limit = 100;
 
-  const items = await loadPurchases(p);
+  const scope = await scopeFor(body);
+  const all = await loadPurchases(p);
+  const items = scope ? all.filter((i) => scope.has(i)) : all;
 
   const filtered = items.filter((i) => {
     if (source !== "all" && i.source !== source) return false;
@@ -674,9 +802,10 @@ const superAdminSalesAnalytics = async (req, res) => {
     if (resolved.error) return res.status(resolved.error.status).json({ status: false, ...resolved.error.body });
 
     let payload;
-    if (view === "overview") payload = await overview(parsePeriod(body));
+    if (view === "overview") payload = await overview(parsePeriod(body), body);
     else if (view === "purchases") payload = await purchases(parsePeriod(body), body);
-    else return res.status(422).json({ status: false, ok: false, message: "view must be overview or purchases" });
+    else if (view === "trainer_admins") payload = { trainer_admins: await trainerAdmins() };
+    else return res.status(422).json({ status: false, ok: false, message: "view must be overview, purchases or trainer_admins" });
 
     await H.writeAuthLogSafe(req, {
       eventType: "super_admin_sales_analytics_viewed",
