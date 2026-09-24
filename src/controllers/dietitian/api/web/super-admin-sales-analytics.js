@@ -123,7 +123,8 @@ async function loadPurchases(p) {
       SELECT
         rs.id, rs.stripe_subscription_id, rs.stripe_checkout_session_id, rs.stripe_customer_id,
         rs.purchaser_email, rs.purchaser_name, rs.profile_id,
-        rs.attributed_partner_code, rs.attributed_user_id, rs.stripe_promotion_code_id, rs.qr_id,
+        rs.attributed_partner_code, rs.attributed_user_id, rs.attributed_role, rs.facility_id,
+        rs.stripe_promotion_code_id, rs.qr_id,
         rs.purchase_code, rs.plan_code, rs.currency, rs.unit_amount_minor,
         rs.status, rs.current_period_end, rs.canceled_at, rs.created_at,
         (
@@ -299,6 +300,96 @@ async function trainerDirectory(codes, emailByCode = new Map()) {
   return map;
 }
 
+/**
+ * Where each code sits in the network: its role, the user who onboarded it
+ * (app_user_roles.parent_user_id) and its facility with the facility admin.
+ * Falls back to the pending invitation, then to what was stamped on the
+ * purchase (attributed_role / facility_id) for codes with no role row.
+ */
+async function trainerHierarchy(codes, items) {
+  const map = new Map();
+  if (!codes.length) return map;
+
+  const [roles] = await pool.query(
+    `
+      SELECT UPPER(partner_code) AS code, role, LOWER(parent_user_id) AS parent_user_id, facility_id
+      FROM app_user_roles
+      WHERE UPPER(partner_code) IN (?)
+    `,
+    [codes]
+  );
+  for (const r of roles) {
+    if (!map.has(r.code)) map.set(r.code, { role: r.role, parent_user_id: r.parent_user_id || null, facility_id: r.facility_id });
+  }
+
+  const missing = codes.filter((c) => !map.has(c));
+  if (missing.length) {
+    const [inv] = await pool.query(
+      `
+        SELECT UPPER(partner_code) AS code, invited_role AS role, LOWER(parent_user_id) AS parent_user_id, facility_id
+        FROM app_user_invitations
+        WHERE UPPER(partner_code) IN (?)
+        ORDER BY id DESC
+      `,
+      [missing]
+    );
+    for (const r of inv) {
+      if (!map.has(r.code)) map.set(r.code, { role: r.role, parent_user_id: r.parent_user_id || null, facility_id: r.facility_id });
+    }
+  }
+
+  for (const i of items) {
+    const code = i.code || i.linkedCode;
+    if (!code || !codes.includes(code)) continue;
+    const h = map.get(code) || { role: null, parent_user_id: null, facility_id: null };
+    if (!h.role && i.raw.attributed_role) h.role = i.raw.attributed_role;
+    if (h.facility_id == null && i.raw.facility_id != null) h.facility_id = i.raw.facility_id;
+    map.set(code, h);
+  }
+
+  const facilityIds = [...new Set([...map.values()].map((h) => h.facility_id).filter((v) => v != null).map(Number))];
+  const facilities = new Map();
+  if (facilityIds.length) {
+    const [fs] = await pool.query(
+      `SELECT id, name, UPPER(partner_code) AS partner_code, LOWER(facility_admin_user_id) AS admin_user_id, status FROM facilities WHERE id IN (?)`,
+      [facilityIds]
+    );
+    for (const f of fs) facilities.set(Number(f.id), f);
+  }
+
+  const emails = [
+    ...new Set(
+      [...map.values()].map((h) => h.parent_user_id).concat([...facilities.values()].map((f) => f.admin_user_id)).filter(Boolean)
+    ),
+  ];
+  const names = new Map();
+  if (emails.length) {
+    const [tds] = await pool.query(`SELECT LOWER(email) AS email, NULLIF(name, '') AS name FROM table_dietician WHERE LOWER(email) IN (?)`, [emails]);
+    for (const t of tds) if (t.name && !names.has(t.email)) names.set(t.email, t.name);
+  }
+
+  const out = new Map();
+  for (const [code, h] of map) {
+    const f = h.facility_id != null ? facilities.get(Number(h.facility_id)) : null;
+    out.set(code, {
+      role: h.role || null,
+      parent_user_id: h.parent_user_id || null,
+      parent_name: h.parent_user_id ? names.get(h.parent_user_id) || null : null,
+      facility: f
+        ? {
+            id: Number(f.id),
+            name: f.name,
+            partner_code: f.partner_code,
+            status: f.status,
+            admin_user_id: f.admin_user_id,
+            admin_name: names.get(f.admin_user_id) || null,
+          }
+        : null,
+    });
+  }
+  return out;
+}
+
 function emailsByCode(items) {
   const m = new Map();
   for (const i of items) {
@@ -358,6 +449,7 @@ async function overview(p) {
 
   const ranked = [...trainers.entries()].sort((a, b) => b[1].net - a[1].net || b[1].purchases - a[1].purchases);
   const directory = await trainerDirectory(ranked.map(([code]) => code), emailsByCode(counted));
+  const hierarchy = await trainerHierarchy(ranked.map(([code]) => code), counted);
   const [[active]] = await pool.query(`SELECT COUNT(*) AS n FROM referral_subscriptions WHERE status = 'active'`);
 
   const channel = (c) => ({
@@ -396,6 +488,7 @@ async function overview(p) {
         trainer_purchases: b.trainer_code.purchases,
       })),
     top_trainers: ranked.map(([code, t]) => ({
+      ...(hierarchy.get(code) || { role: null, parent_user_id: null, parent_name: null, facility: null }),
       trainer_id: directory.get(code)?.trainer_id || null,
       trainer_email: directory.get(code)?.email || null,
       trainer_name: directory.get(code)?.name || null,
