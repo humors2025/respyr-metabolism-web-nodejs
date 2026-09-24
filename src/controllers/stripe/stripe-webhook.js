@@ -17,9 +17,8 @@
  *   checkout.session.async_payment_failed
  *                                -> "payment failed" email to the buyer
  *   customer.subscription.*      -> keep status / period in sync
- *   invoice.paid                 -> sales_invoices (revenue) + commission_entries (the ledger)
- *   invoice.payment_failed       -> sales_invoices status 'failed' (and the email above)
- *   charge.refunded              -> sales_invoices refund + reverse ledger entries for that invoice
+ *   invoice.paid                 -> commission_entries (the ledger)
+ *   charge.refunded              -> reverse ledger entries for that invoice
  *   account.updated              -> partner_payout_accounts status
  *   transfer.reversed            -> payouts + ledger entries reversed
  *   (a Transfer settles synchronously on create; there is no transfer.paid)
@@ -36,7 +35,6 @@ const connect = require("../../services/stripeConnectAccounts");
 const pricing = require("../../services/pricing");
 const purchaseCodes = require("../../services/purchaseCodes");
 const paymentEmails = require("../../services/paymentEmails");
-const salesInvoices = require("../../services/salesInvoices");
 const { resolvePartnerCode } = require("../../utils/partnerCodeResolver");
 
 function toMysqlDateTime(unixSeconds) {
@@ -203,9 +201,6 @@ async function onCheckoutSessionCompleted(stripe, session) {
     limit: 12,
   });
   for (const inv of paid.data) {
-    await salesInvoices.recordPaidSafe(inv);
-  }
-  for (const inv of paid.data) {
     await recordInvoice(inv);
   }
 }
@@ -247,7 +242,6 @@ async function onPaymentIntentFailed(stripe, pi) {
 /** Renewal payment failed (Stripe keeps retrying per the dunning settings). */
 async function onInvoicePaymentFailed(invoice) {
   if (!paymentEmails.invoiceIsOurs(invoice)) return;
-  await salesInvoices.recordFailedSafe(invoice, Math.floor(Date.now() / 1000));
   if (invoice.billing_reason === "subscription_create") return; // handled by onPaymentIntentFailed
   const mail = await paymentEmails.sendPaymentFailed({
     to: invoice.customer_email,
@@ -322,25 +316,17 @@ async function onSubscriptionChanged(subscription) {
 }
 
 async function onInvoicePaid(invoice) {
-  await salesInvoices.recordPaidSafe(invoice);
   await recordInvoice(invoice);
 }
 
 async function onChargeRefunded(stripe, charge) {
-  // Find the invoice for this charge and reverse its ledger entries. Charges no
-  // longer carry `invoice` on current API versions; the invoice is found
-  // through its invoice payment (invoices.list has no payment_intent filter).
+  // Find the invoice for this charge and reverse its ledger entries.
   let invoiceId = charge.invoice ? String(charge.invoice) : null;
   if (!invoiceId && charge.payment_intent) {
-    const pi = typeof charge.payment_intent === "string" ? charge.payment_intent : charge.payment_intent.id;
-    invoiceId = await salesInvoices.invoiceIdForPaymentIntent(stripe, pi);
+    const invoices = await stripe.invoices.list({ payment_intent: String(charge.payment_intent), limit: 1 });
+    invoiceId = invoices.data[0]?.id || null;
   }
   if (!invoiceId) return;
-  await salesInvoices.recordRefundSafe({
-    stripeInvoiceId: invoiceId,
-    amountRefundedMinor: charge.amount_refunded,
-    refundedAtUnix: Math.floor(Date.now() / 1000),
-  });
   await ledger.reverseInvoice({ stripeInvoiceId: invoiceId, reason: `charge.refunded ${charge.id}` });
 }
 
