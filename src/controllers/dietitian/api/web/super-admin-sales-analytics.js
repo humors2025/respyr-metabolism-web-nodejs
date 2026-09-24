@@ -326,7 +326,8 @@ async function trainerHierarchy(codes, items) {
   if (missing.length) {
     const [inv] = await pool.query(
       `
-        SELECT UPPER(partner_code) AS code, invited_role AS role, LOWER(parent_user_id) AS parent_user_id, facility_id
+        SELECT UPPER(partner_code) AS code, invited_role AS role, LOWER(parent_user_id) AS parent_user_id,
+               facility_id, NULLIF(facility_name, '') AS facility_name
         FROM app_user_invitations
         WHERE UPPER(partner_code) IN (?)
         ORDER BY id DESC
@@ -334,7 +335,45 @@ async function trainerHierarchy(codes, items) {
       [missing]
     );
     for (const r of inv) {
-      if (!map.has(r.code)) map.set(r.code, { role: r.role, parent_user_id: r.parent_user_id || null, facility_id: r.facility_id });
+      if (!map.has(r.code)) {
+        map.set(r.code, {
+          role: r.role,
+          parent_user_id: r.parent_user_id || null,
+          facility_id: r.facility_id,
+          invited_facility_name: r.facility_name || null,
+        });
+      }
+    }
+  }
+
+  // A code the account no longer holds (re-issued code, removed role row):
+  // fall back to the account the sale was attributed to, by email.
+  const emailByCode = new Map();
+  for (const i of items) {
+    const code = i.code || i.linkedCode;
+    if (code && i.raw.attributed_user_id && !emailByCode.has(code)) emailByCode.set(code, String(i.raw.attributed_user_id).toLowerCase());
+  }
+  const needAccount = codes.filter((c) => !map.get(c)?.parent_user_id && emailByCode.get(c));
+  if (needAccount.length) {
+    const [acc] = await pool.query(
+      `
+        SELECT LOWER(user_id) AS email, role, LOWER(parent_user_id) AS parent_user_id, facility_id
+        FROM app_user_roles
+        WHERE LOWER(user_id) IN (?)
+      `,
+      [[...new Set(needAccount.map((c) => emailByCode.get(c)))]]
+    );
+    const byEmail = new Map(acc.map((a) => [a.email, a]));
+    for (const c of needAccount) {
+      const a = byEmail.get(emailByCode.get(c));
+      if (!a) continue;
+      const h = map.get(c) || {};
+      map.set(c, {
+        ...h,
+        role: h.role || a.role,
+        parent_user_id: h.parent_user_id || a.parent_user_id || null,
+        facility_id: h.facility_id ?? a.facility_id,
+      });
     }
   }
 
@@ -347,14 +386,24 @@ async function trainerHierarchy(codes, items) {
     map.set(code, h);
   }
 
+  // Facilities by id, plus by the code itself / the owner's email for facility
+  // admins whose role row has no facility_id.
   const facilityIds = [...new Set([...map.values()].map((h) => h.facility_id).filter((v) => v != null).map(Number))];
+  const ownerEmails = [...new Set(codes.map((c) => emailByCode.get(c)).filter(Boolean))];
   const facilities = new Map();
-  if (facilityIds.length) {
-    const [fs] = await pool.query(
-      `SELECT id, name, UPPER(partner_code) AS partner_code, LOWER(facility_admin_user_id) AS admin_user_id, status FROM facilities WHERE id IN (?)`,
-      [facilityIds]
-    );
-    for (const f of fs) facilities.set(Number(f.id), f);
+  const [fs] = await pool.query(
+    `
+      SELECT id, name, UPPER(partner_code) AS partner_code, LOWER(facility_admin_user_id) AS admin_user_id, status
+      FROM facilities
+      WHERE id IN (?) OR UPPER(partner_code) IN (?) OR LOWER(facility_admin_user_id) IN (?)
+    `,
+    [facilityIds.length ? facilityIds : [0], codes, ownerEmails.length ? ownerEmails : [""]]
+  );
+  for (const f of fs) facilities.set(Number(f.id), f);
+  for (const [code, h] of map) {
+    if (h.facility_id != null) continue;
+    const f = fs.find((x) => x.partner_code === code || (emailByCode.get(code) && x.admin_user_id === emailByCode.get(code)));
+    if (f) h.facility_id = f.id;
   }
 
   const emails = [
@@ -384,7 +433,10 @@ async function trainerHierarchy(codes, items) {
             admin_user_id: f.admin_user_id,
             admin_name: names.get(f.admin_user_id) || null,
           }
-        : null,
+        : h.invited_facility_name
+          ? // Invited but never set up: only the name typed on the invitation exists.
+            { id: null, name: h.invited_facility_name, partner_code: null, status: "invited", admin_user_id: null, admin_name: null }
+          : null,
     });
   }
   return out;
