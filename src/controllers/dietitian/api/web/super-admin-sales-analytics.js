@@ -34,7 +34,7 @@
  * Body: { view: "overview" | "purchases", period: week|month|year,
  *         date_from, date_to (YYYY-MM-DD, inclusive, viewer's calendar),
  *         tz_offset_minutes,
- *         purchases only: source, subscription_status, payment_status, search, page, limit }
+ *         purchases only: source, partner_code, subscription_status, payment_status, search, page, limit }
  */
 
 const pool = require("../../../../config/db");
@@ -45,7 +45,6 @@ const YMD = /^\d{4}-\d{2}-\d{2}$/;
 const PERIODS = new Set(["week", "month", "year"]);
 const SOURCES = new Set(["all", "website", "trainer_code"]);
 const SEARCH_MIN_LENGTH = 3;
-const TOP_TRAINERS_MAX = 50;
 const PLAN_NAMES = { [PLAN_CODE]: "Rysflo Membership" };
 const UNPAID_SUB_STATUSES = new Set(["incomplete", "incomplete_expired"]);
 
@@ -124,7 +123,7 @@ async function loadPurchases(p) {
       SELECT
         rs.id, rs.stripe_subscription_id, rs.stripe_checkout_session_id, rs.stripe_customer_id,
         rs.purchaser_email, rs.purchaser_name, rs.profile_id,
-        rs.attributed_partner_code, rs.stripe_promotion_code_id, rs.qr_id,
+        rs.attributed_partner_code, rs.attributed_user_id, rs.stripe_promotion_code_id, rs.qr_id,
         rs.purchase_code, rs.plan_code, rs.currency, rs.unit_amount_minor,
         rs.status, rs.current_period_end, rs.canceled_at, rs.created_at,
         (
@@ -135,6 +134,15 @@ async function loadPurchases(p) {
           ORDER BY ps.id DESC
           LIMIT 1
         ) AS coupon_off_minor,
+        (
+          -- Fallback when the coupon was replaced (pricing re-saved, e.g. after a
+          -- Stripe account change): the referral discount in effect that day.
+          SELECT ps.list_price_minor - ps.referred_price_minor
+          FROM pricing_settings ps
+          WHERE ps.effective_from <= rs.created_at
+          ORDER BY ps.effective_from DESC, ps.id DESC
+          LIMIT 1
+        ) AS pricing_off_minor,
         (
           SELECT ce.stripe_invoice_id
           FROM commission_entries ce
@@ -191,7 +199,10 @@ async function loadPurchases(p) {
     const code = String(r.attributed_partner_code || "").toUpperCase();
     const usedCodeAtCheckout = !!code && !!(r.stripe_promotion_code_id || r.qr_id);
     const gross = Number(r.unit_amount_minor) || 0;
-    const couponOff = r.coupon_off_minor == null ? null : Math.max(0, Number(r.coupon_off_minor));
+    const couponOff =
+      r.coupon_off_minor != null ? Math.max(0, Number(r.coupon_off_minor))
+      : r.pricing_off_minor != null ? Math.max(0, Number(r.pricing_off_minor))
+      : null;
     // The earliest ledger invoice is the purchase itself only if it was paid
     // at checkout time; a member attributed later has ledger rows for renewals only.
     const createdMs = toMs(r.created_at);
@@ -206,7 +217,8 @@ async function loadPurchases(p) {
       net = invoiceNet;
       discount = Math.max(0, gross - invoiceNet);
     } else {
-      discount = r.stripe_promotion_code_id ? couponOff ?? 0 : 0;
+      // A code or sticker at checkout always applies the referral coupon.
+      discount = usedCodeAtCheckout || r.stripe_promotion_code_id ? Math.min(gross, couponOff ?? 0) : 0;
       net = Math.max(0, gross - discount);
     }
 
@@ -233,20 +245,67 @@ async function loadPurchases(p) {
   });
 }
 
-async function trainerDirectory(codes) {
-  if (!codes.length) return new Map();
+/**
+ * Trainer name per partner code. Codes can belong to an active role row, to a
+ * user who has since been removed (name still found through the purchase's
+ * attributed_user_id), or to a pending invitation.
+ */
+async function trainerDirectory(codes, emailByCode = new Map()) {
+  const map = new Map();
+  if (!codes.length) return map;
+
   const [rows] = await pool.query(
     `
-      SELECT UPPER(aur.partner_code) AS code, td.dietician_id, COALESCE(NULLIF(td.name, ''), aur.user_id) AS name
+      SELECT UPPER(aur.partner_code) AS code, td.dietician_id, NULLIF(td.name, '') AS name, LOWER(aur.user_id) AS email
       FROM app_user_roles aur
       LEFT JOIN table_dietician td ON LOWER(td.email) = LOWER(aur.user_id)
       WHERE UPPER(aur.partner_code) IN (?)
     `,
     [codes]
   );
-  const map = new Map();
-  for (const r of rows) if (!map.has(r.code)) map.set(r.code, { trainer_id: r.dietician_id || null, name: r.name || null });
+  for (const r of rows) if (!map.has(r.code) && r.name) map.set(r.code, { trainer_id: r.dietician_id || null, name: r.name, email: r.email || null });
+
+  const byEmail = codes.filter((c) => !map.has(c) && emailByCode.get(c));
+  if (byEmail.length) {
+    const [tds] = await pool.query(
+      `SELECT LOWER(email) AS email, dietician_id, NULLIF(name, '') AS name FROM table_dietician WHERE LOWER(email) IN (?)`,
+      [byEmail.map((c) => emailByCode.get(c))]
+    );
+    const tdByEmail = new Map(tds.map((t) => [t.email, t]));
+    for (const c of byEmail) {
+      const t = tdByEmail.get(emailByCode.get(c));
+      if (t?.name) map.set(c, { trainer_id: t.dietician_id || null, name: t.name, email: t.email });
+    }
+  }
+
+  const rest = codes.filter((c) => !map.has(c));
+  if (rest.length) {
+    const [inv] = await pool.query(
+      `
+        SELECT UPPER(partner_code) AS code,
+               NULLIF(TRIM(CONCAT_WS(' ', invited_first_name, invited_last_name)), '') AS name,
+               facility_name, LOWER(invited_email) AS email
+        FROM app_user_invitations
+        WHERE UPPER(partner_code) IN (?)
+        ORDER BY id DESC
+      `,
+      [rest]
+    );
+    for (const r of inv) if (!map.has(r.code) && (r.name || r.facility_name)) map.set(r.code, { trainer_id: null, name: r.name || r.facility_name, email: r.email || null });
+  }
+  // Still unnamed: at least show the account the sale was attributed to.
+  for (const c of codes) if (!map.has(c) && emailByCode.get(c)) map.set(c, { trainer_id: null, name: null, email: emailByCode.get(c) });
+  for (const [c, v] of map) if (!v.email && emailByCode.get(c)) v.email = emailByCode.get(c);
   return map;
+}
+
+function emailsByCode(items) {
+  const m = new Map();
+  for (const i of items) {
+    const code = i.code || i.linkedCode;
+    if (code && i.raw.attributed_user_id && !m.has(code)) m.set(code, String(i.raw.attributed_user_id).toLowerCase());
+  }
+  return m;
 }
 
 // Chooses the currency to report: the one carrying the most revenue.
@@ -298,7 +357,7 @@ async function overview(p) {
   }
 
   const ranked = [...trainers.entries()].sort((a, b) => b[1].net - a[1].net || b[1].purchases - a[1].purchases);
-  const directory = await trainerDirectory(ranked.slice(0, TOP_TRAINERS_MAX).map(([code]) => code));
+  const directory = await trainerDirectory(ranked.map(([code]) => code), emailsByCode(counted));
   const [[active]] = await pool.query(`SELECT COUNT(*) AS n FROM referral_subscriptions WHERE status = 'active'`);
 
   const channel = (c) => ({
@@ -336,8 +395,9 @@ async function overview(p) {
         website_purchases: b.website.purchases,
         trainer_purchases: b.trainer_code.purchases,
       })),
-    top_trainers: ranked.slice(0, TOP_TRAINERS_MAX).map(([code, t]) => ({
+    top_trainers: ranked.map(([code, t]) => ({
       trainer_id: directory.get(code)?.trainer_id || null,
+      trainer_email: directory.get(code)?.email || null,
       trainer_name: directory.get(code)?.name || null,
       partner_code: code,
       purchases: t.purchases,
@@ -360,6 +420,8 @@ async function purchases(p, body) {
   }
   if (search.length > 100) throw httpError(422, "Search is too long");
 
+  const partnerCode = String(body.partner_code || "").trim().toUpperCase();
+  if (partnerCode.length > 50) throw httpError(422, "Invalid partner_code");
   const subStatus = String(body.subscription_status || "all").toLowerCase();
   const payStatus = String(body.payment_status || "all").toLowerCase();
 
@@ -373,6 +435,7 @@ async function purchases(p, body) {
 
   const filtered = items.filter((i) => {
     if (source !== "all" && i.source !== source) return false;
+    if (partnerCode && i.code !== partnerCode) return false;
     if (subStatus !== "all" && i.subStatus !== subStatus) return false;
     if (payStatus !== "all" && i.paymentStatus !== payStatus) return false;
     if (search) {
@@ -387,7 +450,10 @@ async function purchases(p, body) {
 
   const total = filtered.length;
   const pageItems = filtered.slice((page - 1) * limit, page * limit);
-  const directory = await trainerDirectory([...new Set(pageItems.flatMap((i) => [i.code, i.linkedCode]).filter(Boolean))]);
+  const directory = await trainerDirectory(
+    [...new Set(pageItems.flatMap((i) => [i.code, i.linkedCode]).filter(Boolean))],
+    emailsByCode(pageItems)
+  );
 
   const data = pageItems.map((i) => {
     const r = i.raw;
@@ -401,10 +467,17 @@ async function purchases(p, body) {
       },
       plan: { code: r.plan_code, name: PLAN_NAMES[r.plan_code] || r.plan_code },
       purchase_source: i.source,
-      trainer: i.code ? { trainer_id: directory.get(i.code)?.trainer_id || null, name: directory.get(i.code)?.name || null } : null,
+      trainer: i.code
+        ? {
+            trainer_id: directory.get(i.code)?.trainer_id || null,
+            name: directory.get(i.code)?.name || null,
+            email: directory.get(i.code)?.email || null,
+          }
+        : null,
       attributed_partner_code: i.code,
       linked_partner_code: i.linkedCode,
       linked_trainer_name: i.linkedCode ? directory.get(i.linkedCode)?.name || null : null,
+      linked_trainer_email: i.linkedCode ? directory.get(i.linkedCode)?.email || null : null,
       purchase_code: r.purchase_code || null,
       coupon_code: i.discount > 0 ? i.code || r.stripe_promotion_code_id || null : null,
       currency: i.currency,
@@ -429,7 +502,7 @@ async function purchases(p, body) {
   return {
     filters: {
       period: p.period, date_from: p.dateFrom, date_to: p.dateTo, tz_offset_minutes: p.offset,
-      source, subscription_status: subStatus, payment_status: payStatus, search, search_min_length: SEARCH_MIN_LENGTH,
+      source, partner_code: partnerCode || null, subscription_status: subStatus, payment_status: payStatus, search, search_min_length: SEARCH_MIN_LENGTH,
     },
     purchases: data,
     pagination: { page, limit, total, total_pages: Math.max(1, Math.ceil(total / limit)) },
