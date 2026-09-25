@@ -320,6 +320,8 @@ const {
   listPayouts,
   commissionOverview,
 } = require("../controllers/dietitian/api/web/commission-ops");
+const { superAdminSalesAnalytics } = require("../controllers/dietitian/api/web/super-admin-sales-analytics");
+const { superAdminOrders } = require("../controllers/dietitian/api/web/super-admin-orders");
 
 
 const {
@@ -1065,6 +1067,8 @@ router.post("/dietitian/api/web/run-breath-credits", authMiddleware, runBreathCr
 router.post("/dietitian/api/web/run-payouts", authMiddleware, runPayoutsEndpoint);
 router.post("/dietitian/api/web/list-payouts", authMiddleware, listPayouts);
 router.post("/dietitian/api/web/commission-overview", authMiddleware, commissionOverview);
+router.post("/dietitian/api/web/super-admin-sales-analytics", authMiddleware, superAdminSalesAnalytics);
+router.post("/dietitian/api/web/super-admin-orders", authMiddleware, superAdminOrders);
 router.post("/dietitian/api/web/earnings-summary", authMiddleware, earningsSummary);
 router.post("/dietitian/api/web/list-facilities", authMiddleware, listFacilities);
 
