@@ -11,7 +11,9 @@
  *                  payment, each renewal, failed payments and refunds
  *
  * Both join referral_subscriptions (by stripe_subscription_id) for the buyer's
- * email / name and the partner code used.
+ * email / name and the partner code used. Shipping rows also carry the plan's
+ * current_period_start / current_period_end and a derived subscription_status:
+ * a Stripe "active" plan whose period end has passed is reported as "expired".
  *
  * Body: { view: "shipping" | "payments", search?, page?, limit?,
  *         payments only: status? ("all" | open | paid | failed | refunded | partially_refunded) }
@@ -31,6 +33,21 @@ function toIso(v) {
   if (!v) return null;
   const ms = v instanceof Date ? v.getTime() : Date.parse(String(v).replace(" ", "T") + "Z");
   return Number.isNaN(ms) ? null : new Date(ms).toISOString().replace(".000Z", "Z");
+}
+
+// Stripe status → what the page shows. "expired" is derived: Stripe keeps the
+// last status it sent (usually "active") once a plan's period is over and no
+// renewal invoice was paid, so the end date decides.
+const SUB_STATUS_LABEL = { canceled: "cancelled", incomplete_expired: "expired" };
+const RUNNING_SUB_STATUSES = new Set(["active", "trialing", "past_due"]);
+
+function deriveSubscriptionStatus(row, now = Date.now()) {
+  const raw = row.subscription_status ? String(row.subscription_status).toLowerCase() : null;
+  if (!raw) return null;
+  if (row.canceled_at || raw === "canceled") return "cancelled";
+  const endIso = toIso(row.current_period_end);
+  if (RUNNING_SUB_STATUSES.has(raw) && endIso && Date.parse(endIso) < now) return "expired";
+  return SUB_STATUS_LABEL[raw] || raw;
 }
 
 function httpError(status, message) {
@@ -82,6 +99,7 @@ async function shipping(body) {
         sa.id, sa.stripe_subscription_id, sa.name, sa.phone, sa.line1, sa.line2, sa.city,
         sa.state, sa.postal_code, sa.country, sa.created_at,
         rs.purchaser_email, rs.purchaser_name, rs.attributed_partner_code, rs.status AS subscription_status,
+        rs.current_period_start, rs.current_period_end, rs.canceled_at,
         rs.created_at AS purchased_at
       ${from} ${whereSql}
       ORDER BY sa.id DESC
@@ -90,6 +108,7 @@ async function shipping(body) {
     [...params, limit, offset]
   );
 
+  const now = Date.now();
   return {
     filters: { search, search_min_length: SEARCH_MIN_LENGTH },
     addresses: rows.map((r) => ({
@@ -107,7 +126,11 @@ async function shipping(body) {
         country: r.country || null,
       },
       partner_code: r.attributed_partner_code || null,
-      subscription_status: r.subscription_status || null,
+      subscription_status: deriveSubscriptionStatus(r, now),
+      stripe_status: r.subscription_status || null,
+      current_period_start: toIso(r.current_period_start),
+      current_period_end: toIso(r.current_period_end),
+      canceled_at: toIso(r.canceled_at),
       stripe_subscription_id: r.stripe_subscription_id,
     })),
     pagination: { page, limit, total: Number(total), total_pages: Math.max(1, Math.ceil(Number(total) / limit)) },
