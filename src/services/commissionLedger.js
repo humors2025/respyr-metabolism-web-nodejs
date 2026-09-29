@@ -17,11 +17,16 @@
  * attributed user's *current* standing: a removed trainer's share goes to
  * their parent, matching remove-user.js.
  *
+ * A refund first tries a Stripe transfer reversal to pull an already-paid
+ * commission back out of the payee's balance, and only nets it off their next
+ * payout when that is no longer possible.
+ *
  * Every write is append-only; reversals add status='reversed' to existing
  * rows rather than deleting them. All money is integer minor units.
  */
 
 const pool = require("../config/db");
+const { requireStripe } = require("../config/stripe");
 const { resolvePartnerCode } = require("../utils/partnerCodeResolver");
 
 function lower(v) {
@@ -270,17 +275,60 @@ async function reverseInvoice({ stripeInvoiceId, reason }) {
     `,
     [String(reason).slice(0, 255), stripeInvoiceId]
   );
-  // Already-paid entries cannot be pulled back from a transfer that has
-  // settled; they are flagged for netting against the payee's next payout.
-  await pool.execute(
+  // Already-paid entries: try to pull the money back out of the payee's Stripe
+  // balance with a transfer reversal. That only works while the funds are still
+  // there — once the payee has paid out to their bank, Stripe refuses, and we
+  // fall back to netting the amount off their next payout (which recovers
+  // nothing if they never earn again, hence trying the reversal first).
+  const [paidRows] = await pool.execute(
     `
-      UPDATE commission_entries
-      SET reversed_by_invoice_id = ?, updated_at = UTC_TIMESTAMP()
-      WHERE stripe_invoice_id = ? AND status = 'paid' AND reversed_by_invoice_id IS NULL
+      SELECT ce.id, ce.amount_minor, ce.payee_user_id, p.stripe_transfer_id
+      FROM commission_entries ce
+      LEFT JOIN payouts p ON p.id = ce.payout_id
+      WHERE ce.stripe_invoice_id = ? AND ce.status = 'paid'
+        AND ce.reversed_by_invoice_id IS NULL AND ce.stripe_reversal_id IS NULL
     `,
-    [stripeInvoiceId, stripeInvoiceId]
+    [stripeInvoiceId]
   );
-  return { reversed: res.affectedRows };
+
+  let recovered = 0;
+  for (const row of paidRows) {
+    let reversalId = null;
+    if (row.stripe_transfer_id) {
+      try {
+        const rev = await requireStripe().transfers.createReversal(
+          row.stripe_transfer_id,
+          { amount: Number(row.amount_minor), description: `Refund of invoice ${stripeInvoiceId}` },
+          { idempotencyKey: `reversal-${row.id}-${stripeInvoiceId}` }
+        );
+        reversalId = rev.id;
+      } catch (err) {
+        // insufficient_funds on the connected account is the expected case, not a bug
+        console.warn("TRANSFER_REVERSAL_FALLBACK:", {
+          entry: row.id, transfer: row.stripe_transfer_id, code: err?.code, message: err?.message,
+        });
+      }
+    }
+
+    if (reversalId) {
+      await pool.execute(
+        `
+          UPDATE commission_entries
+          SET status = 'reversed', stripe_reversal_id = ?, hold_reason = ?, updated_at = UTC_TIMESTAMP()
+          WHERE id = ?
+        `,
+        [reversalId, String(reason).slice(0, 255), row.id]
+      );
+      recovered += 1;
+    } else {
+      await pool.execute(
+        `UPDATE commission_entries SET reversed_by_invoice_id = ?, updated_at = UTC_TIMESTAMP() WHERE id = ?`,
+        [stripeInvoiceId, row.id]
+      );
+    }
+  }
+
+  return { reversed: res.affectedRows, transfers_reversed: recovered, netted: paidRows.length - recovered };
 }
 
 /**
