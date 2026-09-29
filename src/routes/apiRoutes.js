@@ -1093,10 +1093,13 @@ router.post("/dietitian/api/web/list-trainer-admins", authMiddleware, referralOp
 router.post("/dietitian/api/web/get-pricing", authMiddleware, referralOps.getPricing);
 router.post("/dietitian/api/web/set-pricing", authMiddleware, requireSettingsUnlock, referralOps.setPricingEndpoint);
 
-// Super Admin › Settings email-code gate (services/settingsLock.js).
+// Super Admin › Settings Google Authenticator gate (services/settingsLock.js).
 router.post("/dietitian/api/web/settings-lock-status", authMiddleware, settingsLock.settingsLockStatus);
 router.post("/dietitian/api/web/settings-lock-request", authMiddleware, settingsLock.settingsLockRequest);
-router.post("/dietitian/api/web/settings-lock-verify", authMiddleware, settingsLock.settingsLockVerify);
+router.post("/dietitian/api/web/settings-lock-verify", authMiddleware, settingsLock.settingsCodeRateLimiter, settingsLock.settingsLockVerify);
+router.post("/dietitian/api/web/settings-mfa-setup", authMiddleware, settingsLock.settingsMfaSetup);
+router.post("/dietitian/api/web/settings-mfa-confirm", authMiddleware, settingsLock.settingsCodeRateLimiter, settingsLock.settingsMfaConfirm);
+router.post("/dietitian/api/web/settings-mfa-verify", authMiddleware, settingsLock.settingsCodeRateLimiter, settingsLock.settingsMfaVerify);
 
 
 router.post(

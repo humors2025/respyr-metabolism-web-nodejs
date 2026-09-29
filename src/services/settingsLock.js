@@ -1,17 +1,22 @@
 "use strict";
 
 /**
- * settingsLock.js — email code gate for Super Admin › Settings.
+ * settingsLock.js — Google Authenticator (TOTP) gate for Super Admin › Settings.
  *
  * The Settings page changes platform pricing and the commission rate, so a
- * signed-in super admin must also enter a 6-digit code emailed to a fixed
- * inbox (SETTINGS_OTP_EMAIL) before the page unlocks.
+ * signed-in super admin must also enter the 6-digit code from their
+ * authenticator app before the page unlocks.
  *
  * FLOW
- *   1. requestCode(actorId)      -> code emailed to SETTINGS_OTP_EMAIL
- *   2. verifyCode(actorId, sid, code) -> unlocks THIS login session (sid)
- *   3. isUnlocked(actorId, sid)  -> checked by requireSettingsUnlock on every
- *                                   settings write
+ *   First time (no authenticator yet):
+ *     1. requestCode / verifyCode  -> 6-digit code emailed to SETTINGS_OTP_EMAIL
+ *        proves the enrolment is allowed (a stolen password alone can't enrol)
+ *     2. startMfaSetup / confirmMfaSetup -> QR code scanned into Google
+ *        Authenticator, confirmed with one app code; 8 backup codes issued
+ *   Every time after:
+ *     verifyMfa(code)  -> app code (or a one-time backup code) unlocks
+ *   Guard:
+ *     requireSettingsUnlock -> session unlocked AND authenticator enrolled
  *
  * The unlock is bound to the login session id (JWT `sid` =
  * dietician_refresh_tokens.id), which stays the same across access-token
@@ -19,12 +24,20 @@
  * It is also capped at SETTINGS_UNLOCK_HOURS, because a login session can
  * last JWT_REFRESH_TTL_DAYS (30 days).
  *
- * STORAGE — reuses `otp_verifications` (see dietitianOtpStore.js) under two
+ * STORAGE — reuses `otp_verifications` (see dietitianOtpStore.js) under
  * dedicated purposes; every statement filters on purpose so other flows'
- * rows are never touched. The `email` column holds the key "sa:<dietician_id>"
- * (the code belongs to the admin who asked for it, not to the inbox).
- *   settings_otp    : otp_code = bcrypt(code), attempts, expires_at
- *   settings_unlock : otp_code = sha256(sid),  expires_at
+ * rows are never touched. The `email` column holds the key "sa:<dietician_id>".
+ *   settings_otp        : otp_code = bcrypt(email code), attempts, expires_at
+ *   settings_unlock     : otp_code = sha256(sid), expires_at
+ *   settings_mfa_pending: otp_code = encrypted TOTP secret, 10-minute expiry
+ *   settings_mfa        : otp_code = encrypted TOTP secret, attempts = last
+ *                         used 30s time step (blocks code replay), no expiry
+ *   settings_mfa_backup : otp_code = bcrypt(backup code), one row per code
+ * TOTP secrets are AES-256-GCM encrypted with SETTINGS_MFA_KEY (falls back to
+ * a key derived from JWT_SECRET — rotating that secret means re-enrolling).
+ *
+ * Lost phone and backup codes: delete the admin's settings_mfa and
+ * settings_mfa_backup rows; the next visit starts enrolment again via email.
  */
 
 const crypto = require("crypto");
@@ -35,6 +48,10 @@ const pool = require("../config/db");
 const TABLE = "otp_verifications";
 const PURPOSE_OTP = "settings_otp";
 const PURPOSE_UNLOCK = "settings_unlock";
+const PURPOSE_MFA_PENDING = "settings_mfa_pending";
+const PURPOSE_MFA = "settings_mfa";
+const PURPOSE_MFA_BACKUP = "settings_mfa_backup";
+const NEVER_EXPIRES = "2099-12-31 23:59:59";
 
 function intEnv(name, def, min, max) {
   const v = parseInt(process.env[name], 10);
@@ -48,6 +65,9 @@ const OTP_TTL_SECONDS = intEnv("SETTINGS_OTP_TTL_SECONDS", 300, 60, 1800);
 const OTP_RESEND_COOLDOWN_SECONDS = intEnv("SETTINGS_OTP_RESEND_COOLDOWN_SECONDS", 60, 0, 3600);
 const OTP_MAX_VERIFY_ATTEMPTS = intEnv("SETTINGS_OTP_MAX_ATTEMPTS", 5, 1, 10);
 const UNLOCK_HOURS = intEnv("SETTINGS_UNLOCK_HOURS", 8, 1, 720);
+const MFA_ISSUER = process.env.SETTINGS_MFA_ISSUER || "Rysflo Settings";
+const MFA_SETUP_TTL_SECONDS = 600;
+const BACKUP_CODE_COUNT = 8;
 
 const RESEND_API_KEY = process.env.RESEND_API_KEY || "";
 const RESEND_FROM_EMAIL = process.env.RESEND_FROM_EMAIL || "Rysflo <no-reply@respyr.ai>";
@@ -66,13 +86,121 @@ function maskEmail(email) {
 async function pruneExpired() {
   try {
     await pool.execute(
-      `DELETE FROM ${TABLE} WHERE purpose IN (?, ?) AND expires_at <= NOW()`,
-      [PURPOSE_OTP, PURPOSE_UNLOCK]
+      `DELETE FROM ${TABLE} WHERE purpose IN (?, ?, ?) AND expires_at <= NOW()`,
+      [PURPOSE_OTP, PURPOSE_UNLOCK, PURPOSE_MFA_PENDING]
     );
   } catch (err) {
     console.error("SETTINGS_LOCK_PRUNE_FAILED:", err?.code || err?.message);
   }
 }
+
+// ─── TOTP (RFC 6238: SHA-1, 6 digits, 30s — what Google Authenticator uses) ──
+
+const B32 = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+
+function base32Encode(buf) {
+  let bits = 0, value = 0, out = "";
+  for (const byte of buf) {
+    value = (value << 8) | byte;
+    bits += 8;
+    while (bits >= 5) {
+      out += B32[(value >>> (bits - 5)) & 31];
+      bits -= 5;
+    }
+  }
+  if (bits > 0) out += B32[(value << (5 - bits)) & 31];
+  return out;
+}
+
+function base32Decode(str) {
+  let bits = 0, value = 0;
+  const out = [];
+  for (const ch of String(str).replace(/=+$/, "").toUpperCase()) {
+    const idx = B32.indexOf(ch);
+    if (idx === -1) continue;
+    value = (value << 5) | idx;
+    bits += 5;
+    if (bits >= 8) {
+      out.push((value >>> (bits - 8)) & 255);
+      bits -= 8;
+    }
+  }
+  return Buffer.from(out);
+}
+
+function hotp(secret, counter) {
+  const msg = Buffer.alloc(8);
+  msg.writeBigUInt64BE(BigInt(counter));
+  const h = crypto.createHmac("sha1", secret).update(msg).digest();
+  const offset = h[h.length - 1] & 0xf;
+  return String((h.readUInt32BE(offset) & 0x7fffffff) % 1_000_000).padStart(6, "0");
+}
+
+const currentStep = () => Math.floor(Date.now() / 1000 / 30);
+
+/** Time step the code belongs to (±1 step for clock drift), or null. */
+function matchTotp(secretB32, code) {
+  const secret = base32Decode(secretB32);
+  const now = currentStep();
+  for (const step of [now - 1, now, now + 1]) {
+    if (crypto.timingSafeEqual(Buffer.from(hotp(secret, step)), Buffer.from(code))) return step;
+  }
+  return null;
+}
+
+// ─── Secret encryption ────────────────────────────────────────────────────────
+
+function mfaKey() {
+  if (process.env.SETTINGS_MFA_KEY) return crypto.createHash("sha256").update(process.env.SETTINGS_MFA_KEY).digest();
+  if (!process.env.JWT_SECRET) throw new Error("SETTINGS_MFA_KEY or JWT_SECRET required");
+  return Buffer.from(crypto.hkdfSync("sha256", process.env.JWT_SECRET, "rysflo-settings-mfa", "totp-secret", 32));
+}
+
+function encryptSecret(plain) {
+  const iv = crypto.randomBytes(12);
+  const c = crypto.createCipheriv("aes-256-gcm", mfaKey(), iv);
+  const ct = Buffer.concat([c.update(plain, "utf8"), c.final()]);
+  return ["v1", iv.toString("base64"), c.getAuthTag().toString("base64"), ct.toString("base64")].join(":");
+}
+
+function decryptSecret(stored) {
+  const [v, iv, tag, ct] = String(stored).split(":");
+  if (v !== "v1") throw new Error("unknown secret format");
+  const d = crypto.createDecipheriv("aes-256-gcm", mfaKey(), Buffer.from(iv, "base64"));
+  d.setAuthTag(Buffer.from(tag, "base64"));
+  return Buffer.concat([d.update(Buffer.from(ct, "base64")), d.final()]).toString("utf8");
+}
+
+// ─── Session unlock ───────────────────────────────────────────────────────────
+
+async function grantUnlock(actorId, sid) {
+  const key = keyFor(actorId);
+  const sidHash = sha256(sid);
+  await pool.execute(`DELETE FROM ${TABLE} WHERE email = ? AND purpose = ? AND otp_code = ?`, [key, PURPOSE_UNLOCK, sidHash]);
+  await pool.execute(
+    `INSERT INTO ${TABLE} (email, otp_code, purpose, is_verified, attempts, expires_at, verified_at)
+     VALUES (?, ?, ?, 1, 0, DATE_ADD(NOW(), INTERVAL ? HOUR), NOW())`,
+    [key, sidHash, PURPOSE_UNLOCK, UNLOCK_HOURS]
+  );
+  return UNLOCK_HOURS * 3600;
+}
+
+/** Seconds of unlock left for this admin's login session (0 = locked). */
+async function unlockRemaining(actorId, sid) {
+  if (!actorId || !sid) return 0;
+  const [rows] = await pool.execute(
+    `SELECT TIMESTAMPDIFF(SECOND, NOW(), expires_at) AS remaining
+       FROM ${TABLE}
+      WHERE email = ? AND purpose = ? AND otp_code = ? AND expires_at > NOW()
+      ORDER BY id DESC
+      LIMIT 1`,
+    [keyFor(actorId), PURPOSE_UNLOCK, sha256(sid)]
+  );
+  const remaining = Number(rows?.[0]?.remaining);
+  return remaining > 0 ? remaining : 0;
+}
+
+// ─── Email code (first-time enrolment only) ──────────────────────────────────
 
 /** Seconds until this admin may ask for another code (0 = now). */
 async function getResendCooldown(actorId) {
@@ -95,7 +223,7 @@ async function sendCodeEmail(code, requestedBy) {
   const html = `
     <div style="font-family:Poppins,Arial,sans-serif;max-width:560px;margin:0 auto;color:#252525">
       <h2 style="margin:0 0 8px">Rysflo Settings access code</h2>
-      <p style="color:#535359">Someone signed in as <b>${String(requestedBy).replace(/[<>&"]/g, "")}</b> asked to open Super Admin › Settings.</p>
+      <p style="color:#535359">Someone signed in as <b>${String(requestedBy).replace(/[<>&"]/g, "")}</b> asked to set up Google Authenticator for Super Admin › Settings.</p>
       <p style="font-size:32px;font-weight:700;letter-spacing:6px;margin:16px 0">${code}</p>
       <p style="color:#535359">The code expires in ${minutes} minutes. If you did not expect this, do not share it.</p>
     </div>`;
@@ -116,7 +244,7 @@ async function sendCodeEmail(code, requestedBy) {
 }
 
 /**
- * Issue a fresh code for this admin and email it.
+ * Issue a fresh email code for this admin.
  * -> { ok: true, ttl, sentTo } | { ok: false, reason: 'cooldown', retryAfter } | { ok: false, reason: 'send_failed' }
  */
 async function requestCode(actorId, requestedBy) {
@@ -146,7 +274,7 @@ async function requestCode(actorId, requestedBy) {
 }
 
 /**
- * Check a code; on success unlock this login session.
+ * Check an email code; on success unlock this login session (setup still required).
  * -> { ok: true, expiresInSeconds } | { ok: false, reason: 'not_found' | 'locked' | 'mismatch', attemptsLeft? }
  */
 async function verifyCode(actorId, sid, submitted) {
@@ -175,30 +303,126 @@ async function verifyCode(actorId, sid, submitted) {
   }
 
   await pool.execute(`DELETE FROM ${TABLE} WHERE id = ?`, [record.id]);
-  const sidHash = sha256(sid);
-  await pool.execute(`DELETE FROM ${TABLE} WHERE email = ? AND purpose = ? AND otp_code = ?`, [key, PURPOSE_UNLOCK, sidHash]);
-  await pool.execute(
-    `INSERT INTO ${TABLE} (email, otp_code, purpose, is_verified, attempts, expires_at, verified_at)
-     VALUES (?, ?, ?, 1, 0, DATE_ADD(NOW(), INTERVAL ? HOUR), NOW())`,
-    [key, sidHash, PURPOSE_UNLOCK, UNLOCK_HOURS]
-  );
-  return { ok: true, expiresInSeconds: UNLOCK_HOURS * 3600 };
+  return { ok: true, expiresInSeconds: await grantUnlock(actorId, sid) };
 }
 
-/** Seconds of unlock left for this admin's login session (0 = locked). */
-async function unlockRemaining(actorId, sid) {
-  if (!actorId || !sid) return 0;
+// ─── Google Authenticator ─────────────────────────────────────────────────────
+
+async function mfaEnrolled(actorId) {
   const [rows] = await pool.execute(
-    `SELECT TIMESTAMPDIFF(SECOND, NOW(), expires_at) AS remaining
-       FROM ${TABLE}
-      WHERE email = ? AND purpose = ? AND otp_code = ? AND expires_at > NOW()
-      ORDER BY id DESC
-      LIMIT 1`,
-    [keyFor(actorId), PURPOSE_UNLOCK, sha256(sid)]
+    `SELECT id FROM ${TABLE} WHERE email = ? AND purpose = ? LIMIT 1`,
+    [keyFor(actorId), PURPOSE_MFA]
   );
-  const remaining = Number(rows?.[0]?.remaining);
-  return remaining > 0 ? remaining : 0;
+  return rows.length > 0;
 }
+
+/** New secret for the QR code; kept as pending until confirmMfaSetup. */
+async function startMfaSetup(actorId, accountLabel) {
+  const key = keyFor(actorId);
+  const secret = base32Encode(crypto.randomBytes(20));
+  await pool.execute(`DELETE FROM ${TABLE} WHERE email = ? AND purpose = ?`, [key, PURPOSE_MFA_PENDING]);
+  await pool.execute(
+    `INSERT INTO ${TABLE} (email, otp_code, purpose, is_verified, attempts, expires_at)
+     VALUES (?, ?, ?, 0, 0, DATE_ADD(NOW(), INTERVAL ? SECOND))`,
+    [key, encryptSecret(secret), PURPOSE_MFA_PENDING, MFA_SETUP_TTL_SECONDS]
+  );
+  const label = `${encodeURIComponent(MFA_ISSUER)}:${encodeURIComponent(accountLabel)}`;
+  const otpauthUrl = `otpauth://totp/${label}?secret=${secret}&issuer=${encodeURIComponent(MFA_ISSUER)}&algorithm=SHA1&digits=6&period=30`;
+  return { secret, otpauthUrl };
+}
+
+/**
+ * Confirm the pending secret with one app code: it becomes the admin's
+ * authenticator, backup codes are issued and this session is unlocked.
+ * -> { ok: true, backupCodes, expiresInSeconds } | { ok: false, reason: 'not_found' | 'mismatch' }
+ */
+async function confirmMfaSetup(actorId, sid, submitted) {
+  const key = keyFor(actorId);
+  const [rows] = await pool.execute(
+    `SELECT id, otp_code FROM ${TABLE}
+      WHERE email = ? AND purpose = ? AND expires_at > NOW()
+      ORDER BY id DESC LIMIT 1`,
+    [key, PURPOSE_MFA_PENDING]
+  );
+  const pending = rows?.[0];
+  if (!pending) return { ok: false, reason: "not_found" };
+
+  const code = String(submitted == null ? "" : submitted).trim();
+  const step = /^\d{6}$/.test(code) ? matchTotp(decryptSecret(pending.otp_code), code) : null;
+  if (step == null) return { ok: false, reason: "mismatch" };
+
+  const backupCodes = Array.from({ length: BACKUP_CODE_COUNT }, () => {
+    const hex = crypto.randomBytes(4).toString("hex");
+    return `${hex.slice(0, 4)}-${hex.slice(4)}`;
+  });
+  const backupHashes = await Promise.all(backupCodes.map((c) => bcrypt.hash(c, 10)));
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    await conn.execute(`DELETE FROM ${TABLE} WHERE email = ? AND purpose IN (?, ?, ?)`, [key, PURPOSE_MFA, PURPOSE_MFA_BACKUP, PURPOSE_MFA_PENDING]);
+    await conn.execute(
+      `INSERT INTO ${TABLE} (email, otp_code, purpose, is_verified, attempts, expires_at, verified_at)
+       VALUES (?, ?, ?, 1, ?, ?, NOW())`,
+      [key, pending.otp_code, PURPOSE_MFA, step, NEVER_EXPIRES]
+    );
+    for (const h of backupHashes) {
+      await conn.execute(
+        `INSERT INTO ${TABLE} (email, otp_code, purpose, is_verified, attempts, expires_at)
+         VALUES (?, ?, ?, 0, 0, ?)`,
+        [key, h, PURPOSE_MFA_BACKUP, NEVER_EXPIRES]
+      );
+    }
+    await conn.commit();
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
+
+  return { ok: true, backupCodes, expiresInSeconds: await grantUnlock(actorId, sid) };
+}
+
+/**
+ * Unlock with an app code, or a one-time backup code ("abcd-1234").
+ * -> { ok: true, expiresInSeconds, usedBackup, backupLeft? } | { ok: false, reason: 'not_enrolled' | 'mismatch' }
+ */
+async function verifyMfa(actorId, sid, submitted) {
+  const key = keyFor(actorId);
+  const code = String(submitted == null ? "" : submitted).trim().toLowerCase();
+
+  if (/^\d{6}$/.test(code)) {
+    const [rows] = await pool.execute(
+      `SELECT id, otp_code, attempts FROM ${TABLE} WHERE email = ? AND purpose = ? LIMIT 1`,
+      [key, PURPOSE_MFA]
+    );
+    const mfa = rows?.[0];
+    if (!mfa) return { ok: false, reason: "not_enrolled" };
+    const step = matchTotp(decryptSecret(mfa.otp_code), code);
+    // A code is good once: reject its step (or an older one) if already used.
+    if (step == null || step <= Number(mfa.attempts)) return { ok: false, reason: "mismatch" };
+    await pool.execute(`UPDATE ${TABLE} SET attempts = ?, verified_at = NOW() WHERE id = ?`, [step, mfa.id]);
+    return { ok: true, usedBackup: false, expiresInSeconds: await grantUnlock(actorId, sid) };
+  }
+
+  if (/^[0-9a-f]{4}-?[0-9a-f]{4}$/.test(code)) {
+    const normalized = code.includes("-") ? code : `${code.slice(0, 4)}-${code.slice(4)}`;
+    const [rows] = await pool.execute(
+      `SELECT id, otp_code FROM ${TABLE} WHERE email = ? AND purpose = ?`,
+      [key, PURPOSE_MFA_BACKUP]
+    );
+    for (const r of rows) {
+      if (await bcrypt.compare(normalized, r.otp_code)) {
+        await pool.execute(`DELETE FROM ${TABLE} WHERE id = ?`, [r.id]);
+        return { ok: true, usedBackup: true, backupLeft: rows.length - 1, expiresInSeconds: await grantUnlock(actorId, sid) };
+      }
+    }
+  }
+  return { ok: false, reason: "mismatch" };
+}
+
+// ─── Guard ────────────────────────────────────────────────────────────────────
 
 const actorIdOf = (req) => String(req.user?.sub || req.user?.dietician_id || "").trim();
 const sidOf = (req) => String(req.user?.sid || "").trim();
@@ -207,8 +431,9 @@ const sidOf = (req) => String(req.user?.sid || "").trim();
 async function requireSettingsUnlock(req, res, next) {
   if (req.method === "OPTIONS") return next();
   try {
-    if ((await unlockRemaining(actorIdOf(req), sidOf(req))) > 0) return next();
-    return res.status(403).json({ ok: false, code: "SETTINGS_LOCKED", message: "Settings are locked. Enter the email code to unlock." });
+    const actorId = actorIdOf(req);
+    if ((await unlockRemaining(actorId, sidOf(req))) > 0 && (await mfaEnrolled(actorId))) return next();
+    return res.status(403).json({ ok: false, code: "SETTINGS_LOCKED", message: "Settings are locked. Enter your Google Authenticator code to unlock." });
   } catch (err) {
     console.error("SETTINGS_LOCK_CHECK_FAILED:", err?.code || err?.message);
     return res.status(500).json({ ok: false, message: "Unable to verify settings access" });
@@ -216,16 +441,18 @@ async function requireSettingsUnlock(req, res, next) {
 }
 
 module.exports = {
-  OTP_TTL_SECONDS,
-  OTP_RESEND_COOLDOWN_SECONDS,
-  UNLOCK_HOURS,
   maskEmail,
   settingsOtpEmail: () => SETTINGS_OTP_EMAIL,
-  getResendCooldown,
   requestCode,
   verifyCode,
   unlockRemaining,
+  mfaEnrolled,
+  startMfaSetup,
+  confirmMfaSetup,
+  verifyMfa,
   actorIdOf,
   sidOf,
   requireSettingsUnlock,
+  // exposed for tests
+  _totp: { base32Encode, base32Decode, hotp, matchTotp, encryptSecret, decryptSecret },
 };
