@@ -322,7 +322,6 @@ const {
 } = require("../controllers/dietitian/api/web/commission-ops");
 const { superAdminSalesAnalytics } = require("../controllers/dietitian/api/web/super-admin-sales-analytics");
 const { superAdminOrders } = require("../controllers/dietitian/api/web/super-admin-orders");
-const { superAdminFacilityDetails } = require("../controllers/dietitian/api/web/super-admin-facility-details");
 
 
 const {
@@ -1070,7 +1069,6 @@ router.post("/dietitian/api/web/list-payouts", authMiddleware, listPayouts);
 router.post("/dietitian/api/web/commission-overview", authMiddleware, commissionOverview);
 router.post("/dietitian/api/web/super-admin-sales-analytics", authMiddleware, superAdminSalesAnalytics);
 router.post("/dietitian/api/web/super-admin-orders", authMiddleware, superAdminOrders);
-router.post("/dietitian/api/web/super-admin-facility-details", authMiddleware, superAdminFacilityDetails);
 router.post("/dietitian/api/web/earnings-summary", authMiddleware, earningsSummary);
 router.post("/dietitian/api/web/list-facilities", authMiddleware, listFacilities);
 
