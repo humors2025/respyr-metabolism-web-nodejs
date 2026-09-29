@@ -16,11 +16,11 @@
  *
  * Definitions
  *   Purchase      a referral_subscriptions row, dated by created_at (UTC).
- *   Source        trainer_code when a trainer/gym code was used at Checkout:
- *                 attributed_partner_code is set AND a promotion code or QR
- *                 sticker was applied. A member who bought without a code and
- *                 linked a trainer later in the app stays "website" (shown as
- *                 linked_partner_code).
+ *   Source        trainer_code whenever the purchase carries a trainer/gym code
+ *                 (attributed_partner_code is set), website when it is empty.
+ *                 A promotion code is not required: with list price = referred
+ *                 price there is no coupon, so a code used at Checkout leaves
+ *                 no promotion code behind (29 Sep 2026, user's rule).
  *   Amounts       first payment only. gross = list price charged
  *                 (unit_amount_minor); discount = the coupon of the promotion
  *                 code used; net = first invoice amount from commission_entries
@@ -202,7 +202,10 @@ async function loadPurchases(p) {
 
   return rows.map((r) => {
     const code = String(r.attributed_partner_code || "").toUpperCase();
-    const usedCodeAtCheckout = !!code && !!(r.stripe_promotion_code_id || r.qr_id);
+    // Trainer-code sale = a code is on the purchase (see "Source" above).
+    const usedCodeAtCheckout = !!code;
+    // The referral coupon only exists when a promotion code or sticker was applied.
+    const discounted = !!(r.stripe_promotion_code_id || r.qr_id);
     const gross = Number(r.unit_amount_minor) || 0;
     const couponOff =
       r.coupon_off_minor != null ? Math.max(0, Number(r.coupon_off_minor))
@@ -223,7 +226,7 @@ async function loadPurchases(p) {
       discount = Math.max(0, gross - invoiceNet);
     } else {
       // A code or sticker at checkout always applies the referral coupon.
-      discount = usedCodeAtCheckout || r.stripe_promotion_code_id ? Math.min(gross, couponOff ?? 0) : 0;
+      discount = discounted ? Math.min(gross, couponOff ?? 0) : 0;
       net = Math.max(0, gross - discount);
     }
 
