@@ -12,7 +12,11 @@
  *   view=members   running referred subscriptions (same rule as
  *                  list-facilities.active_subscriptions)
  *
- * Body: { facility_id?, view }   (facility_id omitted = all facilities)
+ * Body: { facility_id?, view, page?, limit? }   (facility_id omitted = all facilities)
+ *
+ * Pagination is opt-in, as on list-facilities: send page and/or limit
+ * (1..100, default 10) for one page plus a `pagination` block; without them
+ * every row is returned.
  *
  * Existing tables only. Member rows carry buyers' emails, so every read is
  * written to app_auth_logs.
@@ -30,9 +34,34 @@ function toIso(v) {
 
 const lower = (v) => (v == null || v === "" ? null : String(v).toLowerCase());
 
+const DEFAULT_LIMIT = 10;
+const MAX_LIMIT = 100;
+
+// null when the caller did not ask for a page (every row).
+function parsePaging(body) {
+  if (body.page == null && body.limit == null) return null;
+  const page = Math.max(1, parseInt(body.page, 10) || 1);
+  const limit = Math.min(MAX_LIMIT, Math.max(1, parseInt(body.limit, 10) || DEFAULT_LIMIT));
+  return { page, limit, offset: (page - 1) * limit };
+}
+
+// LIMIT/OFFSET are validated integers, inlined because mysql2 execute()
+// rejects them as placeholders on some server versions.
+const pageSql = (paging) => (paging ? `LIMIT ${paging.limit} OFFSET ${paging.offset}` : "");
+
+async function countRows(fromWhere, params) {
+  const [[r]] = await pool.execute(`SELECT COUNT(*) AS total ${fromWhere}`, params);
+  return Number(r.total) || 0;
+}
+
 // facilityId null = every facility. Rows join facilities so the "all" list
 // counts exactly what list-facilities totals count.
-async function trainers(facilityId) {
+async function trainers(facilityId, paging) {
+  const params = facilityId ? [facilityId] : [];
+  const fromWhere = `
+      FROM app_user_roles aur
+      INNER JOIN facilities f ON f.id = aur.facility_id
+      WHERE aur.role = 'trainer' AND aur.status = 'active' ${facilityId ? "AND aur.facility_id = ?" : ""}`;
   const [rows] = await pool.execute(
     `
       SELECT aur.user_id, aur.partner_code, aur.status, aur.created_at,
@@ -47,11 +76,13 @@ async function trainers(facilityId) {
       LEFT JOIN table_dietician td ON LOWER(td.email) = LOWER(aur.user_id)
       LEFT JOIN trainer_commission_splits tcs ON LOWER(tcs.user_id) = LOWER(aur.user_id)
       WHERE aur.role = 'trainer' AND aur.status = 'active' ${facilityId ? "AND aur.facility_id = ?" : ""}
-      ORDER BY aur.created_at DESC
+      ORDER BY aur.created_at DESC, aur.user_id
+      ${pageSql(paging)}
     `,
-    facilityId ? [facilityId] : []
+    params
   );
-  return rows.map((t) => ({
+  const total = paging ? await countRows(fromWhere, params) : rows.length;
+  const items = rows.map((t) => ({
     user_id: lower(t.user_id),
     name: t.name || null,
     phone: t.phone_no || null,
@@ -63,9 +94,15 @@ async function trainers(facilityId) {
     active_members: Number(t.active_members),
     joined_at: toIso(t.created_at),
   }));
+  return { items, total };
 }
 
-async function members(facilityId) {
+async function members(facilityId, paging) {
+  const params = facilityId ? [facilityId] : [];
+  const fromWhere = `
+      FROM referral_subscriptions rs
+      INNER JOIN facilities f ON f.id = rs.facility_id
+      WHERE rs.status IN ('active','trialing','past_due') ${facilityId ? "AND rs.facility_id = ?" : ""}`;
   const [rows] = await pool.execute(
     `
       SELECT rs.id, rs.purchaser_name, rs.purchaser_email, rs.plan_code, rs.unit_amount_minor, rs.currency,
@@ -76,11 +113,13 @@ async function members(facilityId) {
       FROM referral_subscriptions rs
       INNER JOIN facilities f ON f.id = rs.facility_id
       WHERE rs.status IN ('active','trialing','past_due') ${facilityId ? "AND rs.facility_id = ?" : ""}
-      ORDER BY rs.created_at DESC
+      ORDER BY rs.created_at DESC, rs.id DESC
+      ${pageSql(paging)}
     `,
-    facilityId ? [facilityId] : []
+    params
   );
-  return rows.map((m) => ({
+  const total = paging ? await countRows(fromWhere, params) : rows.length;
+  const items = rows.map((m) => ({
     id: Number(m.id),
     name: m.purchaser_name || null,
     email: lower(m.purchaser_email),
@@ -98,6 +137,7 @@ async function members(facilityId) {
     qr_id: m.qr_id || null,
     app_linked: !!m.profile_id,
   }));
+  return { items, total };
 }
 
 const superAdminFacilityPeople = async (req, res) => {
@@ -127,7 +167,8 @@ const superAdminFacilityPeople = async (req, res) => {
       if (!facility) return res.status(404).json({ status: false, ok: false, message: "Facility not found" });
     }
 
-    const items = view === "trainers" ? await trainers(facilityId) : await members(facilityId);
+    const paging = parsePaging(body);
+    const { items, total } = view === "trainers" ? await trainers(facilityId, paging) : await members(facilityId, paging);
 
     await H.writeAuthLogSafe(req, {
       eventType: "super_admin_facility_people_viewed",
@@ -145,6 +186,15 @@ const superAdminFacilityPeople = async (req, res) => {
       view,
       facility: facility ? { id: Number(facility.id), name: facility.name, partner_code: facility.partner_code } : null,
       items,
+      total,
+      ...(paging && {
+        pagination: {
+          page: paging.page,
+          limit: paging.limit,
+          total,
+          total_pages: Math.max(1, Math.ceil(total / paging.limit)),
+        },
+      }),
     });
   } catch (err) {
     console.error("SUPER_ADMIN_FACILITY_PEOPLE_ERROR:", { facilityId, view, code: err?.code, sqlMessage: err?.sqlMessage, message: err?.message });
