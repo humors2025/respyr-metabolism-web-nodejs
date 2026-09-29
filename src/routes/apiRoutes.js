@@ -309,6 +309,8 @@ const {
   getCommissionRate,
   setCommissionRate,
 } = require("../controllers/dietitian/api/web/commission-rate");
+const settingsLock = require("../controllers/dietitian/api/web/settings-lock");
+const { requireSettingsUnlock } = require("../services/settingsLock");
 
 const { earningsSummary } = require("../controllers/dietitian/api/web/earnings-summary");
 const referralOps = require("../controllers/dietitian/api/web/referral-ops");
@@ -1062,7 +1064,7 @@ router.post("/dietitian/api/web/stripe-connect-onboarding-link", authMiddleware,
 router.post("/dietitian/api/web/stripe-connect-dashboard-link", authMiddleware, stripeConnectDashboardLink);
 
 router.post("/dietitian/api/web/get-commission-rate", authMiddleware, getCommissionRate);
-router.post("/dietitian/api/web/set-commission-rate", authMiddleware, setCommissionRate);
+router.post("/dietitian/api/web/set-commission-rate", authMiddleware, requireSettingsUnlock, setCommissionRate);
 
 router.post("/dietitian/api/web/run-breath-credits", authMiddleware, runBreathCreditsEndpoint);
 router.post("/dietitian/api/web/run-payouts", authMiddleware, runPayoutsEndpoint);
@@ -1089,7 +1091,12 @@ router.post("/dietitian/api/web/qr-revoke", authMiddleware, referralOps.qrRevoke
 router.post("/dietitian/api/web/invite-revoke", authMiddleware, referralOps.inviteRevoke);
 router.post("/dietitian/api/web/list-trainer-admins", authMiddleware, referralOps.listTrainerAdmins);
 router.post("/dietitian/api/web/get-pricing", authMiddleware, referralOps.getPricing);
-router.post("/dietitian/api/web/set-pricing", authMiddleware, referralOps.setPricingEndpoint);
+router.post("/dietitian/api/web/set-pricing", authMiddleware, requireSettingsUnlock, referralOps.setPricingEndpoint);
+
+// Super Admin › Settings email-code gate (services/settingsLock.js).
+router.post("/dietitian/api/web/settings-lock-status", authMiddleware, settingsLock.settingsLockStatus);
+router.post("/dietitian/api/web/settings-lock-request", authMiddleware, settingsLock.settingsLockRequest);
+router.post("/dietitian/api/web/settings-lock-verify", authMiddleware, settingsLock.settingsLockVerify);
 
 
 router.post(
