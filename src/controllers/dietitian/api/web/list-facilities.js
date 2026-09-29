@@ -9,10 +9,26 @@
  *
  * Each facility row carries the owner, trainer count, active subscriptions and
  * commission owed/paid to that facility's payees. No member data.
+ *
+ * Pagination is opt-in: send `page` and/or `limit` (1..100, default 10) to get
+ * one page of facilities plus a `pagination` block. Without them every
+ * facility is returned, as before. `totals` always covers all facilities in
+ * scope; pending_invites are never paginated.
  */
 
 const pool = require("../../../../config/db");
 const { _helpers: H } = require("./admin-invite-trainer");
+
+const DEFAULT_LIMIT = 10;
+const MAX_LIMIT = 100;
+
+// null when the caller did not ask for a page (old behaviour: all rows).
+function parsePaging(body) {
+  if (body.page == null && body.limit == null) return null;
+  const page = Math.max(1, parseInt(body.page, 10) || 1);
+  const limit = Math.min(MAX_LIMIT, Math.max(1, parseInt(body.limit, 10) || DEFAULT_LIMIT));
+  return { page, limit, offset: (page - 1) * limit };
+}
 
 function toMysqlDateTime(v) {
   if (!v) return null;
@@ -32,6 +48,10 @@ const listFacilities = async (req, res) => {
 
     const scope = isSuper ? "" : "WHERE LOWER(f.parent_admin_user_id) = ?";
     const params = isSuper ? [] : [actorEmail];
+    const paging = parsePaging(req.body && typeof req.body === "object" ? req.body : {});
+    // LIMIT/OFFSET are validated integers, inlined because mysql2 execute()
+    // rejects them as placeholders on some server versions.
+    const pageSql = paging ? `LIMIT ${paging.limit} OFFSET ${paging.offset}` : "";
 
     const [rows] = await pool.execute(
       `
@@ -48,9 +68,30 @@ const listFacilities = async (req, res) => {
         LEFT JOIN partner_payout_accounts ppa ON LOWER(ppa.user_id) = LOWER(f.facility_admin_user_id)
         ${scope}
         ORDER BY f.created_at DESC, f.id DESC
+        ${pageSql}
       `,
       params
     );
+
+    // Totals over every facility in scope, not just this page.
+    const [[agg]] = await pool.execute(
+      `
+        SELECT COUNT(*) AS facilities,
+               COALESCE(SUM(x.trainers_count),0) AS trainers,
+               COALESCE(SUM(x.active_subscriptions),0) AS active_subscriptions,
+               COALESCE(SUM(x.owed_minor),0) AS owed_minor
+        FROM (
+          SELECT
+            (SELECT COUNT(*) FROM app_user_roles t WHERE t.role = 'trainer' AND t.facility_id = f.id AND t.status = 'active') AS trainers_count,
+            (SELECT COUNT(*) FROM referral_subscriptions rs WHERE rs.facility_id = f.id AND rs.status IN ('active','trialing','past_due')) AS active_subscriptions,
+            (SELECT COALESCE(SUM(ce.amount_minor),0) FROM commission_entries ce WHERE ce.facility_id = f.id AND ce.status IN ('pending','held','scheduled')) AS owed_minor
+          FROM facilities f
+          ${scope}
+        ) x
+      `,
+      params
+    );
+    const totalFacilities = Number(agg.facilities) || 0;
 
     const [pending] = await pool.execute(
       `
@@ -98,12 +139,20 @@ const listFacilities = async (req, res) => {
         created_at: toMysqlDateTime(p.created_at),
       })),
       totals: {
-        facilities: rows.length,
+        facilities: totalFacilities,
         pending_invites: pending.length,
-        trainers: rows.reduce((a, r) => a + Number(r.trainers_count), 0),
-        active_subscriptions: rows.reduce((a, r) => a + Number(r.active_subscriptions), 0),
-        owed_minor: rows.reduce((a, r) => a + Number(r.owed_minor), 0),
+        trainers: Number(agg.trainers) || 0,
+        active_subscriptions: Number(agg.active_subscriptions) || 0,
+        owed_minor: Number(agg.owed_minor) || 0,
       },
+      ...(paging && {
+        pagination: {
+          page: paging.page,
+          limit: paging.limit,
+          total: totalFacilities,
+          total_pages: Math.max(1, Math.ceil(totalFacilities / paging.limit)),
+        },
+      }),
     });
   } catch (err) {
     console.error("LIST_FACILITIES_ERROR:", { code: err?.code, message: err?.message });
