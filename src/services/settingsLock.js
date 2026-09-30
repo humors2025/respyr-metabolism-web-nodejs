@@ -26,13 +26,16 @@
  *
  * STORAGE — reuses `otp_verifications` (see dietitianOtpStore.js) under
  * dedicated purposes; every statement filters on purpose so other flows'
- * rows are never touched. The `email` column holds the key "sa:<dietician_id>".
- *   settings_otp        : otp_code = bcrypt(email code), attempts, expires_at
- *   settings_unlock     : otp_code = sha256(sid), expires_at
- *   settings_mfa_pending: otp_code = encrypted TOTP secret, 10-minute expiry
- *   settings_mfa        : otp_code = encrypted TOTP secret, attempts = last
- *                         used 30s time step (blocks code replay), no expiry
- *   settings_mfa_backup : otp_code = bcrypt(backup code), one row per code
+ * rows are never touched. The table has a UNIQUE index on (email, purpose),
+ * so each purpose keeps exactly one row per `email` key:
+ *   settings_otp        : email "sa:<dietician_id>", otp_code = bcrypt(email code)
+ *   settings_unlock     : email "su:" + sha256(dietician_id:sid) — one row per
+ *                         login session, expires_at = end of the unlock
+ *   settings_mfa_pending: email "sa:<id>", otp_code = encrypted TOTP secret, 10 min
+ *   settings_mfa        : email "sa:<id>", otp_code = encrypted TOTP secret,
+ *                         attempts = last used 30s time step (blocks replay)
+ *   settings_mfa_backup : email "sa:<id>", otp_code = JSON array of bcrypt
+ *                         hashes, one per unused backup code
  * TOTP secrets are AES-256-GCM encrypted with SETTINGS_MFA_KEY (falls back to
  * a key derived from JWT_SECRET — rotating that secret means re-enrolling).
  *
@@ -173,14 +176,14 @@ function decryptSecret(stored) {
 
 // ─── Session unlock ───────────────────────────────────────────────────────────
 
+const unlockKeyFor = (actorId, sid) => `su:${sha256(`${String(actorId).trim()}:${sid}`)}`;
+
 async function grantUnlock(actorId, sid) {
-  const key = keyFor(actorId);
-  const sidHash = sha256(sid);
-  await pool.execute(`DELETE FROM ${TABLE} WHERE email = ? AND purpose = ? AND otp_code = ?`, [key, PURPOSE_UNLOCK, sidHash]);
   await pool.execute(
     `INSERT INTO ${TABLE} (email, otp_code, purpose, is_verified, attempts, expires_at, verified_at)
-     VALUES (?, ?, ?, 1, 0, DATE_ADD(NOW(), INTERVAL ? HOUR), NOW())`,
-    [key, sidHash, PURPOSE_UNLOCK, UNLOCK_HOURS]
+     VALUES (?, '', ?, 1, 0, DATE_ADD(NOW(), INTERVAL ? HOUR), NOW())
+     ON DUPLICATE KEY UPDATE expires_at = VALUES(expires_at), verified_at = NOW()`,
+    [unlockKeyFor(actorId, sid), PURPOSE_UNLOCK, UNLOCK_HOURS]
   );
   return UNLOCK_HOURS * 3600;
 }
@@ -191,10 +194,9 @@ async function unlockRemaining(actorId, sid) {
   const [rows] = await pool.execute(
     `SELECT TIMESTAMPDIFF(SECOND, NOW(), expires_at) AS remaining
        FROM ${TABLE}
-      WHERE email = ? AND purpose = ? AND otp_code = ? AND expires_at > NOW()
-      ORDER BY id DESC
+      WHERE email = ? AND purpose = ? AND expires_at > NOW()
       LIMIT 1`,
-    [keyFor(actorId), PURPOSE_UNLOCK, sha256(sid)]
+    [unlockKeyFor(actorId, sid), PURPOSE_UNLOCK]
   );
   const remaining = Number(rows?.[0]?.remaining);
   return remaining > 0 ? remaining : 0;
@@ -366,13 +368,11 @@ async function confirmMfaSetup(actorId, sid, submitted) {
        VALUES (?, ?, ?, 1, ?, ?, NOW())`,
       [key, pending.otp_code, PURPOSE_MFA, step, NEVER_EXPIRES]
     );
-    for (const h of backupHashes) {
-      await conn.execute(
-        `INSERT INTO ${TABLE} (email, otp_code, purpose, is_verified, attempts, expires_at)
-         VALUES (?, ?, ?, 0, 0, ?)`,
-        [key, h, PURPOSE_MFA_BACKUP, NEVER_EXPIRES]
-      );
-    }
+    await conn.execute(
+      `INSERT INTO ${TABLE} (email, otp_code, purpose, is_verified, attempts, expires_at)
+       VALUES (?, ?, ?, 0, 0, ?)`,
+      [key, JSON.stringify(backupHashes), PURPOSE_MFA_BACKUP, NEVER_EXPIRES]
+    );
     await conn.commit();
   } catch (err) {
     await conn.rollback();
@@ -409,13 +409,26 @@ async function verifyMfa(actorId, sid, submitted) {
   if (/^[0-9a-f]{4}-?[0-9a-f]{4}$/.test(code)) {
     const normalized = code.includes("-") ? code : `${code.slice(0, 4)}-${code.slice(4)}`;
     const [rows] = await pool.execute(
-      `SELECT id, otp_code FROM ${TABLE} WHERE email = ? AND purpose = ?`,
+      `SELECT id, otp_code FROM ${TABLE} WHERE email = ? AND purpose = ? LIMIT 1`,
       [key, PURPOSE_MFA_BACKUP]
     );
-    for (const r of rows) {
-      if (await bcrypt.compare(normalized, r.otp_code)) {
-        await pool.execute(`DELETE FROM ${TABLE} WHERE id = ?`, [r.id]);
-        return { ok: true, usedBackup: true, backupLeft: rows.length - 1, expiresInSeconds: await grantUnlock(actorId, sid) };
+    const row = rows?.[0];
+    let hashes = [];
+    try {
+      hashes = row ? JSON.parse(row.otp_code) : [];
+    } catch (_) {
+      hashes = [];
+    }
+    for (let i = 0; i < hashes.length; i++) {
+      if (await bcrypt.compare(normalized, hashes[i])) {
+        const left = hashes.filter((_, j) => j !== i);
+        // Compare-and-set so two requests can't both spend the same code.
+        const [r] = await pool.execute(
+          `UPDATE ${TABLE} SET otp_code = ? WHERE id = ? AND otp_code = ?`,
+          [JSON.stringify(left), row.id, row.otp_code]
+        );
+        if (r.affectedRows !== 1) break;
+        return { ok: true, usedBackup: true, backupLeft: left.length, expiresInSeconds: await grantUnlock(actorId, sid) };
       }
     }
   }
