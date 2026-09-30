@@ -16,7 +16,19 @@
 
 const rateLimit = require("express-rate-limit");
 const { _helpers: H } = require("./admin-invite-trainer");
+const { getClientIp, getUserAgent } = require("./auth_common");
 const lock = require("../../../../services/settingsLock");
+
+/** Who and where, for admin_mfa and the security alert emails. */
+function requestContext(req, email) {
+  const ip = String(getClientIp(req) || "").replace(/^::ffff:/, "");
+  return {
+    email,
+    ip: ip && ip !== "0.0.0.0" ? ip : null,
+    userAgent: getUserAgent(req) || null,
+    country: req.get?.("cloudfront-viewer-country") || null,
+  };
+}
 
 function guard(fn) {
   return async (req, res) => {
@@ -28,7 +40,8 @@ function guard(fn) {
       const actorId = lock.actorIdOf(req);
       const sid = lock.sidOf(req);
       if (!actorId || !sid) return res.status(401).json({ ok: false, message: "Invalid session" });
-      return await fn(req, res, { actorId, sid, actorEmail: resolved.actorEmail });
+      const actorEmail = resolved.actorEmail || actorId;
+      return await fn(req, res, { actorId, sid, actorEmail, ctx: requestContext(req, actorEmail) });
     } catch (err) {
       console.error("SETTINGS_LOCK_ERROR:", err?.code || err?.message);
       return res.status(500).json({ ok: false, message: "Something went wrong" });
@@ -48,7 +61,14 @@ const settingsCodeRateLimiter = rateLimit({
   legacyHeaders: false,
   skipSuccessfulRequests: true,
   keyGenerator: (req) => `settings-code:${lock.actorIdOf(req) || "unknown"}`,
-  handler: (req, res) => res.status(429).json({ ok: false, message: "Too many attempts. Try again in 15 minutes." }),
+  handler: async (req, res) => {
+    // Alert once, on the first request over the limit, not on every retry after it.
+    if (req.rateLimit?.current === req.rateLimit?.limit + 1) {
+      const email = req.user?.email || req.user?.dietician?.email || lock.actorIdOf(req);
+      await lock.sendAlert("Too many wrong Settings codes", "Someone entered 10 wrong codes on the Settings lock screen within 15 minutes.", requestContext(req, email));
+    }
+    return res.status(429).json({ ok: false, message: "Too many attempts. Try again in 15 minutes." });
+  },
 });
 
 const settingsLockStatus = guard(async (req, res, { actorId, sid }) => {
@@ -64,7 +84,7 @@ const settingsLockStatus = guard(async (req, res, { actorId, sid }) => {
 
 const settingsLockRequest = guard(async (req, res, { actorId, actorEmail }) => {
   if (await lock.mfaEnrolled(actorId)) return alreadyEnrolled(res);
-  const r = await lock.requestCode(actorId, actorEmail || actorId);
+  const r = await lock.requestCode(actorId, actorEmail);
   if (r.ok) return res.json({ ok: true, sent_to: r.sentTo, ttl_seconds: r.ttl });
   if (r.reason === "cooldown") {
     return res.status(429).json({ ok: false, message: `Please wait ${r.retryAfter}s before requesting another code.`, retry_after_seconds: r.retryAfter });
@@ -88,23 +108,23 @@ const settingsMfaSetup = guard(async (req, res, { actorId, sid, actorEmail }) =>
   if ((await lock.unlockRemaining(actorId, sid)) <= 0) {
     return res.status(403).json({ ok: false, code: "SETTINGS_LOCKED", message: "Verify the email code first." });
   }
-  const { secret, otpauthUrl } = await lock.startMfaSetup(actorId, actorEmail || actorId);
+  const { secret, otpauthUrl } = await lock.startMfaSetup(actorId, actorEmail);
   return res.json({ ok: true, secret, otpauth_url: otpauthUrl });
 });
 
-const settingsMfaConfirm = guard(async (req, res, { actorId, sid }) => {
+const settingsMfaConfirm = guard(async (req, res, { actorId, sid, ctx }) => {
   if (await lock.mfaEnrolled(actorId)) return alreadyEnrolled(res);
   if ((await lock.unlockRemaining(actorId, sid)) <= 0) {
     return res.status(403).json({ ok: false, code: "SETTINGS_LOCKED", message: "Verify the email code first." });
   }
-  const r = await lock.confirmMfaSetup(actorId, sid, req.body?.code);
+  const r = await lock.confirmMfaSetup(actorId, sid, req.body?.code, ctx);
   if (r.ok) return res.json({ ok: true, unlocked: true, backup_codes: r.backupCodes, expires_in_seconds: r.expiresInSeconds });
   const message = r.reason === "mismatch" ? "Incorrect code. Check the app and try again." : "Setup expired. Start again.";
   return res.status(400).json({ ok: false, reason: r.reason, message });
 });
 
-const settingsMfaVerify = guard(async (req, res, { actorId, sid }) => {
-  const r = await lock.verifyMfa(actorId, sid, req.body?.code);
+const settingsMfaVerify = guard(async (req, res, { actorId, sid, ctx }) => {
+  const r = await lock.verifyMfa(actorId, sid, req.body?.code, ctx);
   if (r.ok) {
     return res.json({ ok: true, unlocked: true, used_backup: r.usedBackup, backup_codes_left: r.backupLeft, expires_in_seconds: r.expiresInSeconds });
   }
