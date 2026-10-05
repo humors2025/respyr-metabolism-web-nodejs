@@ -1,11 +1,16 @@
 "use strict";
 
 /**
- * POST /dietitian/api/web/super-admin-facility-people        (super_admin)
+ * POST /dietitian/api/web/super-admin-facility-people        (super_admin, admin)
  *
  * The rows behind the Trainers and Active members counts on the Facilities
  * page (list-facilities), for one facility — or, without facility_id, for
- * every facility (the Trainers / Active members total cards):
+ * every facility in scope (the Trainers / Active members total cards):
+ *
+ * admin       -> only facilities whose parent_admin_user_id is the actor
+ *                (same scope as list-facilities); a facility_id outside that
+ *                scope is a 404.
+ * super_admin -> every facility.
  *
  *   view=trainers  active trainers in the facility (same rule as
  *                  list-facilities.trainers_count)
@@ -54,14 +59,16 @@ async function countRows(fromWhere, params) {
   return Number(r.total) || 0;
 }
 
-// facilityId null = every facility. Rows join facilities so the "all" list
-// counts exactly what list-facilities totals count.
-async function trainers(facilityId, paging) {
-  const params = facilityId ? [facilityId] : [];
+// facilityId null = every facility in scope. parentEmail set (trainer admin)
+// limits rows to facilities under that parent, as list-facilities does. Rows
+// join facilities so the "all" list counts exactly what the totals count.
+async function trainers(facilityId, parentEmail, paging) {
+  const params = [...(facilityId ? [facilityId] : []), ...(parentEmail ? [parentEmail] : [])];
+  const where = `WHERE aur.role = 'trainer' AND aur.status = 'active' ${facilityId ? "AND aur.facility_id = ?" : ""} ${parentEmail ? "AND LOWER(f.parent_admin_user_id) = ?" : ""}`;
   const fromWhere = `
       FROM app_user_roles aur
       INNER JOIN facilities f ON f.id = aur.facility_id
-      WHERE aur.role = 'trainer' AND aur.status = 'active' ${facilityId ? "AND aur.facility_id = ?" : ""}`;
+      ${where}`;
   const [rows] = await pool.execute(
     `
       SELECT aur.user_id, aur.partner_code, aur.status, aur.created_at,
@@ -75,7 +82,7 @@ async function trainers(facilityId, paging) {
       INNER JOIN facilities f ON f.id = aur.facility_id
       LEFT JOIN table_dietician td ON LOWER(td.email) = LOWER(aur.user_id)
       LEFT JOIN trainer_commission_splits tcs ON LOWER(tcs.user_id) = LOWER(aur.user_id)
-      WHERE aur.role = 'trainer' AND aur.status = 'active' ${facilityId ? "AND aur.facility_id = ?" : ""}
+      ${where}
       ORDER BY aur.created_at DESC, aur.user_id
       ${pageSql(paging)}
     `,
@@ -97,12 +104,13 @@ async function trainers(facilityId, paging) {
   return { items, total };
 }
 
-async function members(facilityId, paging) {
-  const params = facilityId ? [facilityId] : [];
+async function members(facilityId, parentEmail, paging) {
+  const params = [...(facilityId ? [facilityId] : []), ...(parentEmail ? [parentEmail] : [])];
+  const where = `WHERE rs.status IN ('active','trialing','past_due') ${facilityId ? "AND rs.facility_id = ?" : ""} ${parentEmail ? "AND LOWER(f.parent_admin_user_id) = ?" : ""}`;
   const fromWhere = `
       FROM referral_subscriptions rs
       INNER JOIN facilities f ON f.id = rs.facility_id
-      WHERE rs.status IN ('active','trialing','past_due') ${facilityId ? "AND rs.facility_id = ?" : ""}`;
+      ${where}`;
   const [rows] = await pool.execute(
     `
       SELECT rs.id, rs.purchaser_name, rs.purchaser_email, rs.plan_code, rs.unit_amount_minor, rs.currency,
@@ -112,7 +120,7 @@ async function members(facilityId, paging) {
              (SELECT td.name FROM table_dietician td WHERE LOWER(td.email) = LOWER(rs.attributed_user_id) LIMIT 1) AS code_owner_name
       FROM referral_subscriptions rs
       INNER JOIN facilities f ON f.id = rs.facility_id
-      WHERE rs.status IN ('active','trialing','past_due') ${facilityId ? "AND rs.facility_id = ?" : ""}
+      ${where}
       ORDER BY rs.created_at DESC, rs.id DESC
       ${pageSql(paging)}
     `,
@@ -151,8 +159,11 @@ const superAdminFacilityPeople = async (req, res) => {
   const view = String(body.view || "");
 
   try {
-    const resolved = await H.resolveActorFromToken(req, "super_admin");
+    const resolved = await H.resolveActorFromToken(req, ["super_admin", "admin"]);
     if (resolved.error) return res.status(resolved.error.status).json({ status: false, ...resolved.error.body });
+    const isSuper = String(resolved.actor.role) === "super_admin";
+    // Trainer admin only ever sees facilities under them, as on list-facilities.
+    const parentEmail = isSuper ? null : resolved.actorEmail;
 
     if (!allFacilities && (!Number.isInteger(facilityId) || facilityId <= 0)) {
       return res.status(422).json({ status: false, ok: false, message: "facility_id must be a positive integer or omitted" });
@@ -163,17 +174,20 @@ const superAdminFacilityPeople = async (req, res) => {
 
     let facility = null;
     if (!allFacilities) {
-      [[facility]] = await pool.execute("SELECT id, name, partner_code FROM facilities WHERE id = ? LIMIT 1", [facilityId]);
+      [[facility]] = await pool.execute(
+        `SELECT id, name, partner_code FROM facilities WHERE id = ? ${parentEmail ? "AND LOWER(parent_admin_user_id) = ?" : ""} LIMIT 1`,
+        parentEmail ? [facilityId, parentEmail] : [facilityId]
+      );
       if (!facility) return res.status(404).json({ status: false, ok: false, message: "Facility not found" });
     }
 
     const paging = parsePaging(body);
-    const { items, total } = view === "trainers" ? await trainers(facilityId, paging) : await members(facilityId, paging);
+    const { items, total } = view === "trainers" ? await trainers(facilityId, parentEmail, paging) : await members(facilityId, parentEmail, paging);
 
     await H.writeAuthLogSafe(req, {
       eventType: "super_admin_facility_people_viewed",
       userId: resolved.actorEmail,
-      role: "super_admin",
+      role: String(resolved.actor.role),
       partnerCode: facility ? facility.partner_code : null,
       identifier: resolved.actorEmail,
       success: true,
