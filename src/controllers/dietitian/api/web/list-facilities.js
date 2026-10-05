@@ -62,7 +62,10 @@ const listFacilities = async (req, res) => {
           (SELECT COUNT(*) FROM app_user_roles t WHERE t.role = 'trainer' AND t.facility_id = f.id AND t.status = 'active') AS trainers_count,
           (SELECT COUNT(*) FROM referral_subscriptions rs WHERE rs.facility_id = f.id AND rs.status IN ('active','trialing','past_due')) AS active_subscriptions,
           (SELECT COALESCE(SUM(ce.amount_minor),0) FROM commission_entries ce WHERE ce.facility_id = f.id AND ce.status IN ('pending','held','scheduled')) AS owed_minor,
-          (SELECT COALESCE(SUM(ce.amount_minor),0) FROM commission_entries ce WHERE ce.facility_id = f.id AND ce.status = 'paid') AS paid_minor
+          (SELECT COALESCE(SUM(ce.amount_minor),0) FROM commission_entries ce WHERE ce.facility_id = f.id AND ce.status = 'paid') AS paid_minor,
+          (SELECT COUNT(*) FROM facility_edit_logs l WHERE l.facility_id = f.id) AS edits_count,
+          (SELECT l.edited_by FROM facility_edit_logs l WHERE l.facility_id = f.id ORDER BY l.id DESC LIMIT 1) AS last_edited_by,
+          (SELECT l.edited_at FROM facility_edit_logs l WHERE l.facility_id = f.id ORDER BY l.id DESC LIMIT 1) AS last_edited_at
         FROM facilities f
         LEFT JOIN table_dietician td ON LOWER(td.email) = LOWER(f.facility_admin_user_id)
         LEFT JOIN partner_payout_accounts ppa ON LOWER(ppa.user_id) = LOWER(f.facility_admin_user_id)
@@ -123,6 +126,10 @@ const listFacilities = async (req, res) => {
         active_subscriptions: Number(r.active_subscriptions),
         owed_minor: Number(r.owed_minor),
         paid_minor: Number(r.paid_minor),
+        // Edit history (facility_edit_logs) — drives the "Edited" tag.
+        edits_count: Number(r.edits_count) || 0,
+        last_edited_by: r.last_edited_by ? String(r.last_edited_by).toLowerCase() : null,
+        last_edited_at: toMysqlDateTime(r.last_edited_at),
       })),
       pending_invites: pending.map((p) => ({
         id: Number(p.id),
