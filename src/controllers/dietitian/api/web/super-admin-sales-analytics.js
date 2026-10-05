@@ -248,7 +248,12 @@ async function loadPurchases(p) {
       amountSource: invoiceNet != null ? "invoice" : "price",
       paymentStatus,
       counts: paymentStatus === "paid",
-      subStatus: SUB_STATUS_LABEL[r.status] || r.status || null,
+      // A live plan with canceled_at set is a cancel-at-period-end request:
+      // the buyer keeps access until current_period_end, then it ends.
+      subStatus:
+        r.canceled_at && String(r.status) !== "canceled"
+          ? "cancellation_scheduled"
+          : SUB_STATUS_LABEL[r.status] || r.status || null,
     };
   });
 }
@@ -763,8 +768,12 @@ async function purchases(p, body) {
       amount_source: i.amountSource,
       subscription_status: i.subStatus,
       subscription_start: toIso(r.created_at),
-      // Cancelled: when it was cancelled; otherwise the next renewal date.
-      subscription_end: toIso(r.canceled_at || r.current_period_end),
+      canceled_at: toIso(r.canceled_at),
+      // Cancelled: when access ended. A scheduled cancel (canceled_at set,
+      // status still active) runs until period end, so show that date.
+      subscription_end: toIso(
+        String(r.status) === "canceled" ? r.canceled_at || r.current_period_end : r.current_period_end
+      ),
       payment_status: i.paymentStatus,
       stripe: {
         checkout_session_id: r.stripe_checkout_session_id || null,
