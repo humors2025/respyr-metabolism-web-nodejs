@@ -41,7 +41,7 @@ async function findSubscription(body) {
   if (id) {
     if (!/^sub_[A-Za-z0-9]+$/.test(id)) throw httpError(422, "stripe_subscription_id must look like sub_…");
     const [rows] = await pool.query(
-      `SELECT stripe_subscription_id, purchaser_email, status, canceled_at
+      `SELECT stripe_subscription_id, stripe_schedule_id, purchaser_email, status, canceled_at
        FROM referral_subscriptions WHERE stripe_subscription_id = ?`,
       [id]
     );
@@ -50,7 +50,7 @@ async function findSubscription(body) {
   }
   if (!email) throw httpError(422, "Provide stripe_subscription_id or email");
   const [rows] = await pool.query(
-    `SELECT stripe_subscription_id, purchaser_email, status, canceled_at
+    `SELECT stripe_subscription_id, stripe_schedule_id, purchaser_email, status, canceled_at
      FROM referral_subscriptions WHERE purchaser_email = ? AND status <> 'canceled'`,
     [email]
   );
@@ -59,6 +59,20 @@ async function findSubscription(body) {
     throw httpError(409, "Multiple subscriptions for that email — pass stripe_subscription_id");
   }
   return rows[0];
+}
+
+/**
+ * Website subscriptions sit on a 12-month device-term schedule (end_behavior
+ * "release"; see the webhook's applyTerm), and Stripe refuses cancellation
+ * changes on a schedule-managed subscription. So while the schedule is still
+ * attached, an immediate cancel goes through the schedule, and an
+ * at-period-end cancel first releases the schedule (the subscription keeps
+ * running unchanged, just unmanaged — the term cap is moot once it's ending).
+ */
+async function detachScheduleIfAny(stripe, subscription) {
+  const scheduleId = subscription.schedule ? String(subscription.schedule) : null;
+  if (!scheduleId) return;
+  await stripe.subscriptionSchedules.release(scheduleId);
 }
 
 const cancelOrderSubscription = async (req, res) => {
@@ -82,10 +96,17 @@ const cancelOrderSubscription = async (req, res) => {
     const subscriptionId = row.stripe_subscription_id;
     const stripe = requireStripe();
 
+    const current = await stripe.subscriptions.retrieve(subscriptionId);
+
     let subscription;
-    if (mode === "immediately") {
+    if (mode === "immediately" && current.schedule) {
+      // Cancelling the schedule cancels the subscription with it.
+      await stripe.subscriptionSchedules.cancel(String(current.schedule));
+      subscription = await stripe.subscriptions.retrieve(subscriptionId);
+    } else if (mode === "immediately") {
       subscription = await stripe.subscriptions.cancel(subscriptionId);
     } else {
+      await detachScheduleIfAny(stripe, current);
       subscription = await stripe.subscriptions.update(subscriptionId, {
         cancel_at_period_end: mode === "at_period_end",
       });
