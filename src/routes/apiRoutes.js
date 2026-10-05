@@ -328,6 +328,7 @@ const { superAdminSalesAnalytics } = require("../controllers/dietitian/api/web/s
 const { superAdminOrders } = require("../controllers/dietitian/api/web/super-admin-orders");
 const { cancelOrderSubscription } = require("../controllers/dietitian/api/web/cancel-order-subscription");
 const { simulateRenewal } = require("../controllers/dietitian/api/web/simulate-renewal");
+const { restoreSubscriptionDiscount } = require("../controllers/dietitian/api/web/restore-subscription-discount");
 const { superAdminFacilityPeople } = require("../controllers/dietitian/api/web/super-admin-facility-people");
 
 
@@ -1078,6 +1079,7 @@ router.post("/dietitian/api/web/super-admin-sales-analytics", authMiddleware, su
 router.post("/dietitian/api/web/super-admin-orders", authMiddleware, superAdminOrders);
 router.post("/dietitian/api/web/cancel-order-subscription", authMiddleware, cancelOrderSubscription);
 router.post("/dietitian/api/web/simulate-renewal", authMiddleware, simulateRenewal);
+router.post("/dietitian/api/web/restore-subscription-discount", authMiddleware, restoreSubscriptionDiscount);
 router.post("/dietitian/api/web/super-admin-facility-people", authMiddleware, superAdminFacilityPeople);
 router.post("/dietitian/api/web/earnings-summary", authMiddleware, earningsSummary);
 router.post("/dietitian/api/web/list-facilities", authMiddleware, listFacilities);
