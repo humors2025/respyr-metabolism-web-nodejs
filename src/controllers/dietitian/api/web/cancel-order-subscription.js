@@ -9,10 +9,11 @@
  * which is what updates referral_subscriptions — so the row may lag this
  * response by a few seconds.
  *
- * Body: { stripe_subscription_id? , email? , mode? }
- *   stripe_subscription_id  sub_… (preferred)
- *   email                   purchaser_email lookup when no id is given; must
- *                           match exactly one non-canceled subscription
+ * Body: { stripe_subscription_id , mode? }
+ *   stripe_subscription_id  sub_… — the only accepted identifier. Email lookup
+ *                           was removed on purpose: purchaser_email is the
+ *                           checkout email, which can differ from the app
+ *                           account's email, so cancelling by email is ambiguous.
  *   mode                    "at_period_end" (default) — customer keeps access
  *                                 until current_period_end, then it ends
  *                           "immediately"   — ends now (no refund)
@@ -37,27 +38,14 @@ function httpError(status, message) {
 /** The referral_subscriptions row this acts on — only website purchases live there. */
 async function findSubscription(body) {
   const id = String(body.stripe_subscription_id || "").trim();
-  const email = String(body.email || "").trim().toLowerCase();
-  if (id) {
-    if (!/^sub_[A-Za-z0-9]+$/.test(id)) throw httpError(422, "stripe_subscription_id must look like sub_…");
-    const [rows] = await pool.query(
-      `SELECT stripe_subscription_id, stripe_schedule_id, purchaser_email, status, canceled_at
-       FROM referral_subscriptions WHERE stripe_subscription_id = ?`,
-      [id]
-    );
-    if (!rows.length) throw httpError(404, "No website subscription with that id");
-    return rows[0];
-  }
-  if (!email) throw httpError(422, "Provide stripe_subscription_id or email");
+  if (!id) throw httpError(422, "stripe_subscription_id is required");
+  if (!/^sub_[A-Za-z0-9]+$/.test(id)) throw httpError(422, "stripe_subscription_id must look like sub_…");
   const [rows] = await pool.query(
     `SELECT stripe_subscription_id, stripe_schedule_id, purchaser_email, status, canceled_at
-     FROM referral_subscriptions WHERE purchaser_email = ? AND status <> 'canceled'`,
-    [email]
+     FROM referral_subscriptions WHERE stripe_subscription_id = ?`,
+    [id]
   );
-  if (!rows.length) throw httpError(404, "No active website subscription for that email");
-  if (rows.length > 1) {
-    throw httpError(409, "Multiple subscriptions for that email — pass stripe_subscription_id");
-  }
+  if (!rows.length) throw httpError(404, "No website subscription with that id");
   return rows[0];
 }
 
@@ -150,7 +138,7 @@ const cancelOrderSubscription = async (req, res) => {
         userId: resolved.actorEmail,
         role: "super_admin",
         partnerCode: null,
-        identifier: String(body.email || body.stripe_subscription_id || ""),
+        identifier: String(body.stripe_subscription_id || ""),
         success: false,
         failureReason: String(err?.code || "internal_error"),
       });
