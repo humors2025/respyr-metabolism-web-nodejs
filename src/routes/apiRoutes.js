@@ -315,6 +315,7 @@ const { requireSettingsUnlock } = require("../services/settingsLock");
 const { earningsSummary } = require("../controllers/dietitian/api/web/earnings-summary");
 const referralOps = require("../controllers/dietitian/api/web/referral-ops");
 const { listFacilities } = require("../controllers/dietitian/api/web/list-facilities");
+const { updateFacility } = require("../controllers/dietitian/api/web/update-facility");
 
 const {
   runBreathCreditsEndpoint,
@@ -1075,6 +1076,7 @@ router.post("/dietitian/api/web/super-admin-orders", authMiddleware, superAdminO
 router.post("/dietitian/api/web/super-admin-facility-people", authMiddleware, superAdminFacilityPeople);
 router.post("/dietitian/api/web/earnings-summary", authMiddleware, earningsSummary);
 router.post("/dietitian/api/web/list-facilities", authMiddleware, listFacilities);
+router.post("/dietitian/api/web/update-facility", authMiddleware, updateFacility);
 
 // Referral programme v0.3 — public order-page helpers (no JWT) …
 router.post("/dietitian/api/web/order-page-context", referralOps.orderPageContext);
