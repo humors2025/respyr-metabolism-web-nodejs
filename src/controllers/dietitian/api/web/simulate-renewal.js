@@ -68,8 +68,24 @@ const simulateRenewal = async (req, res) => {
 
     const customerId = String(subscription.customer);
     let clockId = subscription.test_clock ? String(subscription.test_clock) : null;
-    if (!clockId) {
-      const clock = await stripe.testHelpers.testClocks.create({
+    let clock = null;
+    if (clockId) {
+      clock = await stripe.testHelpers.testClocks.retrieve(clockId);
+      if (clock.status === "advancing") {
+        return res.status(200).json({
+          status: true,
+          ok: true,
+          stripe: {
+            subscription_id: id,
+            test_clock_id: clockId,
+            clock_status: "advancing",
+            frozen_time: toIso(Number(clock.frozen_time)),
+          },
+          note: "The clock is still advancing from an earlier call — wait a minute, then check the DB.",
+        });
+      }
+    } else {
+      clock = await stripe.testHelpers.testClocks.create({
         frozen_time: Math.floor(Date.now() / 1000),
         customer: customerId,
         name: `renewal test ${id}`,
@@ -77,10 +93,19 @@ const simulateRenewal = async (req, res) => {
       clockId = clock.id;
     }
 
-    // Just past period end; the renewal invoice is created and paid during
-    // the advance.
-    const target = periodEnd + 3600;
-    const clock = await stripe.testHelpers.testClocks.advance(clockId, { frozen_time: target });
+    // Two hours past period end: Stripe creates the renewal invoice at period
+    // end but finalizes and pays it about an hour later, so one hour can leave
+    // it unpaid. Note period_end is re-read per call — once a renewal has
+    // landed, calling again advances the NEXT cycle.
+    const target = periodEnd + 2 * 3600;
+    if (Number(clock.frozen_time) >= target) {
+      return res.status(409).json({
+        status: false,
+        ok: false,
+        message: `Clock is already at ${toIso(Number(clock.frozen_time))}, past this period end — if the renewal still hasn't landed, check webhook_events for errors.`,
+      });
+    }
+    clock = await stripe.testHelpers.testClocks.advance(clockId, { frozen_time: target });
 
     await H.writeAuthLogSafe(req, {
       eventType: "simulate_renewal",
