@@ -20,6 +20,10 @@
  * `owner_name` is the owner's profile name (table_dietician.name for the
  * facility_admin_user_id email) — the same field list-facilities joins in as
  * owner_name — so the new name shows everywhere that user appears.
+ *
+ * Every changed field is appended to facility_edit_logs (migration 007) —
+ * old/new value, who edited and when — which drives the "Edited" tag and the
+ * edit history shown on the Facilities page.
  */
 
 const pool = require("../../../../config/db");
@@ -92,10 +96,12 @@ const updateFacility = async (req, res) => {
       }
 
       const changes = [];
+      const logRows = []; // [field, old_value, new_value]
 
       if (name.value !== undefined && name.value !== facility.name) {
         await conn.execute(`UPDATE facilities SET name = ? WHERE id = ?`, [name.value, facility.id]);
         changes.push(`name "${facility.name}" -> "${name.value}"`);
+        logRows.push(["name", facility.name || null, name.value]);
       }
 
       let previousOwnerName = null;
@@ -119,7 +125,19 @@ const updateFacility = async (req, res) => {
         if (ownerName.value !== previousOwnerName) {
           await conn.execute(`UPDATE table_dietician SET name = ? WHERE id = ?`, [ownerName.value, owner.id]);
           changes.push(`owner_name "${previousOwnerName || ""}" -> "${ownerName.value}"`);
+          logRows.push(["owner_name", previousOwnerName, ownerName.value]);
         }
+      }
+
+      for (const [field, oldValue, newValue] of logRows) {
+        await conn.execute(
+          `
+            INSERT INTO facility_edit_logs
+              (facility_id, field, old_value, new_value, edited_by, edited_role)
+            VALUES (?, ?, ?, ?, ?, ?)
+          `,
+          [facility.id, field, oldValue, newValue, actorEmail, actorRole]
+        );
       }
 
       await conn.commit();
