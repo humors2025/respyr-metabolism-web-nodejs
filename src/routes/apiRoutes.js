@@ -326,6 +326,7 @@ const {
 } = require("../controllers/dietitian/api/web/commission-ops");
 const { superAdminSalesAnalytics } = require("../controllers/dietitian/api/web/super-admin-sales-analytics");
 const { superAdminOrders } = require("../controllers/dietitian/api/web/super-admin-orders");
+const { superAdminTestCodes } = require("../controllers/dietitian/api/web/super-admin-test-codes");
 const { cancelOrderSubscription } = require("../controllers/dietitian/api/web/cancel-order-subscription");
 const { simulateRenewal } = require("../controllers/dietitian/api/web/simulate-renewal");
 const { restoreSubscriptionDiscount } = require("../controllers/dietitian/api/web/restore-subscription-discount");
@@ -1077,6 +1078,7 @@ router.post("/dietitian/api/web/list-payouts", authMiddleware, listPayouts);
 router.post("/dietitian/api/web/commission-overview", authMiddleware, commissionOverview);
 router.post("/dietitian/api/web/super-admin-sales-analytics", authMiddleware, superAdminSalesAnalytics);
 router.post("/dietitian/api/web/super-admin-orders", authMiddleware, superAdminOrders);
+router.post("/dietitian/api/web/super-admin-test-codes", authMiddleware, superAdminTestCodes);
 router.post("/dietitian/api/web/cancel-order-subscription", authMiddleware, cancelOrderSubscription);
 router.post("/dietitian/api/web/simulate-renewal", authMiddleware, simulateRenewal);
 router.post("/dietitian/api/web/restore-subscription-discount", authMiddleware, restoreSubscriptionDiscount);
