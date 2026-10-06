@@ -309,6 +309,8 @@ const {
   getCommissionRate,
   setCommissionRate,
 } = require("../controllers/dietitian/api/web/commission-rate");
+const settingsLock = require("../controllers/dietitian/api/web/settings-lock");
+const { requireSettingsUnlock } = require("../services/settingsLock");
 
 const { earningsSummary } = require("../controllers/dietitian/api/web/earnings-summary");
 const referralOps = require("../controllers/dietitian/api/web/referral-ops");
@@ -324,6 +326,10 @@ const {
 } = require("../controllers/dietitian/api/web/commission-ops");
 const { superAdminSalesAnalytics } = require("../controllers/dietitian/api/web/super-admin-sales-analytics");
 const { superAdminOrders } = require("../controllers/dietitian/api/web/super-admin-orders");
+const { superAdminTestCodes } = require("../controllers/dietitian/api/web/super-admin-test-codes");
+const { cancelOrderSubscription } = require("../controllers/dietitian/api/web/cancel-order-subscription");
+const { simulateRenewal } = require("../controllers/dietitian/api/web/simulate-renewal");
+const { restoreSubscriptionDiscount } = require("../controllers/dietitian/api/web/restore-subscription-discount");
 const { superAdminFacilityPeople } = require("../controllers/dietitian/api/web/super-admin-facility-people");
 
 
@@ -1064,7 +1070,7 @@ router.post("/dietitian/api/web/stripe-connect-onboarding-link", authMiddleware,
 router.post("/dietitian/api/web/stripe-connect-dashboard-link", authMiddleware, stripeConnectDashboardLink);
 
 router.post("/dietitian/api/web/get-commission-rate", authMiddleware, getCommissionRate);
-router.post("/dietitian/api/web/set-commission-rate", authMiddleware, setCommissionRate);
+router.post("/dietitian/api/web/set-commission-rate", authMiddleware, requireSettingsUnlock, setCommissionRate);
 
 router.post("/dietitian/api/web/run-breath-credits", authMiddleware, runBreathCreditsEndpoint);
 router.post("/dietitian/api/web/run-payouts", authMiddleware, runPayoutsEndpoint);
@@ -1072,6 +1078,10 @@ router.post("/dietitian/api/web/list-payouts", authMiddleware, listPayouts);
 router.post("/dietitian/api/web/commission-overview", authMiddleware, commissionOverview);
 router.post("/dietitian/api/web/super-admin-sales-analytics", authMiddleware, superAdminSalesAnalytics);
 router.post("/dietitian/api/web/super-admin-orders", authMiddleware, superAdminOrders);
+router.post("/dietitian/api/web/super-admin-test-codes", authMiddleware, superAdminTestCodes);
+router.post("/dietitian/api/web/cancel-order-subscription", authMiddleware, cancelOrderSubscription);
+router.post("/dietitian/api/web/simulate-renewal", authMiddleware, simulateRenewal);
+router.post("/dietitian/api/web/restore-subscription-discount", authMiddleware, restoreSubscriptionDiscount);
 router.post("/dietitian/api/web/super-admin-facility-people", authMiddleware, superAdminFacilityPeople);
 router.post("/dietitian/api/web/earnings-summary", authMiddleware, earningsSummary);
 router.post("/dietitian/api/web/list-facilities", authMiddleware, listFacilities);
@@ -1093,7 +1103,15 @@ router.post("/dietitian/api/web/qr-revoke", authMiddleware, referralOps.qrRevoke
 router.post("/dietitian/api/web/invite-revoke", authMiddleware, referralOps.inviteRevoke);
 router.post("/dietitian/api/web/list-trainer-admins", authMiddleware, referralOps.listTrainerAdmins);
 router.post("/dietitian/api/web/get-pricing", authMiddleware, referralOps.getPricing);
-router.post("/dietitian/api/web/set-pricing", authMiddleware, referralOps.setPricingEndpoint);
+router.post("/dietitian/api/web/set-pricing", authMiddleware, requireSettingsUnlock, referralOps.setPricingEndpoint);
+
+// Super Admin › Settings Google Authenticator gate (services/settingsLock.js).
+router.post("/dietitian/api/web/settings-lock-status", authMiddleware, settingsLock.settingsLockStatus);
+router.post("/dietitian/api/web/settings-lock-request", authMiddleware, settingsLock.settingsLockRequest);
+router.post("/dietitian/api/web/settings-lock-verify", authMiddleware, settingsLock.settingsCodeRateLimiter, settingsLock.settingsLockVerify);
+router.post("/dietitian/api/web/settings-mfa-setup", authMiddleware, settingsLock.settingsMfaSetup);
+router.post("/dietitian/api/web/settings-mfa-confirm", authMiddleware, settingsLock.settingsCodeRateLimiter, settingsLock.settingsMfaConfirm);
+router.post("/dietitian/api/web/settings-mfa-verify", authMiddleware, settingsLock.settingsCodeRateLimiter, settingsLock.settingsMfaVerify);
 
 
 router.post(

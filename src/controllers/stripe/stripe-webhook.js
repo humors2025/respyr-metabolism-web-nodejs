@@ -153,6 +153,17 @@ async function onCheckoutSessionCompleted(stripe, session) {
 
   if (schedule.metadata?.rysflo_term_months !== String(STRIPE_TERM_MONTHS)) {
     const phase = schedule.phases[0];
+    // Rewriting the phase replaces it wholesale, so the referral coupon
+    // (duration "forever") must be carried over or every renewal bills list
+    // price instead of the referred price.
+    const phaseDiscounts = (phase.discounts || [])
+      .map((d) => {
+        const promo = typeof d.promotion_code === "string" ? d.promotion_code : d.promotion_code?.id;
+        if (promo) return { promotion_code: promo };
+        const coupon = typeof d.coupon === "string" ? d.coupon : d.coupon?.id;
+        return coupon ? { coupon } : null;
+      })
+      .filter(Boolean);
     schedule = await stripe.subscriptionSchedules.update(
       schedule.id,
       {
@@ -162,6 +173,7 @@ async function onCheckoutSessionCompleted(stripe, session) {
             items: phase.items.map((i) => ({ price: i.price, quantity: i.quantity })),
             start_date: phase.start_date,
             duration: { interval: "month", interval_count: STRIPE_TERM_MONTHS },
+            ...(phaseDiscounts.length ? { discounts: phaseDiscounts } : {}),
             metadata: md,
           },
         ],
