@@ -44,7 +44,7 @@ const DEFAULT_BOARD = {
         { key: 'l5', label: 'L5 — Owner said yes' },
       ],
     },
-    { key: 'qr', label: 'QR up', subs: [], fields: ['qr_where', 'device_given', 'incentive'] },
+    { key: 'qr', label: 'QR up', subs: [], unlock: true, fields: ['qr_where', 'device_given', 'incentive'] },
     { key: 'stripe', label: 'Stripe onboarded', subs: [], fields: ['contact', 'email', 'partner_code'] },
     { key: 'sales', label: 'Sales', subs: [], fields: ['contact', 'phone', 'email', 'devices_sold', 'sales_amount'] },
   ],
@@ -248,7 +248,7 @@ async function saveBoard(cfg) {
     const key = str(c.key).trim(), label = str(c.label).trim();
     if (!key || !label) bad('every column needs a key and a label');
     const subs = (c.subs || []).map((s) => ({ key: str(s.key).trim().slice(0, 40), label: str(s.label).trim().slice(0, 120) })).filter((s) => s.key && s.label);
-    return { key: key.slice(0, 40), label: label.slice(0, 60), subs, fields: (c.fields || []).map((f) => str(f).slice(0, 40)) };
+    return { key: key.slice(0, 40), label: label.slice(0, 60), subs, fields: (c.fields || []).map((f) => str(f).slice(0, 40)), ...(c.unlock ? { unlock: true } : {}) };
   });
   await q(pool, 'INSERT INTO fc_board (id, `columns`) VALUES (1, ?) ON DUPLICATE KEY UPDATE `columns` = VALUES(`columns`)', [JSON.stringify(clean)]);
   return { columns: clean };
@@ -390,6 +390,10 @@ async function saveIn(conn, placeId, payload, t) {
   placeId = str(placeId).trim();
   if (!placeId) bad('place_id is required');
   const rec = clean(payload);
+  if (rec.email) {
+    rec.email = rec.email.toLowerCase();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(rec.email)) bad(`that email doesn't look right: ${rec.email}`);
+  }
   if (rec.phone) rec.phone = phoneE164(rec.phone);
   const repForDay = str(payload.rep);
   const today = dayIn(tzOf(t, repForDay));
