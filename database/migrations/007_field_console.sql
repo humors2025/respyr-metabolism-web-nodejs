@@ -83,6 +83,11 @@ CREATE TABLE IF NOT EXISTS `fc_cards` (
   `device_given`    ENUM('','yes','no') NOT NULL DEFAULT '',
   `incentive`       DECIMAL(10,2) NULL,
   `incentive_note`  VARCHAR(500)  NOT NULL DEFAULT '',
+  -- what the gym sold: running totals typed at the Sales stage, until they
+  -- are filled from the sales tables by partner_code (the gym's FAC… code)
+  `devices_sold`    INT UNSIGNED  NULL,
+  `sales_amount`    DECIMAL(12,2) NULL,
+  `partner_code`    VARCHAR(50)   NOT NULL DEFAULT '',
   -- a place carrying its own identity (not in the prospect list)
   `name`            VARCHAR(200)  NOT NULL DEFAULT '',
   `address`         VARCHAR(300)  NOT NULL DEFAULT '',
@@ -122,7 +127,8 @@ CREATE TABLE IF NOT EXISTS `fc_cards` (
   KEY `idx_fc_cards_col` (`col`),
   KEY `idx_fc_cards_rep` (`rep_key`),
   KEY `idx_fc_cards_plan_date` (`plan_date`),
-  KEY `idx_fc_cards_next_date` (`next_date`)
+  KEY `idx_fc_cards_next_date` (`next_date`),
+  KEY `idx_fc_cards_partner_code` (`partner_code`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- ----------------------------------------------------------------------------

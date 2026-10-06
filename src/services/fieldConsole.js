@@ -45,8 +45,8 @@ const DEFAULT_BOARD = {
       ],
     },
     { key: 'qr', label: 'QR up', subs: [], fields: ['qr_where', 'device_given', 'incentive'] },
-    { key: 'stripe', label: 'Stripe onboarded', subs: [], fields: ['contact', 'email'] },
-    { key: 'sales', label: 'Sales', subs: [], fields: ['contact', 'phone', 'email'] },
+    { key: 'stripe', label: 'Stripe onboarded', subs: [], fields: ['contact', 'email', 'partner_code'] },
+    { key: 'sales', label: 'Sales', subs: [], fields: ['contact', 'phone', 'email', 'devices_sold', 'sales_amount'] },
   ],
 };
 
@@ -62,10 +62,12 @@ const FIELDS = [
   'photo', 'rating', 'reviews', 'g_type', 'hours', 'verified',
   'confirm',
   'plan_id', 'plan_date', 'plan_stop',
+  'devices_sold', 'sales_amount', 'partner_code',
 ];
 
 // Fields whose change is worth a line in the card's history.
 const TRACKED = ['col', 'sub', 'dead', 'contact', 'role', 'phone', 'email', 'plan_date',
+  'devices_sold', 'sales_amount', 'partner_code',
   'next_action', 'next_date', 'qr_where', 'device_given', 'incentive',
   'name', 'address', 'city', 'via'];
 
@@ -257,7 +259,8 @@ async function saveBoard(cfg) {
 // Card fields stored as plain text columns, same name in the record.
 const TEXT_COLS = ['col', 'sub', 'dead', 'contact', 'role', 'phone', 'email', 'next_action',
   'qr_where', 'device_given', 'incentive_note', 'name', 'address', 'city', 'metro', 'kind', 'via',
-  'photo', 'rating', 'reviews', 'g_type', 'hours', 'verified', 'confirm', 'plan_id', 'last_note', 'removed_by'];
+  'photo', 'rating', 'reviews', 'g_type', 'hours', 'verified', 'confirm', 'plan_id', 'last_note', 'removed_by',
+  'partner_code'];
 
 /* A row, read back as the record crm.py returned. Empty values are left out,
    as they were absent in crm.json. */
@@ -270,6 +273,8 @@ function recOf(row) {
   if (row.plan_date) r.plan_date = row.plan_date;
   if (row.plan_stop !== null && row.plan_stop !== undefined) r.plan_stop = String(row.plan_stop);
   if (row.incentive !== null && row.incentive !== undefined) r.incentive = String(+row.incentive);
+  if (row.devices_sold !== null && row.devices_sold !== undefined) r.devices_sold = String(row.devices_sold);
+  if (row.sales_amount !== null && row.sales_amount !== undefined) r.sales_amount = String(+row.sales_amount);
   if (row.lat !== null && row.lat !== undefined) r.lat = String(+row.lat);
   if (row.lon !== null && row.lon !== undefined) r.lon = String(+row.lon);
   if (row.first_visit) r.first_visit = row.first_visit;
@@ -297,6 +302,8 @@ async function writeCard(conn, rec) {
     next_date: day(rec.next_date), plan_date: day(rec.plan_date),
     plan_stop: str(rec.plan_stop).trim() === '' ? null : parseInt(rec.plan_stop, 10) || null,
     incentive: num(rec.incentive), lat: num(rec.lat), lon: num(rec.lon),
+    devices_sold: num(rec.devices_sold) === null || Number.isNaN(num(rec.devices_sold)) ? num(rec.devices_sold) : Math.max(0, Math.round(num(rec.devices_sold))),
+    sales_amount: num(rec.sales_amount),
     removed: rec.removed ? 1 : 0, removed_reason: rec.removed ? str(rec.removed_reason) : null,
     removed_at: rec.removed ? ts(rec.removed_at) : null,
     col_since: ts(rec.col_since), first_visit: day(rec.first_visit), last_visit: day(rec.last_visit),
@@ -307,6 +314,8 @@ async function writeCard(conn, rec) {
   if (!DEAD.includes(row.dead)) row.dead = '';
   if (!['', 'yes', 'no'].includes(row.device_given)) row.device_given = '';
   if (Number.isNaN(row.incentive)) bad(`incentive must be a number: ${rec.incentive}`);
+  if (Number.isNaN(row.devices_sold)) bad(`devices sold must be a number: ${rec.devices_sold}`);
+  if (Number.isNaN(row.sales_amount)) bad(`sales must be a number: ${rec.sales_amount}`);
   const cols = Object.keys(row);
   await q(conn, `INSERT INTO fc_cards (${cols.map((c) => '`' + c + '`').join(', ')}) VALUES (${cols.map(() => '?').join(', ')})
     ON DUPLICATE KEY UPDATE ${cols.filter((c) => c !== 'place_id').map((c) => '`' + c + '` = VALUES(`' + c + '`)').join(', ')}`,

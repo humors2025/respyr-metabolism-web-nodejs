@@ -47,7 +47,7 @@ const num = (v) => (s(v).trim() === '' || Number.isNaN(Number(s(v).replace(/[$,]
 
 const TEXT = ['col', 'sub', 'dead', 'contact', 'role', 'phone', 'email', 'next_action', 'qr_where', 'device_given', 'incentive_note',
   'name', 'address', 'city', 'metro', 'kind', 'via', 'photo', 'rating', 'reviews', 'g_type', 'hours', 'verified', 'confirm',
-  'plan_id', 'last_note', 'removed_by'];
+  'plan_id', 'last_note', 'removed_by', 'partner_code'];
 
 const OLD = { todo: ['planned', ''], visited: ['visited', 'l1'], met: ['visited', 'l3'], interested: ['visited', 'l5'], signed: ['sales', ''], revisit: ['visited', ''], no: ['visited', ''], closed: ['visited', ''], moved: ['visited', ''] };
 
@@ -80,6 +80,7 @@ const OLD = { todo: ['planned', ''], visited: ['visited', 'l1'], met: ['visited'
         plan_stop: parseInt(c.plan_stop, 10) || null, incentive: num(c.incentive), lat: num(c.lat), lon: num(c.lon),
         removed: c.removed ? 1 : 0, removed_reason: c.removed ? s(c.removed_reason) : null, removed_at: c.removed ? sqlTs(c.removed_at) : null,
         col_since: sqlTs(c.col_since || c.updated || c.created), first_visit: day(c.first_visit), last_visit: day(c.last_visit),
+        devices_sold: num(c.devices_sold) === null ? null : Math.round(num(c.devices_sold)), sales_amount: num(c.sales_amount),
         touches: +c.touches || 0, notes_n: +c.notes_n || 0, last_note_at: sqlTs(c.last_note_at),
         created_at: sqlTs(c.created) || sqlTs(new Date().toISOString()), updated_at: sqlTs(c.updated) || sqlTs(new Date().toISOString()) };
       for (const k of TEXT) row[k] = s(c[k]);
