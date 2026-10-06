@@ -1389,5 +1389,27 @@ router.post(
 // Only live rows (deleted = 0) are returned.
 router.post("/dietitian/api/web/food-log", authMiddleware, foodLog);
 
-module.exports = router;
+// Field Console — the US field team's CRM, routes and day plans
+// (salesforce.rysflo.com). super_admin and admin only; see the controller.
+const field = require("../controllers/fieldConsole/fieldConsoleController");
+const F = "/dietitian/api/web/field";
+router.get(`${F}/me`, authMiddleware, field.me);
+router.get(`${F}/crm`, authMiddleware, field.crm);
+router.get(`${F}/crm/history`, authMiddleware, field.history);
+router.get(`${F}/crm/log`, authMiddleware, field.log);
+router.get(`${F}/crm/export.csv`, authMiddleware, field.exportCsv);
+router.get(`${F}/team`, authMiddleware, field.team);
+router.get(`${F}/checks`, authMiddleware, field.checks);
+router.get(`${F}/places`, authMiddleware, field.places);
+router.get(`${F}/resolve`, authMiddleware, field.resolve);
+router.post(`${F}/crm`, authMiddleware, field.save);
+router.post(`${F}/note`, authMiddleware, field.note);
+router.post(`${F}/remove`, authMiddleware, field.remove);
+router.post(`${F}/plan`, authMiddleware, field.plan);
+router.post(`${F}/plan/move`, authMiddleware, field.planMove);
+router.post(`${F}/plan/delete`, authMiddleware, field.planDelete);
+router.post(`${F}/board`, authMiddleware, field.saveBoard);
+router.post(`${F}/team`, authMiddleware, field.saveTeam);
+router.post(`${F}/check`, authMiddleware, field.check);
 
+module.exports = router;
