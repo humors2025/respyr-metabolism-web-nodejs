@@ -16,7 +16,9 @@
  *   POST /dietitian/api/web/resend-purchase-code { stripe_subscription_id }
  *   POST /dietitian/api/web/qr-generate          (super_admin) { count }
  *   POST /dietitian/api/web/qr-link              (super_admin, admin) { qr_id, target_user_id | null }
- *   POST /dietitian/api/web/qr-list              (super_admin, admin) { status?, facility_id? }
+ *   POST /dietitian/api/web/qr-list              (super_admin, admin) { status?, facility_id?,
+ *        page?, limit? (1-100, default 20), filter? (all|unset|live) } — sending page opts into
+ *        pagination (+ pagination/counts in the response); without it the legacy ≤1000-row shape
  *   POST /dietitian/api/web/get-pricing          (any role)
  *   POST /dietitian/api/web/set-pricing          (super_admin) { list_price, referred_price, note? }
  */
@@ -424,6 +426,14 @@ const qrLink = guard(async (req, res) => {
   return res.status(200).json({ ok: true, qr: row });
 });
 
+// The dashboard's filter pills, expressed in SQL so paginated pages and the
+// pill counts agree with what the client used to compute over the full list.
+const QR_FILTERS = {
+  all: "q.status <> 'retired'",
+  unset: "(q.status <> 'assigned' OR q.partner_code IS NULL)",
+  live: "(q.status = 'assigned' AND q.partner_code IS NOT NULL)",
+};
+
 const qrList = guard(async (req, res) => {
   const a = await actor(req, res, ["super_admin", "admin"]);
   if (!a) return;
@@ -437,6 +447,37 @@ const qrList = guard(async (req, res) => {
     where.push("LOWER(q.assigned_to_user_id) = ?");
     params.push(a.actorEmail);
   }
+
+  // Pagination is opt-in: legacy callers (sticker print sheet, facilities
+  // panel) send no page and keep the single-response shape with up to 1000 rows.
+  const paginate = req.body?.page != null;
+  const filter = paginate && QR_FILTERS[req.body?.filter] ? String(req.body.filter) : null;
+
+  let pagination;
+  let counts;
+  let limitSql = "LIMIT 1000";
+  const listWhere = [...where];
+  if (filter) listWhere.push(QR_FILTERS[filter]);
+  if (paginate) {
+    const page = Math.max(1, parseInt(req.body.page, 10) || 1);
+    const limit = Math.min(100, Math.max(1, parseInt(req.body.limit, 10) || 20));
+    const [[c]] = await pool.execute(
+      `SELECT COUNT(*) AS total_rows,
+              COALESCE(SUM(${QR_FILTERS.all}), 0) AS all_rows,
+              COALESCE(SUM(${QR_FILTERS.unset}), 0) AS unset_rows,
+              COALESCE(SUM(${QR_FILTERS.live}), 0) AS live_rows
+       FROM qr_codes q
+       ${where.length ? "WHERE " + where.join(" AND ") : ""}`,
+      params
+    );
+    counts = { all: Number(c.all_rows), unset: Number(c.unset_rows), live: Number(c.live_rows) };
+    const total = filter ? counts[filter] : Number(c.total_rows);
+    pagination = { page, limit, total, total_pages: Math.max(1, Math.ceil(total / limit)) };
+    // Validated integers inlined: placeholders inside LIMIT are rejected by
+    // some MySQL server versions in execute().
+    limitSql = `LIMIT ${limit} OFFSET ${(page - 1) * limit}`;
+  }
+
   const [rows] = await pool.execute(
     `
       SELECT q.id, q.batch_id, q.status, q.assigned_to_user_id, q.assigned_at, q.partner_code, q.target_type, q.target_label,
@@ -446,9 +487,9 @@ const qrList = guard(async (req, res) => {
       FROM qr_codes q
       LEFT JOIN facilities f ON f.id = q.facility_id
       LEFT JOIN app_user_invitations inv ON inv.id = q.invitation_id
-      ${where.length ? "WHERE " + where.join(" AND ") : ""}
+      ${listWhere.length ? "WHERE " + listWhere.join(" AND ") : ""}
       ORDER BY q.assigned_at DESC, q.created_at DESC, q.id
-      LIMIT 1000
+      ${limitSql}
     `,
     params
   );
@@ -467,7 +508,7 @@ const qrList = guard(async (req, res) => {
     );
     allocation = alloc.map((r) => ({ ta: r.ta || null, ta_name: r.ta_name || null, unassigned: Number(r.unassigned), linked: Number(r.linked), total: Number(r.total) }));
   }
-  return res.status(200).json({ ok: true, items: rows, allocation });
+  return res.status(200).json({ ok: true, items: rows, allocation, ...(pagination ? { pagination, counts, filter: filter || "all" } : {}) });
 });
 
 /**
