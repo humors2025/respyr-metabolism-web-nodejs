@@ -118,7 +118,9 @@ const shiftDay = (d, n) => { const t = new Date(d + 'T12:00:00Z'); t.setUTCDate(
    in the server's local zone. */
 const typeCast = (field, next) => {
   if (field.type === 'DATE' || field.type === 'DATETIME' || field.type === 'TIMESTAMP') return field.string();
-  if (field.type === 'JSON') { const s = field.string(); return s === null ? null : JSON.parse(s); }
+  // JSON columns report the binary charset; newer mysql2 then decodes them as
+  // latin1 ("—" read back as "â", "José" as "JosÃ©"). They hold UTF-8.
+  if (field.type === 'JSON') { const s = field.string('utf8'); return s === null ? null : JSON.parse(s); }
   return next();
 };
 const q = (conn, sql, params = []) => conn.query({ sql, typeCast }, params).then(([rows]) => rows);
