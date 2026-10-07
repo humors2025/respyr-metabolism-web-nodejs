@@ -1412,5 +1412,6 @@ router.post(`${F}/board`, authMiddleware, field.saveBoard);
 router.post(`${F}/team`, authMiddleware, field.saveTeam);
 router.post(`${F}/check`, authMiddleware, field.check);
 router.post(`${F}/order`, authMiddleware, field.order);
+router.post(`${F}/redate`, authMiddleware, field.redate);
 
 module.exports = router;

@@ -440,7 +440,10 @@ async function saveIn(conn, placeId, payload, t) {
     merged.last_note_at = now;
   }
   const day = on || dayIn(tzOf(t, str(merged.rep)));
-  if (merged.col !== 'planned') {
+  // Putting a card on a day (a revisit) is a plan, not a visit.
+  const planOnly = Object.keys(payload).filter((k) => !['place_id', 'rep', 'on'].includes(k))
+    .every((k) => ['plan_id', 'plan_date', 'plan_stop', 'next_date'].includes(k));
+  if (merged.col !== 'planned' && !planOnly) {
     if (!merged.first_visit || day < merged.first_visit) merged.first_visit = day;
     if (day >= str(merged.last_visit)) merged.last_visit = day;
   }
@@ -472,6 +475,40 @@ async function save(placeId, payload) {
 }
 
 /* A dated note. Notes are never edited or replaced. */
+/* Fix the day one history line is filed under (a visit logged on the 7th that
+   happened on the 1st). The line keeps its timestamp, gets the right day, and
+   a "redated" line records who changed it from what to what. The card's first
+   and last visit and days-in-stage are worked out again from the history. */
+async function redate(placeId, at, type, on, rep = '') {
+  placeId = str(placeId).trim();
+  if (!['added', 'move', 'edit', 'note'].includes(type)) bad('only visits, moves, edits and notes have a day to fix');
+  return tx(async (conn) => {
+    const t = await team(conn);
+    if (!isDay(str(on)) || on > dayIn(tzOf(t, rep))) bad(`pick a real day, not in the future: ${on}`);
+    const [ev] = await q(conn, 'SELECT id, on_day, col FROM fc_events WHERE place_id = ? AND at = ? AND type = ? LIMIT 1 FOR UPDATE',
+      [placeId, sqlOfIso(at), type]);
+    if (!ev) bad("that history line wasn't found");
+    const was = str(ev.on_day instanceof Date ? ev.on_day.toISOString().slice(0, 10) : ev.on_day).slice(0, 10);
+    if (was !== on) {
+      await q(conn, 'UPDATE fc_events SET on_day = ? WHERE id = ?', [on, ev.id]);
+      const now = new Date().toISOString().slice(0, 19) + '+00:00';
+      await addEvent(conn, { type: 'redated', place_id: placeId, at: now, on: dayIn(tzOf(t, rep)), rep, col: ev.col,
+        target_at: at, target_type: type, was, now: on });
+      const [d] = await q(conn, `SELECT MIN(on_day) AS f, MAX(on_day) AS l FROM fc_events
+        WHERE place_id = ? AND type IN ('added','move','edit','note') AND col IS NOT NULL AND col NOT IN ('', 'planned')`, [placeId]);
+      const c = await getCard(conn, placeId, true);
+      const [mv] = await q(conn, `SELECT on_day FROM fc_events WHERE place_id = ? AND type IN ('move','added') AND col = ?
+        ORDER BY at DESC LIMIT 1`, [placeId, c ? c.col : '']);
+      if (c && d && d.f) {
+        const iso = (v) => (v instanceof Date ? v.toISOString().slice(0, 10) : str(v).slice(0, 10));
+        await q(conn, 'UPDATE fc_cards SET first_visit = ?, last_visit = ?, col_since = COALESCE(?, col_since) WHERE place_id = ?',
+          [iso(d.f), iso(d.l), mv ? `${iso(mv.on_day)} 12:00:00` : null, placeId]);
+      }
+    }
+    return getCard(conn, placeId);
+  });
+}
+
 async function addNote(placeId, text, rep = '', on = null) {
   placeId = str(placeId).trim();
   text = str(text).trim().slice(0, MAX_LEN);
@@ -724,7 +761,7 @@ async function exportCsv() {
 module.exports = {
   FieldError, phoneE164, dayIn,
   team, saveTeam, board, saveBoard,
-  allRecords, save, addNote, setRemoved, summary, log, history,
+  allRecords, save, addNote, redate, setRemoved, summary, log, history,
   plans, planDay, moveToDay, deletePlan,
   checks, staleChecks, saveChecks, exportCsv,
   writeCard, addEvent, tx, q,

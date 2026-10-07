@@ -98,6 +98,12 @@ const note = handle(async (req, actor) => {
   return { record: rec, summary: await fc.summary() };
 }, { write: true });
 
+const redate = handle(async (req, actor) => {
+  const p = body(req);
+  const rec = await fc.redate(p.place_id, p.at, p.type, p.on, repFor(actor, p.rep));
+  return { record: rec, summary: await fc.summary() };
+}, { write: true });
+
 const remove = handle(async (req, actor) => {
   const p = body(req);
   const rec = await fc.setRemoved(p.place_id, !p.restore, p.reason || '', repFor(actor, p.rep));
@@ -259,5 +265,5 @@ const order = handle(async (req, actor, res) => {
 module.exports = {
   me, crm, history, log, exportCsv, team, checks,
   save, note, remove, plan, planMove, planDelete, saveBoard, saveTeam,
-  places, resolve, check, order,
+  places, resolve, check, order, redate,
 };
