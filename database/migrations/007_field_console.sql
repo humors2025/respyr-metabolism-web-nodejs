@@ -88,6 +88,11 @@ CREATE TABLE IF NOT EXISTS `fc_cards` (
   `devices_sold`    INT UNSIGNED  NULL,
   `sales_amount`    DECIMAL(12,2) NULL,
   `partner_code`    VARCHAR(50)   NOT NULL DEFAULT '',
+  -- someone else's number handed over at the desk, and who gave it
+  `ref_name`        VARCHAR(255)  NOT NULL DEFAULT '',
+  `ref_role`        VARCHAR(100)  NOT NULL DEFAULT '',
+  `ref_phone`       VARCHAR(32)   NOT NULL DEFAULT '',
+  `ref_via`         VARCHAR(255)  NOT NULL DEFAULT '',
   -- a place carrying its own identity (not in the prospect list)
   `name`            VARCHAR(200)  NOT NULL DEFAULT '',
   `address`         VARCHAR(300)  NOT NULL DEFAULT '',

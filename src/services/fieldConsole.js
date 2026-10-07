@@ -35,13 +35,16 @@ const DEFAULT_BOARD = {
   columns: [
     { key: 'planned', label: 'Planned', subs: [], fields: [] },
     {
-      key: 'visited', label: 'Visited', fields: ['contact', 'role', 'phone'],
+      key: 'visited', label: 'Visited', fields: ['contact', 'role', 'phone', 'email'],
+      // Keys are fixed (history uses them); the front-desk-manager rung came
+      // later, so it is key 'fdm' shown as L3 and the old L3–L5 read L4–L6.
       subs: [
         { key: 'l1', label: 'L1 — Nobody to talk to' },
         { key: 'l2', label: 'L2 — Front desk only' },
-        { key: 'l3', label: 'L3 — Met the owner' },
-        { key: 'l4', label: 'L4 — Demoed the device' },
-        { key: 'l5', label: 'L5 — Owner said yes' },
+        { key: 'fdm', label: 'L3 — Met the front desk manager' },
+        { key: 'l3', label: 'L4 — Met the owner' },
+        { key: 'l4', label: 'L5 — Demoed the device' },
+        { key: 'l5', label: 'L6 — Owner said yes' },
       ],
     },
     { key: 'qr', label: 'QR up', subs: [], unlock: true, fields: ['qr_where', 'device_given', 'incentive'] },
@@ -62,12 +65,12 @@ const FIELDS = [
   'photo', 'rating', 'reviews', 'g_type', 'hours', 'verified',
   'confirm',
   'plan_id', 'plan_date', 'plan_stop',
-  'devices_sold', 'sales_amount', 'partner_code',
+  'devices_sold', 'sales_amount', 'partner_code', 'ref_name', 'ref_role', 'ref_phone', 'ref_via',
 ];
 
 // Fields whose change is worth a line in the card's history.
 const TRACKED = ['col', 'sub', 'dead', 'contact', 'role', 'phone', 'email', 'plan_date',
-  'devices_sold', 'sales_amount', 'partner_code',
+  'devices_sold', 'sales_amount', 'partner_code', 'ref_name', 'ref_role', 'ref_phone', 'ref_via',
   'next_action', 'next_date', 'qr_where', 'device_given', 'incentive',
   'name', 'address', 'city', 'via'];
 
@@ -260,7 +263,7 @@ async function saveBoard(cfg) {
 const TEXT_COLS = ['col', 'sub', 'dead', 'contact', 'role', 'phone', 'email', 'next_action',
   'qr_where', 'device_given', 'incentive_note', 'name', 'address', 'city', 'metro', 'kind', 'via',
   'photo', 'rating', 'reviews', 'g_type', 'hours', 'verified', 'confirm', 'plan_id', 'last_note', 'removed_by',
-  'partner_code'];
+  'partner_code', 'ref_name', 'ref_role', 'ref_phone', 'ref_via'];
 
 /* A row, read back as the record crm.py returned. Empty values are left out,
    as they were absent in crm.json. */
@@ -395,6 +398,7 @@ async function saveIn(conn, placeId, payload, t) {
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(rec.email)) bad(`that email doesn't look right: ${rec.email}`);
   }
   if (rec.phone) rec.phone = phoneE164(rec.phone);
+  if (rec.ref_phone) rec.ref_phone = phoneE164(rec.ref_phone);
   const repForDay = str(payload.rep);
   const today = dayIn(tzOf(t, repForDay));
   let on = null;

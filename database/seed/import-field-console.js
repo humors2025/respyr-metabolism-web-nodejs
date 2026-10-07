@@ -47,7 +47,7 @@ const num = (v) => (s(v).trim() === '' || Number.isNaN(Number(s(v).replace(/[$,]
 
 const TEXT = ['col', 'sub', 'dead', 'contact', 'role', 'phone', 'email', 'next_action', 'qr_where', 'device_given', 'incentive_note',
   'name', 'address', 'city', 'metro', 'kind', 'via', 'photo', 'rating', 'reviews', 'g_type', 'hours', 'verified', 'confirm',
-  'plan_id', 'last_note', 'removed_by', 'partner_code'];
+  'plan_id', 'last_note', 'removed_by', 'partner_code', 'ref_name', 'ref_role', 'ref_phone', 'ref_via'];
 
 const OLD = { todo: ['planned', ''], visited: ['visited', 'l1'], met: ['visited', 'l3'], interested: ['visited', 'l5'], signed: ['sales', ''], revisit: ['visited', ''], no: ['visited', ''], closed: ['visited', ''], moved: ['visited', ''] };
 
