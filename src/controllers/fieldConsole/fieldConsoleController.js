@@ -168,10 +168,24 @@ const resolve = handle(async (req, actor, res) => {
   const url = String(req.query.url || '').trim();
   if (!/^https?:\/\//.test(url)) { res.status(400).json({ error: 'Paste the whole link, starting with https://' }); return undefined; }
   let final = url;
-  try {
-    const r = await axios.get(url, { maxRedirects: 10, timeout: 10000, headers: { 'User-Agent': 'Mozilla/5.0' }, validateStatus: () => true });
-    final = r.request?.res?.responseUrl || final;
-  } catch { /* a dead short link may still carry coordinates */ }
+  let reached = false;
+  // A short link's redirect already holds the place's name and pin: read the
+  // Location header and stop. Following it downloads the whole Maps page
+  // (~12 s), which timed out. Up to 5 hops, 3 tries.
+  for (let attempt = 0; attempt < 3 && !reached; attempt += 1) {
+    try {
+      let cur = url;
+      for (let hop = 0; hop < 5; hop += 1) {
+        if (cur !== url && /google\.[a-z.]+\/maps|[?&](q|ll|query)=/.test(cur)) break;
+        const r = await axios.head(cur, { maxRedirects: 0, timeout: 8000, headers: { 'User-Agent': 'Mozilla/5.0' }, validateStatus: () => true });
+        const nxt = r.headers && r.headers.location;
+        if (!nxt) break;
+        cur = new URL(nxt, cur).toString();
+      }
+      final = cur;
+      reached = true;
+    } catch { await new Promise((ok) => setTimeout(ok, 600 * (attempt + 1))); }
+  }
   const dec = decodeURIComponent(final);
   let lat = null, lon = null;
   for (const pat of [/!3d(-?\d+\.\d+)!4d(-?\d+\.\d+)/, /@(-?\d+\.\d+),(-?\d+\.\d+)/, /[?&](?:q|ll|query)=(-?\d+\.\d+),\s*(-?\d+\.\d+)/]) {
@@ -180,7 +194,7 @@ const resolve = handle(async (req, actor, res) => {
   }
   const nm = dec.match(/\/place\/([^/@?]+)/);
   const name = nm ? nm[1].replace(/\+/g, ' ').trim() : '';
-  const out = { url: final, name, lat, lon, google: null };
+  const out = { url: final, name, lat, lon, google: null, unreached: !reached && !name && lat === null };
   if (name || lat !== null) {
     const q = { textQuery: name || `${lat},${lon}`, maxResultCount: 3 };
     if (lat !== null) q.locationBias = { circle: { center: { latitude: lat, longitude: lon }, radius: 400 } };
