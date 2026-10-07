@@ -234,8 +234,30 @@ const check = handle(async (req) => {
   return { checks: await fc.checks(ids), asked: todo.length, cached: ids.length - todo.length, failed };
 }, { write: true });
 
+/* The day's stops in the fastest driving order (Google Routes API): start
+   where the rep says, end at their base. stops: [{id, lat, lon}], up to 25. */
+const order = handle(async (req, actor, res) => {
+  const b = req.body || {};
+  const pts = (Array.isArray(b.stops) ? b.stops : []).filter((x) => x && x.lat !== null && x.lat !== undefined).slice(0, 25);
+  const start = b.start || {}, end = b.end || b.start || {};
+  if (pts.length < 2 || start.lat === null || start.lat === undefined) return { order: pts.map((p) => p.id) };
+  const ll = (p) => ({ location: { latLng: { latitude: +p.lat, longitude: +p.lon } } });
+  try {
+    const r = await axios.post('https://routes.googleapis.com/directions/v2:computeRoutes',
+      { origin: ll(start), destination: ll(end), intermediates: pts.map(ll), travelMode: 'DRIVE', optimizeWaypointOrder: true },
+      { headers: { 'X-Goog-Api-Key': mapsKey(), 'X-Goog-FieldMask': 'routes.optimizedIntermediateWaypointIndex,routes.distanceMeters,routes.duration' }, timeout: 20000 });
+    const route = (r.data.routes || [{}])[0];
+    const idx = route.optimizedIntermediateWaypointIndex || pts.map((_, i) => i);
+    return { order: idx.map((i) => pts[i].id), km: Math.round((route.distanceMeters || 0) / 100) / 10,
+      minutes: Math.round(parseInt(String(route.duration || '0s'), 10) / 60) };
+  } catch (e) {
+    res.status(502).json({ error: 'Google could not work out the order' });
+    return undefined;
+  }
+});
+
 module.exports = {
   me, crm, history, log, exportCsv, team, checks,
   save, note, remove, plan, planMove, planDelete, saveBoard, saveTeam,
-  places, resolve, check,
+  places, resolve, check, order,
 };

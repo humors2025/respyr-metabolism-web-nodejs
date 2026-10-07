@@ -1411,5 +1411,6 @@ router.post(`${F}/plan/delete`, authMiddleware, field.planDelete);
 router.post(`${F}/board`, authMiddleware, field.saveBoard);
 router.post(`${F}/team`, authMiddleware, field.saveTeam);
 router.post(`${F}/check`, authMiddleware, field.check);
+router.post(`${F}/order`, authMiddleware, field.order);
 
 module.exports = router;

@@ -65,7 +65,7 @@ const FIELDS = [
   'photo', 'rating', 'reviews', 'g_type', 'hours', 'verified',
   'confirm',
   'plan_id', 'plan_date', 'plan_stop',
-  'devices_sold', 'sales_amount', 'partner_code', 'ref_name', 'ref_role', 'ref_phone', 'ref_via',
+  'devices_sold', 'sales_amount', 'partner_code', 'ref_name', 'ref_role', 'ref_phone', 'ref_via', 'g_phone',
 ];
 
 // Fields whose change is worth a line in the card's history.
@@ -263,7 +263,7 @@ async function saveBoard(cfg) {
 const TEXT_COLS = ['col', 'sub', 'dead', 'contact', 'role', 'phone', 'email', 'next_action',
   'qr_where', 'device_given', 'incentive_note', 'name', 'address', 'city', 'metro', 'kind', 'via',
   'photo', 'rating', 'reviews', 'g_type', 'hours', 'verified', 'confirm', 'plan_id', 'last_note', 'removed_by',
-  'partner_code', 'ref_name', 'ref_role', 'ref_phone', 'ref_via'];
+  'partner_code', 'ref_name', 'ref_role', 'ref_phone', 'ref_via', 'g_phone'];
 
 /* A row, read back as the record crm.py returned. Empty values are left out,
    as they were absent in crm.json. */
@@ -399,6 +399,7 @@ async function saveIn(conn, placeId, payload, t) {
   }
   if (rec.phone) rec.phone = phoneE164(rec.phone);
   if (rec.ref_phone) rec.ref_phone = phoneE164(rec.ref_phone);
+  if (rec.g_phone) rec.g_phone = phoneE164(rec.g_phone);
   const repForDay = str(payload.rep);
   const today = dayIn(tzOf(t, repForDay));
   let on = null;
@@ -460,7 +461,8 @@ async function saveIn(conn, placeId, payload, t) {
     type: !Object.keys(prev).length ? 'added' : moved ? 'move' : 'edit',
     from: prev.col ?? null, from_sub: prev.sub ?? null, changes,
   });
-  await addEvent(conn, entry);
+  // A save that only renumbers a day is not news; history keeps what a person would read back.
+  if (entry.type !== 'edit' || Object.keys(changes).length) await addEvent(conn, entry);
   if (note) await addEvent(conn, { type: 'note', place_id: placeId, at: now, on: day, rep: str(rec.rep), text: note, col: merged.col });
   return getCard(conn, placeId);
 }
@@ -504,8 +506,20 @@ async function setRemoved(placeId, removed, reason = '', rep = '') {
     if (!rec) bad("that card isn't in the CRM");
     if (Boolean(rec.removed) === Boolean(removed)) return rec;
     const now = new Date().toISOString().slice(0, 19) + '+00:00';
-    if (removed) Object.assign(rec, { removed: 'yes', removed_reason: reason, removed_at: now, removed_by: rep });
-    else for (const k of ['removed', 'removed_reason', 'removed_at', 'removed_by']) delete rec[k];
+    if (removed) {
+      Object.assign(rec, { removed: 'yes', removed_reason: reason, removed_at: now, removed_by: rep });
+      // Discarded comes off any day it was on; the rest of that day renumbers.
+      if (rec.plan_id) {
+        const plans = await q(conn, 'SELECT DISTINCT plan_id FROM fc_plan_stops WHERE place_id = ?', [placeId]);
+        for (const { plan_id: id } of plans) {
+          const left = (await q(conn, 'SELECT place_id FROM fc_plan_stops WHERE plan_id = ? ORDER BY position', [id])).map((r) => r.place_id).filter((x) => x !== placeId);
+          await writeStops(conn, id, left);
+          if (!left.length) await q(conn, 'DELETE FROM fc_day_plans WHERE id = ?', [id]);
+          else await renumber(conn, id, left);
+        }
+        Object.assign(rec, { plan_id: null, plan_date: null, plan_stop: null });
+      }
+    } else for (const k of ['removed', 'removed_reason', 'removed_at', 'removed_by']) delete rec[k];
     rec.updated = now;
     await writeCard(conn, rec);
     await addEvent(conn, { type: removed ? 'removed' : 'restored', place_id: placeId, at: now, on: dayIn(tzOf(t, rep)), rep, reason, col: rec.col });
@@ -565,7 +579,12 @@ async function planDay(payload) {
     for (const [i, place] of stops.entries()) {
       const c = await getCard(conn, place, true);
       if (c && c.removed) continue;
-      if (c && c.col && c.col !== 'planned') { out.revisits += 1; continue; }
+      if (c && c.col && c.col !== 'planned') {
+        // A revisit: on the day like any stop, stage left alone.
+        out.revisits += 1;
+        if (c.plan_id !== pid || String(c.plan_stop) !== String(i + 1)) await saveIn(conn, place, { rep, plan_id: pid, plan_date: date, plan_stop: String(i + 1) }, t);
+        continue;
+      }
       if (!c) out.added += 1; else if (c.plan_id === pid) out.kept += 1; else out.moved += 1;
       const meta = (!c && payload.meta && payload.meta[place]) || {};
       const extra = {};
@@ -618,7 +637,8 @@ async function moveToDay(placeId, date, rep, at = null) {
     const t = await team(conn);
     const c = await getCard(conn, placeId, true);
     if (!c) bad("that card isn't in the CRM");
-    if (c.col !== 'planned') bad('only Planned cards go on a day');
+    if (c.removed) bad('that card was removed; restore it first');
+    const first = c.col === 'planned';   // otherwise a revisit: keeps its stage and its own next step
     const owner = rep || c.rep || '';
     const touched = await q(conn, 'SELECT DISTINCT p.id FROM fc_day_plans p JOIN fc_plan_stops s ON s.plan_id = p.id WHERE s.place_id = ? AND p.rep_key = ?', [placeId, owner]);
     for (const { id } of touched) {
@@ -627,7 +647,7 @@ async function moveToDay(placeId, date, rep, at = null) {
       if (!left.length) await q(conn, 'DELETE FROM fc_day_plans WHERE id = ?', [id]);
       else await renumber(conn, id, left);
     }
-    if (!date) return saveIn(conn, placeId, { plan_id: '', plan_date: '', plan_stop: '', next_date: '', rep: owner }, t);
+    if (!date) return saveIn(conn, placeId, { plan_id: '', plan_date: '', plan_stop: '', ...(first ? { next_date: '' } : {}), rep: owner }, t);
     const pid = `${owner}:${date}`;
     await q(conn, 'INSERT IGNORE INTO fc_day_plans (id, rep_key, plan_date, name) VALUES (?, ?, ?, ?)', [pid, owner, date, `Day plan ${date}`]);
     const list = (await q(conn, 'SELECT place_id FROM fc_plan_stops WHERE plan_id = ? ORDER BY position', [pid])).map((r) => r.place_id);
@@ -635,7 +655,7 @@ async function moveToDay(placeId, date, rep, at = null) {
     list.splice(i, 0, placeId);
     await writeStops(conn, pid, list);
     await renumber(conn, pid, list, placeId);
-    return saveIn(conn, placeId, { plan_id: pid, plan_date: date, plan_stop: String(i + 1), next_date: date, rep: owner }, t);
+    return saveIn(conn, placeId, { plan_id: pid, plan_date: date, plan_stop: String(i + 1), ...(first ? { next_date: date } : {}), rep: owner }, t);
   });
 }
 
@@ -643,7 +663,7 @@ async function moveToDay(placeId, date, rep, at = null) {
 async function renumber(conn, planId, list, skip = null) {
   for (const [n, p] of list.entries()) {
     if (p === skip) continue;
-    await q(conn, "UPDATE fc_cards SET plan_stop = ? WHERE place_id = ? AND plan_id = ? AND col = 'planned'", [n + 1, p, planId]);
+    await q(conn, 'UPDATE fc_cards SET plan_stop = ? WHERE place_id = ? AND plan_id = ?', [n + 1, p, planId]);
   }
 }
 

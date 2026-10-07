@@ -93,6 +93,8 @@ CREATE TABLE IF NOT EXISTS `fc_cards` (
   `ref_role`        VARCHAR(100)  NOT NULL DEFAULT '',
   `ref_phone`       VARCHAR(32)   NOT NULL DEFAULT '',
   `ref_via`         VARCHAR(255)  NOT NULL DEFAULT '',
+  -- a hand-added place's own number from Google (the person's is `phone`)
+  `g_phone`         VARCHAR(32)   NOT NULL DEFAULT '',
   -- a place carrying its own identity (not in the prospect list)
   `name`            VARCHAR(200)  NOT NULL DEFAULT '',
   `address`         VARCHAR(300)  NOT NULL DEFAULT '',
