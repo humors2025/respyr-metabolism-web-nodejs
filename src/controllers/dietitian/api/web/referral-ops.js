@@ -184,7 +184,7 @@ const referredMembers = guard(async (req, res) => {
              tc.profile_name
       FROM referral_subscriptions rs
       LEFT JOIN table_clients tc ON rs.profile_id IS NOT NULL AND tc.profile_id = rs.profile_id
-      WHERE ${isHouse ? "rs.attributed_partner_code IS NULL" : "UPPER(rs.attributed_partner_code) IN (?)"}
+      WHERE ${isHouse ? "rs.attributed_partner_code IS NULL AND LEFT(rs.stripe_subscription_id, 5) <> 'test_'" : "UPPER(rs.attributed_partner_code) IN (?)"}
       ORDER BY rs.created_at DESC
       LIMIT 500
     `,
