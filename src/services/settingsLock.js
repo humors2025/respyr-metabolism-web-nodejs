@@ -71,9 +71,10 @@ function intEnv(name, def, min, max) {
   return Math.min(max, Math.max(min, v));
 }
 
-// Temporary default for testing; set SETTINGS_OTP_EMAIL to change the inbox.
-const SETTINGS_OTP_EMAIL = (process.env.SETTINGS_OTP_EMAIL || "harsh@respyr.in").trim().toLowerCase();
-const SETTINGS_ALERT_EMAIL = (process.env.SETTINGS_ALERT_EMAIL || SETTINGS_OTP_EMAIL).trim().toLowerCase();
+// Comma-separated inbox lists; every address gets the code / alert.
+const emailList = (v) => String(v || "").split(",").map((e) => e.trim().toLowerCase()).filter(Boolean);
+const SETTINGS_OTP_EMAIL = emailList(process.env.SETTINGS_OTP_EMAIL || "harsh@respyr.in,chandan@respyr.in");
+const SETTINGS_ALERT_EMAIL = process.env.SETTINGS_ALERT_EMAIL ? emailList(process.env.SETTINGS_ALERT_EMAIL) : SETTINGS_OTP_EMAIL;
 const OTP_TTL_SECONDS = intEnv("SETTINGS_OTP_TTL_SECONDS", 300, 60, 1800);
 const OTP_RESEND_COOLDOWN_SECONDS = intEnv("SETTINGS_OTP_RESEND_COOLDOWN_SECONDS", 60, 0, 3600);
 const OTP_MAX_VERIFY_ATTEMPTS = intEnv("SETTINGS_OTP_MAX_ATTEMPTS", 5, 1, 10);
@@ -88,8 +89,9 @@ const RESEND_FROM_EMAIL = process.env.RESEND_FROM_EMAIL || "Rysflo <no-reply@res
 const keyFor = (actorId) => `sa:${String(actorId).trim()}`;
 const sha256 = (v) => crypto.createHash("sha256").update(String(v)).digest("hex");
 
-/** "harsh@respyr.in" -> "h***h@respyr.in" — shown on the lock screen. */
+/** "harsh@respyr.in" -> "h***h@respyr.in" — shown on the lock screen. Lists are masked per address. */
 function maskEmail(email) {
+  if (Array.isArray(email)) return email.map(maskEmail).join(", ");
   const [local, domain] = String(email).split("@");
   if (!domain) return "***";
   const shown = local.length <= 2 ? local[0] + "***" : `${local[0]}***${local[local.length - 1]}`;
@@ -113,7 +115,7 @@ async function sendEmail(to, subject, html, kind) {
   if (!RESEND_API_KEY) return { ok: false, reason: "RESEND_API_KEY not set" };
   const res = await axios.post(
     "https://api.resend.com/emails",
-    { from: RESEND_FROM_EMAIL, to: [to], subject, html, tags: [{ name: "kind", value: kind }] },
+    { from: RESEND_FROM_EMAIL, to: Array.isArray(to) ? to : [to], subject, html, tags: [{ name: "kind", value: kind }] },
     { headers: { Authorization: `Bearer ${RESEND_API_KEY}`, "Content-Type": "application/json" }, timeout: 15000, validateStatus: () => true }
   );
   if (res.status >= 200 && res.status < 300) return { ok: true };
