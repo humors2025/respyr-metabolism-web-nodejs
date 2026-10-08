@@ -4,11 +4,15 @@
  * POST /dietitian/api/web/super-admin-test-codes   (super_admin only)
  *
  * Free app-onboarding codes for testing. Each code is a
- * trainer_client_plan_subscriptions row in the exact shape a paid website
- * purchase produces (see services/purchaseCodes.js), so the app's existing
- * redemption accepts it unchanged — but no Stripe checkout, subscription or
- * referral_subscriptions row exists, so nothing reaches sales analytics,
- * commissions or payouts. The app enforces one redemption per code, so
+ * trainer_client_plan_subscriptions row plus a referral_subscriptions row, in
+ * the exact shape a paid website purchase produces (see
+ * services/purchaseCodes.js), so the app's existing redemption and its
+ * subscription checks accept it unchanged. There is no Stripe checkout behind
+ * it: the referral_subscriptions row is a $49, one-month 'active' plan whose
+ * stripe_subscription_id starts with TEST_SUB_PREFIX, and it carries no
+ * partner code, facility or QR, so commissions, payouts and trainer/facility
+ * counts never see it; sales analytics and the breath-credit job skip the
+ * prefix explicitly. The app enforces one redemption per code, so
  * "onboard n users" means generating n codes.
  *
  * Rows are tagged created_by_user_id = 'superadmin:test', which is also how
@@ -35,6 +39,9 @@ const TRAINER_EMAIL = csi.email(process.env.SUPER_ADMIN_TEST_CODE_TRAINER_EMAIL 
 // Same plan shape as a paid purchase so the app treats the code identically;
 // only the price label says it was minted for testing.
 const TEST_PLAN = { plan_code: "rysflo_monthly", plan_name: "Rysflo Membership", plan_price_label: "Test" };
+// The referral_subscriptions side: what a real $49 monthly purchase stores.
+const TEST_SUB_PREFIX = "test_";
+const TEST_PRICE = { currency: "usd", unit_amount_minor: 4900, price_id: "test_price" };
 
 function httpError(status, message) {
   const e = new Error(message);
@@ -88,6 +95,25 @@ function trainerSummary(trainer) {
     : { email: TRAINER_EMAIL, name: null, code: null, found: false };
 }
 
+/**
+ * The referral_subscriptions row for one test code. profile_id stays NULL;
+ * purchaseCodes.linkProfiles() fills it from purchase_code_row_id once the
+ * app redeems the code, exactly as for a paid purchase.
+ */
+async function insertTestSubscription(conn, code, rowId) {
+  await conn.execute(
+    `
+      INSERT INTO referral_subscriptions
+        (stripe_subscription_id, stripe_customer_id, purchaser_name, purchase_code, purchase_code_row_id,
+         plan_code, price_id, currency, unit_amount_minor, status,
+         current_period_start, current_period_end, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', UTC_TIMESTAMP(), UTC_TIMESTAMP() + INTERVAL 1 MONTH, UTC_TIMESTAMP())
+    `,
+    [`${TEST_SUB_PREFIX}${code}`, `${TEST_SUB_PREFIX}customer`, "Test member", code, rowId,
+     TEST_PLAN.plan_code, TEST_PRICE.price_id, TEST_PRICE.currency, TEST_PRICE.unit_amount_minor]
+  );
+}
+
 async function generate(body) {
   const count = Math.min(MAX_PER_CALL, Math.max(1, parseInt(body.count, 10) || 1));
   const trainer = await resolveTestTrainer();
@@ -107,7 +133,7 @@ async function generate(body) {
     const codes = [];
     for (let i = 0; i < count; i++) {
       const code = await csi.uniqueRedeemCode(conn);
-      await conn.execute(
+      const [ins] = await conn.execute(
         `
           INSERT INTO trainer_client_plan_subscriptions
             (source_invite_id, trainer_id, trainer_code, client_name, client_mobile, client_email,
@@ -118,6 +144,7 @@ async function generate(body) {
         `,
         [trainer.trainer_id, trainer.code, "Test member", "", TEST_PLAN.plan_code, TEST_PLAN.plan_name, TEST_PLAN.plan_price_label, code, expiresAt, CREATED_BY]
       );
+      await insertTestSubscription(conn, code, ins.insertId);
       codes.push(code);
     }
     await conn.commit();

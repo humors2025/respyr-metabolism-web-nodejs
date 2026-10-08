@@ -87,6 +87,7 @@ async function runBreathCredits({ now = new Date(), dryRun = false } = {}) {
         ON bc.stripe_subscription_id = rs.stripe_subscription_id
        AND bc.period_start = DATE(rs.current_period_start)
       WHERE rs.status IN ('active','past_due')
+        AND LEFT(rs.stripe_subscription_id, 5) <> 'test_'
         AND rs.current_period_start IS NOT NULL
         AND rs.current_period_end   IS NOT NULL
         AND rs.current_period_end <= ?

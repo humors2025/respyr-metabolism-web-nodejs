@@ -178,6 +178,7 @@ async function loadPurchases(p) {
         ) AS profile_name
       FROM referral_subscriptions rs
       WHERE rs.created_at >= ? AND rs.created_at < ?
+        AND LEFT(rs.stripe_subscription_id, 5) <> 'test_'
       ORDER BY rs.created_at DESC, rs.id DESC
     `,
     [p.startUtc, p.endUtc]
@@ -635,7 +636,7 @@ async function overview(p, body) {
         `,
         [scope.codes.size ? [...scope.codes] : [""], [...scope.emails], scope.facilityIds.size ? [...scope.facilityIds] : [0]]
       )
-    : await pool.query(`SELECT COUNT(*) AS n FROM referral_subscriptions WHERE status = 'active'`);
+    : await pool.query(`SELECT COUNT(*) AS n FROM referral_subscriptions WHERE status = 'active' AND LEFT(stripe_subscription_id, 5) <> 'test_'`);
 
   const channel = (c) => ({
     purchases: c.purchases,
