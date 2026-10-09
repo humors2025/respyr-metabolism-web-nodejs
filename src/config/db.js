@@ -114,6 +114,42 @@ pool.getConnection()
     console.error("Database connection failed:", err.message);
   });
 
+// ---------------------------------------------------------------------------
+// Audit bookkeeping: tell the access-log middleware when a request has
+// written its own app_auth_logs row, so it does not add a second one.
+//
+// Every statement in this codebase goes through pool.execute / pool.query or
+// through a connection handed out by pool.getConnection, so wrapping those
+// entry points sees every audit insert, whichever helper issued it. The mark
+// is made when the statement is *issued*, so a fire-and-forget insert that
+// resolves after the response has gone out still counts.
+// ---------------------------------------------------------------------------
+const auditContext = require("./auditContext");
+
+const AUDIT_INSERT = /INSERT\s+(?:IGNORE\s+)?INTO\s+`?app_auth_logs`?\b/i;
+
+function watchAuditInserts(target) {
+  for (const method of ["execute", "query"]) {
+    const original = target[method];
+    if (typeof original !== "function" || original.auditWatched) continue;
+
+    const wrapped = function (sql, ...rest) {
+      const text =
+        typeof sql === "string" ? sql : sql && typeof sql.sql === "string" ? sql.sql : "";
+      if (AUDIT_INSERT.test(text)) auditContext.markAuditWritten();
+      return original.call(this, sql, ...rest);
+    };
+    wrapped.auditWatched = true;
+    target[method] = wrapped;
+  }
+  return target;
+}
+
+watchAuditInserts(pool);
+
+const getConnection = pool.getConnection.bind(pool);
+pool.getConnection = (...args) => getConnection(...args).then(watchAuditInserts);
+
 module.exports = pool;
 
 

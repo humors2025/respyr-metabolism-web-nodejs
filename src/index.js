@@ -189,9 +189,11 @@ app.use((req, res, next) => {
 
 // =====================================================
 // Global API access audit (app_auth_logs)
-// Mounted AFTER the /v1 strip so paths match the
-// middleware's route sets. Endpoints that already write
-// their own audit rows are skipped inside the middleware.
+// Mounted AFTER the /v1 strip (so paths are canonical)
+// and AFTER the body parsers (so the request context it
+// opens reaches every handler). Every request gets a row
+// unless its controller wrote one itself; see the
+// middleware header for how that is detected.
 // =====================================================
 app.use(auditAccessLogMiddleware);
 
