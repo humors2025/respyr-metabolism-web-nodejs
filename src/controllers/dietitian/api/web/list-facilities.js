@@ -14,6 +14,15 @@
  * one page of facilities plus a `pagination` block. Without them every
  * facility is returned, as before. `totals` always covers all facilities in
  * scope; pending_invites are never paginated.
+ *
+ * Search is opt-in: `search` (trimmed, 3..100 chars — shorter is a 422, same
+ * rule as super-admin-orders) keeps only facilities whose
+ * name, partner code, owner name, owner email or parent admin email contains
+ * the term (case-insensitive, "contains" match), and pending invites whose
+ * facility name, code, invitee name / email or parent admin email contains it.
+ * `pagination.total` counts the matching facilities; `totals` stays
+ * whole-scope so the stat cards do not move while searching. The normalised
+ * term is echoed back as `search` ("" when none was given).
  */
 
 const pool = require("../../../../config/db");
@@ -21,6 +30,8 @@ const { _helpers: H } = require("./admin-invite-trainer");
 
 const DEFAULT_LIMIT = 10;
 const MAX_LIMIT = 100;
+const SEARCH_MIN_LENGTH = 3;
+const SEARCH_MAX_LENGTH = 100;
 
 // null when the caller did not ask for a page (old behaviour: all rows).
 function parsePaging(body) {
@@ -29,6 +40,21 @@ function parsePaging(body) {
   const limit = Math.min(MAX_LIMIT, Math.max(1, parseInt(body.limit, 10) || DEFAULT_LIMIT));
   return { page, limit, offset: (page - 1) * limit };
 }
+
+function parseSearch(body) {
+  return typeof body.search === "string" ? body.search.trim().slice(0, SEARCH_MAX_LENGTH) : "";
+}
+
+// Literal "contains" LIKE term: escape the wildcards so "100%" or "a_b" match
+// themselves (same helper as super-admin-orders).
+const like = (s) => `%${s.replace(/[\\%_]/g, (c) => `\\${c}`)}%`;
+
+const whereSql = (conds) => (conds.length ? `WHERE ${conds.join(" AND ")}` : "");
+
+const FACILITY_SEARCH_SQL =
+  "(f.name LIKE ? OR f.partner_code LIKE ? OR td.name LIKE ? OR f.facility_admin_user_id LIKE ? OR f.parent_admin_user_id LIKE ?)";
+const INVITE_SEARCH_SQL =
+  "(i.facility_name LIKE ? OR i.partner_code LIKE ? OR CONCAT_WS(' ', i.invited_first_name, i.invited_last_name) LIKE ? OR i.invited_email LIKE ? OR i.parent_user_id LIKE ?)";
 
 function toMysqlDateTime(v) {
   if (!v) return null;
@@ -46,9 +72,21 @@ const listFacilities = async (req, res) => {
     const { actor, actorEmail } = resolved;
     const isSuper = String(actor.role) === "super_admin";
 
-    const scope = isSuper ? "" : "WHERE LOWER(f.parent_admin_user_id) = ?";
-    const params = isSuper ? [] : [actorEmail];
-    const paging = parsePaging(req.body && typeof req.body === "object" ? req.body : {});
+    const body = req.body && typeof req.body === "object" ? req.body : {};
+    const paging = parsePaging(body);
+    const search = parseSearch(body);
+    if (search && search.length < SEARCH_MIN_LENGTH) {
+      return res.status(422).json({ ok: false, message: `search must be at least ${SEARCH_MIN_LENGTH} characters` });
+    }
+
+    // Scope (trainer admin: own facilities only) applies to every query. The
+    // search term narrows the facility list, its count and the pending
+    // invites, but not `totals`.
+    const scopeConds = isSuper ? [] : ["LOWER(f.parent_admin_user_id) = ?"];
+    const scopeParams = isSuper ? [] : [actorEmail];
+    const searchParams = search ? Array(5).fill(like(search)) : [];
+    const listWhere = whereSql([...scopeConds, ...(search ? [FACILITY_SEARCH_SQL] : [])]);
+    const listParams = [...scopeParams, ...searchParams];
     // LIMIT/OFFSET are validated integers, inlined because mysql2 execute()
     // rejects them as placeholders on some server versions.
     const pageSql = paging ? `LIMIT ${paging.limit} OFFSET ${paging.offset}` : "";
@@ -69,14 +107,15 @@ const listFacilities = async (req, res) => {
         FROM facilities f
         LEFT JOIN table_dietician td ON LOWER(td.email) = LOWER(f.facility_admin_user_id)
         LEFT JOIN partner_payout_accounts ppa ON LOWER(ppa.user_id) = LOWER(f.facility_admin_user_id)
-        ${scope}
+        ${listWhere}
         ORDER BY f.created_at DESC, f.id DESC
         ${pageSql}
       `,
-      params
+      listParams
     );
 
-    // Totals over every facility in scope, not just this page.
+    // Totals over every facility in scope — not just this page, and not
+    // narrowed by the search term.
     const [[agg]] = await pool.execute(
       `
         SELECT COUNT(*) AS facilities,
@@ -89,29 +128,56 @@ const listFacilities = async (req, res) => {
             (SELECT COUNT(*) FROM referral_subscriptions rs WHERE rs.facility_id = f.id AND rs.status IN ('active','trialing','past_due')) AS active_subscriptions,
             (SELECT COALESCE(SUM(ce.amount_minor),0) FROM commission_entries ce WHERE ce.facility_id = f.id AND ce.status IN ('pending','held','scheduled')) AS owed_minor
           FROM facilities f
-          ${scope}
+          ${whereSql(scopeConds)}
         ) x
       `,
-      params
+      scopeParams
     );
     const totalFacilities = Number(agg.facilities) || 0;
 
+    // How many facilities match the search — drives pagination.
+    let matchingFacilities = totalFacilities;
+    if (search) {
+      const [[m]] = await pool.execute(
+        `
+          SELECT COUNT(*) AS n
+          FROM facilities f
+          LEFT JOIN table_dietician td ON LOWER(td.email) = LOWER(f.facility_admin_user_id)
+          ${listWhere}
+        `,
+        listParams
+      );
+      matchingFacilities = Number(m.n) || 0;
+    }
+
+    const pendingBaseSql = `
+        FROM app_user_invitations i
+        WHERE i.invited_role IN ('facility_admin', 'trainer') AND i.status = 'pending'
+          ${isSuper ? "" : "AND LOWER(i.parent_user_id) = ?"}
+    `;
     const [pending] = await pool.execute(
       `
         SELECT i.id, i.invited_email, i.invited_first_name, i.invited_last_name, i.invited_role, i.facility_name, i.partner_code,
                i.invited_by_user_id, i.parent_user_id, i.status, i.expires_at, i.sent_at, i.created_at,
                (SELECT q.id FROM qr_codes q WHERE q.invitation_id = i.id AND q.status = 'assigned' LIMIT 1) AS qr_id
-        FROM app_user_invitations i
-        WHERE i.invited_role IN ('facility_admin', 'trainer') AND i.status = 'pending'
-          ${isSuper ? "" : "AND LOWER(i.parent_user_id) = ?"}
+        ${pendingBaseSql}
+          ${search ? `AND ${INVITE_SEARCH_SQL}` : ""}
         ORDER BY i.created_at DESC
       `,
-      params
+      [...scopeParams, ...searchParams]
     );
+
+    // totals.pending_invites is whole-scope too (the Facilities card hint).
+    let totalPending = pending.length;
+    if (search) {
+      const [[pc]] = await pool.execute(`SELECT COUNT(*) AS n ${pendingBaseSql}`, scopeParams);
+      totalPending = Number(pc.n) || 0;
+    }
 
     return res.status(200).json({
       ok: true,
       actor: { user_id: actorEmail, role: String(actor.role) },
+      search,
       facilities: rows.map((r) => ({
         id: Number(r.id),
         name: r.name,
@@ -147,7 +213,7 @@ const listFacilities = async (req, res) => {
       })),
       totals: {
         facilities: totalFacilities,
-        pending_invites: pending.length,
+        pending_invites: totalPending,
         trainers: Number(agg.trainers) || 0,
         active_subscriptions: Number(agg.active_subscriptions) || 0,
         owed_minor: Number(agg.owed_minor) || 0,
@@ -156,8 +222,8 @@ const listFacilities = async (req, res) => {
         pagination: {
           page: paging.page,
           limit: paging.limit,
-          total: totalFacilities,
-          total_pages: Math.max(1, Math.ceil(totalFacilities / paging.limit)),
+          total: matchingFacilities,
+          total_pages: Math.max(1, Math.ceil(matchingFacilities / paging.limit)),
         },
       }),
     });

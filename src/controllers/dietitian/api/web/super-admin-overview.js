@@ -45,6 +45,7 @@
 
 const crypto = require("crypto");
 const pool   = require("../../../../config/db");
+const { listNetworkCodes } = require("../../../../services/partnerNetwork");
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -265,8 +266,9 @@ async function expireOldAdminInvites() {
 
 /**
  * Build the upper-cased, de-duplicated set of partner codes in this super
- * admin's network: own effective code + admins under them + trainers directly
- * under them or under their admins. Mirrors PHP get_super_admin_network_codes().
+ * admin's network: own effective code + every admin, facility admin and
+ * trainer under them (the exact parent-chain rule lives in
+ * services/partnerNetwork.js — same set All Clients uses, so the counts agree).
  */
 async function getSuperAdminNetworkCodes(actor, actorEmail) {
   const codes = new Set();
@@ -278,39 +280,8 @@ async function getSuperAdminNetworkCodes(actor, actorEmail) {
 
   addCode(getActorEffectivePartnerCode(actor));
 
-  const [rows] = await pool.execute(
-    `
-      SELECT partner_code
-      FROM app_user_roles
-      WHERE status         = 'active'
-        AND partner_code IS NOT NULL
-        AND partner_code  <> ''
-        AND (
-          (
-            role = 'admin'
-            AND LOWER(parent_user_id) = LOWER(?)
-          )
-          OR
-          (
-            role = 'trainer'
-            AND (
-              LOWER(parent_user_id) = LOWER(?)
-              OR LOWER(parent_user_id) IN (
-                SELECT LOWER(user_id)
-                FROM app_user_roles
-                WHERE role   = 'admin'
-                  AND status = 'active'
-                  AND LOWER(parent_user_id) = LOWER(?)
-              )
-            )
-          )
-        )
-    `,
-    [actorEmail, actorEmail, actorEmail]
-  );
-
-  for (const row of rows) {
-    addCode(row.partner_code);
+  for (const code of await listNetworkCodes(actorEmail, "super_admin")) {
+    addCode(code);
   }
 
   return [...codes];

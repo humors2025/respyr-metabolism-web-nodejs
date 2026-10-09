@@ -958,13 +958,18 @@ exports.login =
       if (
         !user
       ) {
+        // No account matched. Record the identifier that was tried in
+        // user_id (validated, <= MAX_IDENTIFIER_LEN) so a wrong email is
+        // visible on the audit page — the wrong-password branch below already
+        // stores the account email there. identifier_hash still gets the
+        // peppered hash as before.
         await writeAuthLogSafe(
           conn,
           req,
 
           'login_failed',
 
-          null,
+          identifier,
 
           null,
 
@@ -987,7 +992,7 @@ exports.login =
             ok: false,
 
             error:
-              'Invalid credentials',
+              'Wrong email or password',
           });
       }
 
@@ -1313,7 +1318,7 @@ exports.login =
             ok: false,
 
             error:
-              'Invalid credentials',
+              'Wrong email or password',
           });
       }
 
