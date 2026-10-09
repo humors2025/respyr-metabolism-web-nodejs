@@ -987,7 +987,7 @@ exports.login =
             ok: false,
 
             error:
-              'Invalid credentials',
+              'Wrong email or password',
           });
       }
 
@@ -1313,7 +1313,7 @@ exports.login =
             ok: false,
 
             error:
-              'Invalid credentials',
+              'Wrong email or password',
           });
       }
 
