@@ -58,6 +58,7 @@
 
 const crypto = require("crypto");
 const pool = require("../../../../config/db");
+const { listNetworkCodes } = require("../../../../services/partnerNetwork");
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -300,8 +301,10 @@ async function resolveActorFromToken(req) {
 
 /**
  * Port of PHP getTrainerAdminNetworkCodes(): actor's own effective code plus the
- * partner codes of active trainers directly parented to the actor. Returns a
- * de-duplicated array of UPPER-cased codes.
+ * partner codes of the active trainers and facility admins under the actor,
+ * including trainers a facility admin invited (the exact parent-chain rule
+ * lives in services/partnerNetwork.js). Returns a de-duplicated array of
+ * UPPER-cased codes.
  */
 async function getTrainerAdminNetworkCodes(actor, actorEmail) {
   const codes = new Map();
@@ -313,20 +316,7 @@ async function getTrainerAdminNetworkCodes(actor, actorEmail) {
 
   addCode(getActorEffectiveCode(actor));
 
-  const [rows] = await pool.execute(
-    `
-      SELECT partner_code
-      FROM app_user_roles
-      WHERE role = 'trainer'
-        AND status = 'active'
-        AND partner_code IS NOT NULL
-        AND partner_code <> ''
-        AND LOWER(parent_user_id) = LOWER(?)
-    `,
-    [actorEmail]
-  );
-
-  for (const row of rows) addCode(row.partner_code);
+  for (const code of await listNetworkCodes(actorEmail, "admin")) addCode(code);
 
   return [...codes.values()];
 }

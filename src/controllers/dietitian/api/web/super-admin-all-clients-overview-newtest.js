@@ -70,6 +70,7 @@
 
 const crypto = require("crypto");
 const pool = require("../../../../config/db");
+const { listNetworkCodes } = require("../../../../services/partnerNetwork");
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -363,14 +364,14 @@ async function resolveSuperAdminFromToken(req) {
   return { actor, actorEmail: normalizeEmail(actor.email) };
 }
 
-// ─── Network codes (PHP sac_get_super_admin_network_codes) ───────────────────
+// ─── Network codes ───────────────────────────────────────────────────────────
 
 /**
- * Build the upper-cased, de-duplicated set of partner codes in this super
- * admin's network: own effective code + admins parented to it + trainers
- * parented to it or to one of those admins (one level, exactly as the PHP).
- * Uses COALESCE(partner_code, dietician_id) so trainers without a partner_code
- * still contribute their dietician_id, matching the PHP.
+ * Upper-cased, de-duplicated partner codes in this super admin's network: own
+ * effective code + every admin, facility admin and trainer under it (the exact
+ * parent-chain rule lives in services/partnerNetwork.js). Codes fall back to
+ * table_dietician.dietician_id for trainers without a partner_code, as the
+ * PHP did.
  */
 async function getSuperAdminNetworkCodes(actor, actorEmail) {
   const codes = new Map();
@@ -381,40 +382,7 @@ async function getSuperAdminNetworkCodes(actor, actorEmail) {
   };
 
   addCode(getActorCode(actor));
-
-  const [rows] = await pool.execute(
-    `
-      SELECT
-        COALESCE(NULLIF(aur.partner_code, ''), NULLIF(td.dietician_id, '')) AS code
-      FROM app_user_roles aur
-      LEFT JOIN table_dietician td
-        ON LOWER(td.email) = LOWER(aur.user_id)
-      WHERE aur.status = 'active'
-        AND (
-              (
-                aur.role = 'admin'
-                AND LOWER(aur.parent_user_id) = LOWER(?)
-              )
-              OR
-              (
-                aur.role = 'trainer'
-                AND (
-                  LOWER(aur.parent_user_id) = LOWER(?)
-                  OR LOWER(aur.parent_user_id) IN (
-                    SELECT LOWER(user_id)
-                    FROM app_user_roles
-                    WHERE role = 'admin'
-                      AND status = 'active'
-                      AND LOWER(parent_user_id) = LOWER(?)
-                  )
-                )
-              )
-        )
-    `,
-    [actorEmail, actorEmail, actorEmail]
-  );
-
-  for (const row of rows) addCode(row.code);
+  for (const code of await listNetworkCodes(actorEmail, "super_admin")) addCode(code);
 
   return [...codes.values()];
 }

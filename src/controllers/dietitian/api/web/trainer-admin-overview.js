@@ -65,6 +65,7 @@
 
 const crypto = require("crypto");
 const pool = require("../../../../config/db");
+const { listNetworkCodes } = require("../../../../services/partnerNetwork");
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -356,7 +357,10 @@ async function resolveTargetAdmin(actorEmail, targetEmail) {
 
 /**
  * PHP get_network_codes_for_overview(): own effective code plus the network
- * partner codes for the actor's role. Returns upper-cased, de-duplicated codes.
+ * partner codes for the actor's role. For admins and super admins the network
+ * now includes facility admins and the trainers under them (the exact
+ * parent-chain rule lives in services/partnerNetwork.js). Returns upper-cased,
+ * de-duplicated codes.
  */
 async function getNetworkCodesForOverview(actor, actorEmail) {
   const role = String(actor.role);
@@ -367,55 +371,8 @@ async function getNetworkCodesForOverview(actor, actorEmail) {
     codes.add(String(ownCode).toUpperCase());
   }
 
-  if (role === "admin") {
-    const [rows] = await pool.execute(
-      `
-        SELECT partner_code
-        FROM app_user_roles
-        WHERE role = 'trainer'
-          AND status = 'active'
-          AND partner_code IS NOT NULL
-          AND partner_code <> ''
-          AND LOWER(parent_user_id) = LOWER(?)
-      `,
-      [actorEmail]
-    );
-    for (const row of rows) {
-      if (row.partner_code) codes.add(String(row.partner_code).toUpperCase());
-    }
-  }
-
-  if (role === "super_admin") {
-    const [rows] = await pool.execute(
-      `
-        SELECT partner_code
-        FROM app_user_roles
-        WHERE status = 'active'
-          AND partner_code IS NOT NULL
-          AND partner_code <> ''
-          AND (
-            (
-              role = 'admin'
-              AND LOWER(parent_user_id) = LOWER(?)
-            )
-            OR
-            (
-              role = 'trainer'
-              AND LOWER(parent_user_id) IN (
-                SELECT LOWER(user_id)
-                FROM app_user_roles
-                WHERE role = 'admin'
-                  AND status = 'active'
-                  AND LOWER(parent_user_id) = LOWER(?)
-              )
-            )
-          )
-      `,
-      [actorEmail, actorEmail]
-    );
-    for (const row of rows) {
-      if (row.partner_code) codes.add(String(row.partner_code).toUpperCase());
-    }
+  if (role === "admin" || role === "super_admin") {
+    for (const code of await listNetworkCodes(actorEmail, role)) codes.add(code);
   }
 
   return [...codes];
