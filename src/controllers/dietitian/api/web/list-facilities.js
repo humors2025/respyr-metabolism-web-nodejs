@@ -15,7 +15,8 @@
  * facility is returned, as before. `totals` always covers all facilities in
  * scope; pending_invites are never paginated.
  *
- * Search is opt-in: `search` (trimmed, <=100 chars) keeps only facilities whose
+ * Search is opt-in: `search` (trimmed, 3..100 chars — shorter is a 422, same
+ * rule as super-admin-orders) keeps only facilities whose
  * name, partner code, owner name, owner email or parent admin email contains
  * the term (case-insensitive, "contains" match), and pending invites whose
  * facility name, code, invitee name / email or parent admin email contains it.
@@ -29,6 +30,7 @@ const { _helpers: H } = require("./admin-invite-trainer");
 
 const DEFAULT_LIMIT = 10;
 const MAX_LIMIT = 100;
+const SEARCH_MIN_LENGTH = 3;
 const SEARCH_MAX_LENGTH = 100;
 
 // null when the caller did not ask for a page (old behaviour: all rows).
@@ -73,6 +75,9 @@ const listFacilities = async (req, res) => {
     const body = req.body && typeof req.body === "object" ? req.body : {};
     const paging = parsePaging(body);
     const search = parseSearch(body);
+    if (search && search.length < SEARCH_MIN_LENGTH) {
+      return res.status(422).json({ ok: false, message: `search must be at least ${SEARCH_MIN_LENGTH} characters` });
+    }
 
     // Scope (trainer admin: own facilities only) applies to every query. The
     // search term narrows the facility list, its count and the pending
