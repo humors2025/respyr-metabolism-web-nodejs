@@ -37,6 +37,13 @@
  *
  * IMPORTANT:
  *   Live polling does NOT generate audit_logs_viewed.
+ *
+ * exclude_role (both endpoints, optional):
+ *   Comma-separated roles to hide, e.g. exclude_role=super_admin.
+ *   Applies to the rows, the filtered total, the summary cards, the
+ *   event-type / role dropdown lists and the live feed, so every number
+ *   on the dashboard describes the same population. Rows without a role
+ *   (anonymous failed logins) are never hidden by it.
  */
 
 const crypto = require("crypto");
@@ -436,6 +443,65 @@ function parseSuccessFlag(value) {
   };
 }
 
+/**
+ * Parse a comma-separated role list (exclude_role=super_admin,admin).
+ *
+ * Role names follow app_user_roles.role: letters, digits and underscores.
+ * Compared case-insensitively; duplicates dropped; at most MAX_EXCLUDED_ROLES.
+ */
+const MAX_EXCLUDED_ROLES = 10;
+
+function parseRoleList(value) {
+  if (value === undefined || value === null || value === "") {
+    return { ok: true, value: [] };
+  }
+
+  if (!isPlainScalar(value)) {
+    return { ok: false, message: "Invalid role list" };
+  }
+
+  const roles = [];
+
+  for (const part of String(value).split(",")) {
+    const role = part.trim().toLowerCase();
+
+    if (!role) continue;
+
+    if (!/^[a-z0-9_]{1,64}$/.test(role)) {
+      return { ok: false, message: "Invalid role list" };
+    }
+
+    if (!roles.includes(role)) roles.push(role);
+  }
+
+  if (roles.length > MAX_EXCLUDED_ROLES) {
+    return { ok: false, message: "Too many roles" };
+  }
+
+  return { ok: true, value: roles };
+}
+
+/**
+ * SQL fragment that hides the given roles.
+ *
+ * Rows with no role (a wrong-password login for an unknown email, an
+ * audit_logs_denied row) belong to nobody, so they are kept.
+ *
+ * Returns null when there is nothing to hide.
+ */
+function buildRoleExclusion(excludeRoles) {
+  if (!Array.isArray(excludeRoles) || excludeRoles.length === 0) {
+    return null;
+  }
+
+  const placeholders = excludeRoles.map(() => "?").join(", ");
+
+  return {
+    sql: `(role IS NULL OR LOWER(role) NOT IN (${placeholders}))`,
+    params: excludeRoles,
+  };
+}
+
 // -----------------------------------------------------------------------------
 // Audit log writer
 // -----------------------------------------------------------------------------
@@ -744,6 +810,7 @@ function validateQuery(query) {
     "ip_address",
     "date_from",
     "date_to",
+    "exclude_role",
   ];
 
   /**
@@ -945,6 +1012,22 @@ function validateQuery(query) {
     };
   }
 
+  // ---------------------------------------------------------------------------
+  // exclude_role
+  // ---------------------------------------------------------------------------
+
+  const parsedExcludeRoles =
+    parseRoleList(source.exclude_role);
+
+  if (!parsedExcludeRoles.ok) {
+    return {
+      ok: false,
+      status: 400,
+      message:
+        "Invalid exclude_role parameter",
+    };
+  }
+
   return {
     ok: true,
 
@@ -981,6 +1064,9 @@ function validateQuery(query) {
       dateFrom,
 
       dateTo,
+
+      excludeRoles:
+        parsedExcludeRoles.value,
     },
   };
 }
@@ -1147,6 +1233,18 @@ function buildFilters(filters) {
     params.push(
       `${filters.dateTo} 00:00:00`
     );
+  }
+
+  // ---------------------------------------------------------------------------
+  // Hidden roles (exclude_role)
+  // ---------------------------------------------------------------------------
+
+  const exclusion =
+    buildRoleExclusion(filters.excludeRoles);
+
+  if (exclusion) {
+    conditions.push(exclusion.sql);
+    params.push(...exclusion.params);
   }
 
   return {
@@ -1368,11 +1466,29 @@ async function auditLogs(
     // 5. Dashboard summary
     // -------------------------------------------------------------------------
 
+    /**
+     * The role exclusion applies to the summary too, so the cards describe
+     * the same population as the table. The other filters do not: the cards
+     * are a picture of the whole log, the table is the slice being browsed.
+     */
+    const scope =
+      buildRoleExclusion(filters.excludeRoles);
+
+    const scopeAnd =
+      scope ? `AND ${scope.sql}` : "";
+
+    const scopeWhere =
+      scope ? `WHERE ${scope.sql}` : "";
+
+    const scopeParams =
+      scope ? scope.params : [];
+
     const [
       [todayRows],
       [eventTypeCountRows],
       [failedRows],
       [eventTypeRows],
+      [roleRows],
     ] = await Promise.all([
       /**
        * Today's logs
@@ -1393,7 +1509,10 @@ async function auditLogs(
                 CURDATE(),
                 INTERVAL 1 DAY
               )
-        `
+
+          ${scopeAnd}
+        `,
+        scopeParams
       ),
 
       /**
@@ -1407,7 +1526,10 @@ async function auditLogs(
             ) AS total
 
           FROM ${AUDIT_TABLE}
-        `
+
+          ${scopeWhere}
+        `,
+        scopeParams
       ),
 
       /**
@@ -1421,7 +1543,10 @@ async function auditLogs(
           FROM ${AUDIT_TABLE}
 
           WHERE success = 0
-        `
+
+          ${scopeAnd}
+        `,
+        scopeParams
       ),
 
       /**
@@ -1439,11 +1564,39 @@ async function auditLogs(
 
           AND event_type <> ''
 
+          ${scopeAnd}
+
           ORDER BY
             event_type ASC
 
           LIMIT 500
+        `,
+        scopeParams
+      ),
+
+      /**
+       * Role dropdown
+       */
+      pool.execute(
         `
+          SELECT DISTINCT
+            role
+
+          FROM ${AUDIT_TABLE}
+
+          WHERE
+            role IS NOT NULL
+
+          AND role <> ''
+
+          ${scopeAnd}
+
+          ORDER BY
+            role ASC
+
+          LIMIT 50
+        `,
+        scopeParams
       ),
     ]);
 
@@ -1471,6 +1624,15 @@ async function auditLogs(
           String(
             row.event_type ||
               ""
+          ).trim()
+        )
+        .filter(Boolean);
+
+    const roles =
+      roleRows
+        .map((row) =>
+          String(
+            row.role || ""
           ).trim()
         )
         .filter(Boolean);
@@ -1553,7 +1715,10 @@ async function auditLogs(
           true,
 
         failureReason:
-          `page=${filters.page} limit=${filters.limit} filtered=${total}`,
+          `page=${filters.page} limit=${filters.limit} filtered=${total}` +
+          (filters.excludeRoles.length > 0
+            ? ` exclude_role=${filters.excludeRoles.join(",")}`
+            : ""),
       }
     );
 
@@ -1582,6 +1747,8 @@ async function auditLogs(
 
         event_types:
           eventTypes,
+
+        roles,
 
         logs,
 
@@ -1749,6 +1916,33 @@ async function auditLogsLive(
     const afterId =
       parsedAfterId.value;
 
+    const parsedExcludeRoles =
+      parseRoleList(
+        req.query?.exclude_role
+      );
+
+    if (!parsedExcludeRoles.ok) {
+      return res
+        .status(400)
+        .json({
+          ok: false,
+
+          message:
+            "Invalid exclude_role parameter",
+        });
+    }
+
+    const liveScope =
+      buildRoleExclusion(
+        parsedExcludeRoles.value
+      );
+
+    const liveScopeAnd =
+      liveScope ? `AND ${liveScope.sql}` : "";
+
+    const liveScopeParams =
+      liveScope ? liveScope.params : [];
+
     // -------------------------------------------------------------------------
     // 3. Get NEW records only
     // -------------------------------------------------------------------------
@@ -1793,12 +1987,14 @@ async function auditLogsLive(
           AND event_type <>
               'audit_logs_viewed'
 
+          ${liveScopeAnd}
+
           ORDER BY
             id ASC
 
           LIMIT ${LIVE_LIMIT}
         `,
-        [afterId]
+        [afterId, ...liveScopeParams]
       );
 
     /**
