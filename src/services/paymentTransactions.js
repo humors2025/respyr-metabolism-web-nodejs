@@ -19,6 +19,7 @@
 
 const pool = require("../config/db");
 const { invoiceIsOurs } = require("./paymentEmails");
+const salesCrm = require("./salesCrmMirror");
 
 function toMysqlDateTime(unixSeconds) {
   if (unixSeconds == null) return null;
@@ -35,13 +36,20 @@ function clip(v, max) {
   return s ? s.slice(0, max) : null;
 }
 
-async function referralSubscriptionIdFor(stripeSubscriptionId) {
+/** Our subscription row (id, attribution, buyer) for a Stripe subscription, or null. */
+async function referralSubscriptionFor(stripeSubscriptionId) {
   if (!stripeSubscriptionId) return null;
   const [rows] = await pool.execute(
-    `SELECT id FROM referral_subscriptions WHERE stripe_subscription_id = ? LIMIT 1`,
+    `SELECT id, attributed_partner_code, purchaser_email, purchaser_name
+       FROM referral_subscriptions WHERE stripe_subscription_id = ? LIMIT 1`,
     [stripeSubscriptionId]
   );
-  return rows[0] ? Number(rows[0].id) : null;
+  return rows[0] || null;
+}
+
+async function referralSubscriptionIdFor(stripeSubscriptionId) {
+  const rs = await referralSubscriptionFor(stripeSubscriptionId);
+  return rs ? Number(rs.id) : null;
 }
 
 /** The invoice id a PaymentIntent paid, or null. */
@@ -103,6 +111,8 @@ async function syncInvoice(stripe, invoiceOrId, { failure = false } = {}) {
     ? clip(pi?.last_payment_error?.message || charge?.failure_message || "Payment failed", 500)
     : null;
 
+  const rs = await referralSubscriptionFor(subscriptionId);
+
   await pool.execute(
     `
       INSERT INTO payment_transactions (
@@ -126,7 +136,7 @@ async function syncInvoice(stripe, invoiceOrId, { failure = false } = {}) {
         paid_at                  = COALESCE(VALUES(paid_at), paid_at)
     `,
     [
-      await referralSubscriptionIdFor(subscriptionId),
+      rs ? Number(rs.id) : null,
       subscriptionId,
       idOf(invoice.customer),
       invoice.id,
@@ -147,6 +157,36 @@ async function syncInvoice(stripe, invoiceOrId, { failure = false } = {}) {
       toMysqlDateTime(invoice.status_transitions?.paid_at),
     ]
   );
+
+  // Sales team copy (sales_crm.stripe_payments). Best-effort: logs and moves
+  // on, so a sales_crm problem can never cost the ledger or the buyer.
+  const md = invoice.parent?.subscription_details?.metadata || invoice.subscription_details?.metadata || invoice.metadata || {};
+  const purchaserEmail = clip(invoice.customer_email || rs?.purchaser_email, 255);
+  await salesCrm.upsertPayment({
+    stripe_invoice_id: invoice.id,
+    stripe_subscription_id: subscriptionId,
+    stripe_customer_id: idOf(invoice.customer),
+    stripe_payment_intent_id: paymentIntentId,
+    stripe_charge_id: idOf(charge),
+    livemode: !!invoice.livemode,
+    purchaser_email: purchaserEmail ? purchaserEmail.toLowerCase() : null,
+    purchaser_name: clip(invoice.customer_name || rs?.purchaser_name, 150),
+    partner_code: clip(md.attributed_partner_code || rs?.attributed_partner_code, 50),
+    billing_reason: clip(invoice.billing_reason, 32),
+    period_start: toMysqlDateTime(line?.period?.start ?? invoice.period_start),
+    period_end: toMysqlDateTime(line?.period?.end ?? invoice.period_end),
+    amount_paid_minor: Number(invoice.amount_paid || 0),
+    amount_refunded_minor: refunded,
+    currency,
+    fee_minor: sameCurrency ? Number(bt.fee) : null,
+    net_minor: sameCurrency ? Number(bt.net) : null,
+    status,
+    failure_message: failureMessage,
+    payment_method_type: clip(pmDetails?.type, 32),
+    card_last4: clip(pmDetails?.card?.last4, 4),
+    paid_at: toMysqlDateTime(invoice.status_transitions?.paid_at),
+  });
+
   return { invoice: invoice.id, status, failureMessage };
 }
 
