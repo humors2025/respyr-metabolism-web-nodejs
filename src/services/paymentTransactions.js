@@ -58,7 +58,8 @@ async function invoiceIdForPaymentIntent(stripe, paymentIntentId) {
  * Upsert the payment_transactions row for one invoice, from Stripe's current
  * state. `failure` marks an invoice.payment_failed delivery (the invoice is
  * still 'open' then, so its status alone cannot say it failed).
- * Returns null for invoices that are not this programme's.
+ * Returns { invoice, status, failureMessage }, or null for invoices that are
+ * not this programme's.
  */
 async function syncInvoice(stripe, invoiceOrId, { failure = false } = {}) {
   const invoice = await stripe.invoices.retrieve(idOf(invoiceOrId), { expand: ["payments"] });
@@ -146,7 +147,7 @@ async function syncInvoice(stripe, invoiceOrId, { failure = false } = {}) {
       toMysqlDateTime(invoice.status_transitions?.paid_at),
     ]
   );
-  return { invoice: invoice.id, status };
+  return { invoice: invoice.id, status, failureMessage };
 }
 
 /**

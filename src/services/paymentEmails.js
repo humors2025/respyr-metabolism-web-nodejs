@@ -11,6 +11,12 @@
  *                         / checkout.session.async_payment_failed: the decline
  *                         reason and a link back to the order page. Sent once
  *                         per PaymentIntent / invoice, not per retry.
+ *   sendPaymentAlert    — internal copy of every attempt, success or failure,
+ *                         to the team (PAYMENT_ALERT_EMAILS, default
+ *                         connect@humorstech.com): outcome, amount, buyer, referral
+ *                         code, decline reason and a Stripe Dashboard link.
+ *                         Inline HTML only; never throws, so a Resend problem
+ *                         cannot cost the buyer their receipt or code.
  *
  * Each email goes through a published Resend template when its template ID is
  * configured (emails/resend/*.html — same mechanism as the invite email);
@@ -32,6 +38,17 @@ const RESEND_FROM_EMAIL = process.env.RESEND_FROM_EMAIL || "Rysflo <no-reply@res
 const SKIP_OUTBOUND_EMAIL =
   process.env.NODE_ENV !== "production" && String(process.env.SKIP_OUTBOUND_EMAIL || "").toLowerCase() === "true";
 const SUPPORT_EMAIL = process.env.SUPPORT_EMAIL || "support@rysflo.com";
+
+// Team inboxes for the per-attempt payment alert. Comma / semicolon / space
+// separated. Unset → connect@humorstech.com; set to an empty string to turn it off.
+const PAYMENT_ALERT_EMAILS = [
+  ...new Set(
+    String(process.env.PAYMENT_ALERT_EMAILS ?? "connect@humorstech.com")
+      .split(/[,;\s]+/)
+      .map((e) => e.trim().toLowerCase())
+      .filter((e) => e.includes("@"))
+  ),
+];
 
 // Published Resend template IDs (or slugs). Unset → inline HTML fallback.
 const TEMPLATE = {
@@ -115,6 +132,34 @@ function renewalHtml(v) {
   );
 }
 
+const ALERT_STYLE = {
+  SUCCESS: { bg: "#E6F7EE", fg: "#1B7F4D" },
+  FAILED: { bg: "#FDECEC", fg: "#B42318" },
+  PENDING: { bg: "#FFF4E0", fg: "#A66B00" },
+};
+
+/** Internal alert: no customer wording, no support footer. */
+function alertHtml(v) {
+  const c = ALERT_STYLE[v.OUTCOME] || ALERT_STYLE.PENDING;
+  return `
+    <div style="font-family:Poppins,Arial,sans-serif;max-width:560px;margin:0 auto;color:#252525">
+      <p style="margin:0 0 12px">
+        <span style="display:inline-block;padding:4px 10px;border-radius:999px;font-weight:600;font-size:12px;background:${c.bg};color:${c.fg}">${v.OUTCOME}</span>
+        &nbsp;<strong>${v.KIND}</strong>${v.MODE === "Test" ? ` &nbsp;<span style="color:#A66B00;font-size:12px">TEST MODE</span>` : ""}
+      </p>
+      <table style="width:100%;border-collapse:collapse;background:#F5F7FA;border-radius:10px;margin:0 0 16px" cellpadding="0" cellspacing="0">
+        ${row("Amount", v.AMOUNT)}
+        ${row("Buyer", v.BUYER)}
+        ${row("Email", v.EMAIL)}
+        ${row("Referral code", `<span style="font-family:monospace">${v.REFERRAL_CODE}</span>`)}
+        ${v.OUTCOME === "SUCCESS" ? "" : row("Reason", v.REASON)}
+        ${row("When", v.WHEN)}
+        ${row("Stripe object", `<span style="font-family:monospace;font-size:12px">${v.OBJECT_ID}</span>`)}
+      </table>
+      <p style="margin:0"><a href="${v.STRIPE_URL}" style="display:inline-block;background:#308BF9;color:#ffffff;text-decoration:none;font-weight:600;padding:10px 18px;border-radius:10px">Open in Stripe</a></p>
+    </div>`;
+}
+
 // ── Transport ────────────────────────────────────────────────────────────────
 
 /**
@@ -123,12 +168,13 @@ function renewalHtml(v) {
  * X-Entity-Ref-ID so the recipient's client threads retries together.
  */
 async function send({ to, subject, templateId, variables, html, kind, refId }) {
-  if (!to) return { ok: false, reason: "no recipient" };
+  const recipients = (Array.isArray(to) ? to : [to]).filter(Boolean);
+  if (!recipients.length) return { ok: false, reason: "no recipient" };
   if (SKIP_OUTBOUND_EMAIL) return { ok: true, skipped: true, dev: true };
   if (!RESEND_API_KEY) return { ok: false, reason: "RESEND_API_KEY not configured" };
   const body = {
     from: RESEND_FROM_EMAIL,
-    to: [to],
+    to: recipients,
     subject,
     ...(templateId ? { template: { id: templateId, variables } } : { html }),
     headers: { "X-Entity-Ref-ID": `payment-${refId}` },
@@ -241,6 +287,56 @@ async function sendPaymentFailed({ to, reason, amountMinor, currency, retryUrl, 
   });
 }
 
+/**
+ * Internal alert to the team for one payment attempt.
+ *   outcome     "success" | "failed" | "pending" (delayed payment method)
+ *   kind        short label: "New purchase", "Renewal", "Checkout card declined"…
+ *   objectId    Stripe object this is about (cs_/pi_/in_). With `outcome` it
+ *               is the dedupe key, so a renewal that fails and then succeeds
+ *               produces one FAILED and one SUCCESS alert, never two of either.
+ *   dedupeKey   overrides objectId as the dedupe key (e.g. invoice + attempt
+ *               number, so every dunning retry is reported once).
+ *   stripePath  Dashboard path after the mode prefix, e.g. "payments/pi_…".
+ * Never throws: a failure here is logged as PAYMENT_ALERT_EMAIL_NOT_SENT.
+ */
+async function sendPaymentAlert({ outcome, kind, amountMinor, currency, buyerEmail, buyerName, partnerCode, reason, objectId, dedupeKey, stripePath, livemode }) {
+  if (!PAYMENT_ALERT_EMAILS.length) return { ok: true, skipped: true, reason: "no recipients" };
+  try {
+    const OUTCOME = outcome === "success" ? "SUCCESS" : outcome === "pending" ? "PENDING" : "FAILED";
+    const key = dedupeKey || objectId;
+    if (key && !(await claimOnce(`alert_${OUTCOME.toLowerCase()}`, key))) return { ok: true, skipped: true };
+
+    const amount = amountMinor != null ? money(amountMinor, currency) : "—";
+    const email = String(buyerEmail || "").trim().toLowerCase();
+    const mode = livemode === false ? "Test" : "Live";
+    const variables = {
+      OUTCOME,
+      KIND: escapeHtml(String(kind || "Payment")),
+      AMOUNT: amount,
+      BUYER: escapeHtml(String(buyerName || "").trim() || "—"),
+      EMAIL: email ? escapeHtml(email) : "—",
+      REFERRAL_CODE: partnerCode ? escapeHtml(String(partnerCode)) : "—",
+      REASON: escapeHtml(String(reason || "Card declined").slice(0, 300)),
+      WHEN: `${new Date().toISOString().slice(0, 19).replace("T", " ")} UTC`,
+      MODE: mode,
+      OBJECT_ID: escapeHtml(String(objectId || "—")),
+      STRIPE_URL: `https://dashboard.stripe.com/${mode === "Test" ? "test/" : ""}${stripePath || "payments"}`,
+    };
+    const res = await send({
+      to: PAYMENT_ALERT_EMAILS,
+      subject: `[Rysflo] Payment ${OUTCOME} · ${amount} · ${email || "unknown buyer"}${mode === "Test" ? " (test)" : ""}`,
+      html: alertHtml(variables),
+      kind: `alert_${OUTCOME.toLowerCase()}`,
+      refId: `alert-${objectId || Date.now()}`,
+    });
+    if (!res.ok) console.warn("PAYMENT_ALERT_EMAIL_NOT_SENT:", { object: objectId, reason: res.reason });
+    return res;
+  } catch (err) {
+    console.warn("PAYMENT_ALERT_EMAIL_NOT_SENT:", { object: objectId, reason: err?.message });
+    return { ok: false, reason: err?.message || "alert failed" };
+  }
+}
+
 /** Order page URL to retry from, with the referral code preserved when known. */
 function retryUrlFor(partnerCode) {
   return partnerCode ? `${ORDER_CANCEL_URL}/${encodeURIComponent(partnerCode)}` : ORDER_CANCEL_URL;
@@ -252,4 +348,4 @@ function invoiceIsOurs(invoice) {
   return md.plan_code === PLAN_CODE;
 }
 
-module.exports = { sendPaymentReceipt, sendPaymentFailed, retryUrlFor, invoiceIsOurs };
+module.exports = { sendPaymentReceipt, sendPaymentFailed, sendPaymentAlert, retryUrlFor, invoiceIsOurs };
