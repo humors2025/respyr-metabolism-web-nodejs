@@ -27,6 +27,10 @@
  *   transfer.reversed            -> payouts + ledger entries reversed
  *   (a Transfer settles synchronously on create; there is no transfer.paid)
  *
+ * Every payment attempt above (new purchase, renewal, any decline) is also
+ * copied to the team as an internal alert (paymentEmails.sendPaymentAlert,
+ * recipients in PAYMENT_ALERT_EMAILS). It never throws.
+ *
  * Anything else is acknowledged and ignored. Always returns 200 once the event
  * is recorded, even if handling failed — Stripe retries are not useful for a
  * bug; the error is logged and visible for a super_admin to replay.
@@ -49,6 +53,25 @@ function toMysqlDateTime(unixSeconds) {
 
 function lower(v) {
   return typeof v === "string" ? v.trim().toLowerCase() : null;
+}
+
+/** Referral code attributed to a subscription, from our own row (renewals). */
+async function partnerCodeForSubscription(stripeSubscriptionId) {
+  if (!stripeSubscriptionId) return null;
+  const [rows] = await pool.execute(
+    `SELECT attributed_partner_code FROM referral_subscriptions WHERE stripe_subscription_id = ? LIMIT 1`,
+    [String(stripeSubscriptionId)]
+  );
+  return rows[0]?.attributed_partner_code || null;
+}
+
+function invoiceMetadata(invoice) {
+  return invoice?.parent?.subscription_details?.metadata || invoice?.subscription_details?.metadata || invoice?.metadata || {};
+}
+
+function invoiceSubscriptionId(invoice) {
+  const v = invoice?.parent?.subscription_details?.subscription || invoice?.subscription || null;
+  return v ? (typeof v === "string" ? v : v.id) : null;
 }
 
 // ─── Event handlers ──────────────────────────────────────────────────────────
@@ -204,6 +227,23 @@ async function onCheckoutSessionCompleted(stripe, session) {
   const receipt = await paymentEmails.sendPaymentReceipt({ session, subscription, partnerCode: md.attributed_partner_code || null, purchaseCodeSent });
   if (!receipt.ok) console.warn("PAYMENT_RECEIPT_EMAIL_NOT_SENT:", { session: session.id, reason: receipt.reason });
 
+  // Internal copy to the team (once per session). A delayed payment method
+  // leaves the session completed but unpaid; that is reported as PENDING and
+  // its outcome arrives later as async_payment_failed / invoice.paid.
+  const pendingPayment = session.payment_status === "unpaid";
+  await paymentEmails.sendPaymentAlert({
+    outcome: pendingPayment ? "pending" : "success",
+    kind: pendingPayment ? "New purchase (payment pending)" : "New purchase",
+    amountMinor: session.amount_total,
+    currency: session.currency || subscription.currency,
+    buyerEmail: purchaserEmail,
+    buyerName: purchaserName,
+    partnerCode: md.attributed_partner_code || null,
+    objectId: session.id,
+    stripePath: `subscriptions/${subscription.id}`,
+    livemode: session.livemode,
+  });
+
   // Phone + shipping address for the device, kept out of referral_subscriptions.
   await paymentTransactions.saveShippingAddress({ session, stripeSubscriptionId: subscription.id });
 
@@ -232,29 +272,62 @@ async function onCheckoutSessionCompleted(stripe, session) {
  * not told twice.
  */
 async function onPaymentIntentFailed(stripe, pi) {
-  let invoice = null;
-  if (pi.invoice) {
-    invoice = await stripe.invoices.retrieve(String(pi.invoice));
-    if (!paymentEmails.invoiceIsOurs(invoice)) return;
-    if (invoice.billing_reason && invoice.billing_reason !== "subscription_create") return;
-  } else if (pi.metadata?.plan_code !== PLAN_CODE) {
-    // Not from this programme's checkout (in-app purchases share the account).
-    console.warn("PAYMENT_FAILED_EMAIL_SKIPPED:", { payment_intent: pi.id, reason: "no invoice / plan metadata" });
-    return;
+  // PaymentIntents no longer carry `invoice` (API 2025-03-31+); the link is
+  // looked up through the invoice's payments list, as for refunds.
+  let invoiceId = pi.invoice ? String(pi.invoice) : null;
+  if (!invoiceId) {
+    try {
+      invoiceId = await paymentTransactions.invoiceIdForPaymentIntent(stripe, pi.id);
+    } catch (err) {
+      console.warn("PAYMENT_FAILED_INVOICE_LOOKUP:", { payment_intent: pi.id, reason: err?.message });
+    }
   }
+  const invoice = invoiceId ? await stripe.invoices.retrieve(invoiceId) : null;
+
+  // Renewal declines come through invoice.payment_failed; skip them here so
+  // the member and the team are not told twice.
+  if (invoice?.billing_reason && invoice.billing_reason !== "subscription_create") return;
+  // Another channel's invoice (the in-app PHP checkout shares the account).
+  const ours = invoice ? paymentEmails.invoiceIsOurs(invoice) : pi.metadata?.plan_code === PLAN_CODE;
+  if (invoice && !ours) return;
+
   const err = pi.last_payment_error || {};
   let to = pi.receipt_email || err.payment_method?.billing_details?.email || invoice?.customer_email || null;
   if (!to && pi.customer) {
     const customer = await stripe.customers.retrieve(String(pi.customer));
     to = customer?.email || null;
   }
-  const md = invoice?.parent?.subscription_details?.metadata || invoice?.subscription_details?.metadata || pi.metadata || {};
+  const md = invoice ? invoiceMetadata(invoice) : pi.metadata || {};
+  const partnerCode = md.link_partner_code || md.attributed_partner_code || null;
+  const reason = err.message || err.decline_code || err.code || null;
+
+  // Team alert first. It goes out even when the attempt cannot be tied to the
+  // programme (a subscription-mode Checkout decline may carry neither invoice
+  // nor metadata), labelled so the reader knows attribution is missing.
+  await paymentEmails.sendPaymentAlert({
+    outcome: "failed",
+    kind: ours ? "Checkout card declined" : "Card declined (unattributed)",
+    amountMinor: pi.amount,
+    currency: pi.currency,
+    buyerEmail: to,
+    buyerName: err.payment_method?.billing_details?.name || invoice?.customer_name || null,
+    partnerCode,
+    reason,
+    objectId: pi.id,
+    stripePath: `payments/${pi.id}`,
+    livemode: pi.livemode,
+  });
+
+  if (!ours) {
+    console.warn("PAYMENT_FAILED_EMAIL_SKIPPED:", { payment_intent: pi.id, reason: "no invoice / plan metadata" });
+    return;
+  }
   const mail = await paymentEmails.sendPaymentFailed({
     to,
     reason: err.message,
     amountMinor: pi.amount,
     currency: pi.currency,
-    retryUrl: paymentEmails.retryUrlFor(md.link_partner_code || md.attributed_partner_code || null),
+    retryUrl: paymentEmails.retryUrlFor(partnerCode),
     objectId: pi.id,
   });
   if (!mail.ok) console.warn("PAYMENT_FAILED_EMAIL_NOT_SENT:", { payment_intent: pi.id, reason: mail.reason });
@@ -263,7 +336,7 @@ async function onPaymentIntentFailed(stripe, pi) {
 /** Renewal payment failed (Stripe keeps retrying per the dunning settings). */
 async function onInvoicePaymentFailed(stripe, invoice) {
   if (!paymentEmails.invoiceIsOurs(invoice)) return;
-  await paymentTransactions.syncInvoice(stripe, invoice, { failure: true });
+  const synced = await paymentTransactions.syncInvoice(stripe, invoice, { failure: true });
   if (invoice.billing_reason === "subscription_create") return; // handled by onPaymentIntentFailed
   const mail = await paymentEmails.sendPaymentFailed({
     to: invoice.customer_email,
@@ -274,6 +347,23 @@ async function onInvoicePaymentFailed(stripe, invoice) {
     renewal: true,
   });
   if (!mail.ok) console.warn("PAYMENT_FAILED_EMAIL_NOT_SENT:", { invoice: invoice.id, reason: mail.reason });
+
+  // Team alert, once per dunning attempt (the member hears about it once).
+  const subId = invoiceSubscriptionId(invoice);
+  await paymentEmails.sendPaymentAlert({
+    outcome: "failed",
+    kind: `Renewal card declined (attempt ${Number(invoice.attempt_count || 1)})`,
+    amountMinor: invoice.amount_due,
+    currency: invoice.currency,
+    buyerEmail: invoice.customer_email,
+    buyerName: invoice.customer_name,
+    partnerCode: invoiceMetadata(invoice).attributed_partner_code || (await partnerCodeForSubscription(subId)),
+    reason: synced?.failureMessage || null,
+    objectId: invoice.id,
+    dedupeKey: `${invoice.id}#${Number(invoice.attempt_count || 1)}`,
+    stripePath: `invoices/${invoice.id}`,
+    livemode: invoice.livemode,
+  });
 }
 
 /** Delayed payment method (e.g. bank debit) failed after Checkout completed. */
@@ -289,6 +379,23 @@ async function onAsyncPaymentFailed(session) {
     objectId: session.id,
   });
   if (!mail.ok) console.warn("PAYMENT_FAILED_EMAIL_NOT_SENT:", { session: session.id, reason: mail.reason });
+
+  await paymentEmails.sendPaymentAlert({
+    outcome: "failed",
+    kind: "Delayed payment failed after checkout",
+    amountMinor: session.amount_total,
+    currency: session.currency,
+    buyerEmail: session.customer_details?.email || session.customer_email,
+    buyerName: session.customer_details?.name || null,
+    partnerCode: md.link_partner_code || md.attributed_partner_code || null,
+    objectId: session.id,
+    stripePath: session.subscription
+      ? `subscriptions/${session.subscription}`
+      : session.customer
+        ? `customers/${session.customer}`
+        : "payments",
+    livemode: session.livemode,
+  });
 }
 
 /** promo_… id on a subscription's discount, if any (current and legacy shapes). */
@@ -338,8 +445,24 @@ async function onSubscriptionChanged(subscription) {
 }
 
 async function onInvoicePaid(stripe, invoice) {
-  await paymentTransactions.syncInvoice(stripe, invoice);
+  const synced = await paymentTransactions.syncInvoice(stripe, invoice); // null: not ours
   await recordInvoice(invoice);
+
+  // First invoices are announced by checkout.session.completed; renewals here.
+  if (!synced || invoice.billing_reason === "subscription_create") return;
+  const subId = invoiceSubscriptionId(invoice);
+  await paymentEmails.sendPaymentAlert({
+    outcome: "success",
+    kind: "Renewal paid",
+    amountMinor: invoice.amount_paid,
+    currency: invoice.currency,
+    buyerEmail: invoice.customer_email,
+    buyerName: invoice.customer_name,
+    partnerCode: invoiceMetadata(invoice).attributed_partner_code || (await partnerCodeForSubscription(subId)),
+    objectId: invoice.id,
+    stripePath: `invoices/${invoice.id}`,
+    livemode: invoice.livemode,
+  });
 }
 
 async function onChargeRefunded(stripe, charge) {
