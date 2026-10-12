@@ -24,6 +24,9 @@ const secretsManagerClient = new SecretsManagerClient({
 // Each canonical DB key is resolved from the first non-blank alias below.
 // The three non-DB keys are taken from the secret when present (prod) and
 // otherwise MUST already exist as plain Lambda environment variables (UAT).
+// The SALES_CRM_DB_* keys are optional: copied from the secret when present
+// (production's sales_crm mirror connects to a separate RDS), otherwise
+// whatever is in the environment, possibly nothing, is used.
 // Either way every key is present in process.env before ./src/index is
 // required, which is what the module-load-time constants in the controllers
 // depend on.
@@ -41,6 +44,15 @@ const SECRET_OR_ENV_KEYS = [
   "JWT_SECRET",
   "JWT_REFRESH_SECRET",
   "RESEND_API_KEY",
+];
+
+// Never required; see salesCrmMirror.js.
+const OPTIONAL_SECRET_KEYS = [
+  "SALES_CRM_DB_HOST",
+  "SALES_CRM_DB_PORT",
+  "SALES_CRM_DB_NAME",
+  "SALES_CRM_DB_USER",
+  "SALES_CRM_DB_PASSWORD",
 ];
 
 // Cache the initialization promise for warm Lambda invocations.
@@ -108,6 +120,10 @@ function resolveSecrets(secrets, env = process.env) {
     } else if (isBlank(env[key])) {
       missing.push(`${key} (secret key or Lambda env var)`);
     }
+  }
+
+  for (const key of OPTIONAL_SECRET_KEYS) {
+    if (!isBlank(secrets[key])) resolved[key] = String(secrets[key]);
   }
 
   if (missing.length > 0) {
