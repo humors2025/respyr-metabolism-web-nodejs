@@ -2,10 +2,11 @@
 --
 -- RUN THIS AGAINST THE `sales_crm` DATABASE, not dietician_db. It is kept in
 -- this repo because the writer is this backend's Stripe webhook
--- (src/services/salesCrmMirror.js), which inserts with a cross-database
--- statement (`sales_crm`.`stripe_payments`) through its normal connection.
--- The two databases live on the same MySQL server; the backend's MySQL user
--- needs SELECT, INSERT, UPDATE on this table.
+-- (src/services/salesCrmMirror.js). On UAT, where sales_crm shares the RDS
+-- with dietician_db, it inserts with a cross-database statement through the
+-- normal connection; on production it opens its own connection to the RDS
+-- (SALES_CRM_DB_HOST etc.). Either way the MySQL user it connects as needs
+-- SELECT, INSERT, UPDATE on this table.
 --
 -- One row per Stripe invoice, same shape as dietician_db.payment_transactions
 -- plus the buyer, the referral code and the live/test flag, so the sales
