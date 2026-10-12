@@ -36,6 +36,28 @@ function clip(v, max) {
   return s ? s.slice(0, max) : null;
 }
 
+// Production has chosen not to create the migration-006 tables. Their absence
+// must not cost the buyer, the commission ledger or the sales_crm copy, so a
+// missing table is logged once per container and the row is skipped. Any
+// other database error still propagates.
+const missingTableWarned = new Set();
+function isMissingTable(err) {
+  return err?.code === "ER_NO_SUCH_TABLE" || err?.errno === 1146;
+}
+async function writeOptional(table, run) {
+  try {
+    await run();
+    return true;
+  } catch (err) {
+    if (!isMissingTable(err)) throw err;
+    if (!missingTableWarned.has(table)) {
+      missingTableWarned.add(table);
+      console.warn("PAYMENT_TABLE_MISSING:", { table, note: "row skipped; run database/migrations/006 to store it" });
+    }
+    return false;
+  }
+}
+
 /** Our subscription row (id, attribution, buyer) for a Stripe subscription, or null. */
 async function referralSubscriptionFor(stripeSubscriptionId) {
   if (!stripeSubscriptionId) return null;
@@ -113,7 +135,7 @@ async function syncInvoice(stripe, invoiceOrId, { failure = false } = {}) {
 
   const rs = await referralSubscriptionFor(subscriptionId);
 
-  await pool.execute(
+  await writeOptional("payment_transactions", () => pool.execute(
     `
       INSERT INTO payment_transactions (
         referral_subscription_id, stripe_subscription_id, stripe_customer_id,
@@ -156,7 +178,7 @@ async function syncInvoice(stripe, invoiceOrId, { failure = false } = {}) {
       clip(pmDetails?.card?.last4, 4),
       toMysqlDateTime(invoice.status_transitions?.paid_at),
     ]
-  );
+  ));
 
   // Sales team copy (sales_crm.stripe_payments). Best-effort: logs and moves
   // on, so a sales_crm problem can never cost the ledger or the buyer.
@@ -201,7 +223,7 @@ async function saveShippingAddress({ session, stripeSubscriptionId }) {
   const phone = clip(session.customer_details?.phone, 32);
   if (!addr && !phone) return false;
 
-  await pool.execute(
+  return writeOptional("subscription_shipping_addresses", async () => pool.execute(
     `
       INSERT INTO subscription_shipping_addresses (
         referral_subscription_id, stripe_subscription_id, stripe_checkout_session_id,
@@ -232,8 +254,7 @@ async function saveShippingAddress({ session, stripeSubscriptionId }) {
       clip(addr?.postal_code, 20),
       clip(addr?.country, 2),
     ]
-  );
-  return true;
+  ));
 }
 
 module.exports = { syncInvoice, saveShippingAddress, invoiceIdForPaymentIntent };
