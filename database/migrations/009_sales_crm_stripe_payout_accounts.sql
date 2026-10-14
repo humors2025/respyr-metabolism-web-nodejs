@@ -1,12 +1,14 @@
 -- 009: mirror of Stripe Connect payout setup for the sales team.
 --
 -- RUN THIS AGAINST THE `sales_crm` DATABASE, not dietician_db. Same writer and
--- connection as 008 (src/services/salesCrmMirror.js). An account is added here
--- the first time Stripe verifies it (onboarding_status = 'verified' and
--- payouts_enabled = 1); payees who started setup but never finished are not.
--- After that, every write of dietician_db.partner_payout_accounts (the
--- account.updated webhook, the payee returning from Stripe, the pre-transfer
--- check) updates the row, so a later action_required or disabled still shows.
+-- connection as 008 (src/services/salesCrmMirror.js). Rows are built from
+-- Stripe's data and written independently of dietician_db, so this table is
+-- still updated when dietician_db is down (and the other way round). An
+-- account is added here the first time Stripe verifies it (onboarding_status
+-- = 'verified' and payouts_enabled = 1); payees who started setup but never
+-- finished are not. After that, every save (the account.updated webhook, the
+-- payee returning from Stripe, the pre-transfer check) updates the row, so a
+-- later action_required or disabled still shows.
 -- The MySQL user it connects as needs SELECT, INSERT, UPDATE on this table.
 --
 -- One row per Stripe Connect account. Carries the payee's role, referral code

@@ -23,8 +23,11 @@
  *                                   + commission_entries (the ledger)
  *   charge.refunded              -> payment_transactions refund amount/status
  *                                   + reverse ledger entries for that invoice
- *   account.updated              -> partner_payout_accounts status
- *                                   (+ sales_crm.stripe_payout_accounts copy)
+ *   account.updated              -> dietician_db.partner_payout_accounts and
+ *                                   sales_crm.stripe_payout_accounts, each
+ *                                   written on its own (handleAccountUpdated);
+ *                                   500 until both are written, so Stripe
+ *                                   retries
  *   transfer.reversed            -> payouts + ledger entries reversed
  *   (a Transfer settles synchronously on create; there is no transfer.paid)
  *
@@ -40,9 +43,10 @@
  * (event.account set) other than account.updated are acknowledged and ignored:
  * they belong to the gym's own Stripe account, not to Rysflo's sales.
  *
- * Anything else is acknowledged and ignored. Always returns 200 once the event
- * is recorded, even if handling failed — Stripe retries are not useful for a
- * bug; the error is logged and visible for a super_admin to replay.
+ * Anything else is acknowledged and ignored. Apart from account.updated,
+ * always returns 200 once the event is recorded, even if handling failed —
+ * Stripe retries are not useful for a bug; the error is logged and visible
+ * for a super_admin to replay.
  */
 
 const pool = require("../../config/db");
@@ -518,6 +522,63 @@ async function onTransferReversed(transfer) {
 
 // ─── Endpoint ────────────────────────────────────────────────────────────────
 
+/** webhook_events row for an event handled outside the main path. Never throws. */
+async function recordEventSafe(event, status, error) {
+  try {
+    await pool.execute(
+      `INSERT INTO webhook_events (event_id, type, status, error, processed_at)
+       VALUES (?, ?, ?, ?, UTC_TIMESTAMP())
+       ON DUPLICATE KEY UPDATE status = VALUES(status), error = VALUES(error), processed_at = VALUES(processed_at)`,
+      [event.id, event.type, status, error ? String(error).slice(0, 2000) : null]
+    );
+  } catch (err) {
+    console.warn("WEBHOOK_EVENT_RECORD_FAILED:", { event_id: event.id, code: err?.code, message: err?.message });
+  }
+}
+
+/**
+ * account.updated: the payee's account is saved to dietician_db and sales_crm
+ * independently (connect.syncFromWebhook), so one database being down never
+ * stops the other. It runs outside the webhook_events first-writer-wins check
+ * because the save is an idempotent upsert of Stripe's current state and a
+ * redelivery must re-run it. Answers 500 when either database was not written
+ * so Stripe retries (up to 3 days in live mode) until both have it.
+ */
+async function handleAccountUpdated(event, res) {
+  let result;
+  try {
+    result = await connect.syncFromWebhook(event.data.object);
+  } catch (err) {
+    console.error("STRIPE_WEBHOOK_ACCOUNT_SYNC_FAILED:", {
+      event_id: event.id,
+      account: event.data.object?.id,
+      code: err?.code,
+      message: err?.message,
+    });
+    await recordEventSafe(event, "error", `stripe: ${err?.message || "account read failed"}`);
+    return res.status(500).json({ ok: false, retry: true });
+  }
+
+  const failed = [];
+  if (!result.dieticianDb.ok) failed.push(`dietician_db: ${result.dieticianDb.reason}`);
+  if (!result.salesCrm.ok) failed.push(`sales_crm: ${result.salesCrm.reason}`);
+
+  // When dietician_db is the one that failed, recording there would fail too.
+  if (result.dieticianDb.ok) {
+    await recordEventSafe(event, failed.length ? "error" : "processed", failed.join("; ") || null);
+  }
+
+  if (failed.length) {
+    console.error("STRIPE_WEBHOOK_ACCOUNT_SYNC_PARTIAL:", {
+      event_id: event.id,
+      account: event.data.object?.id,
+      failed,
+    });
+    return res.status(500).json({ ok: false, retry: true });
+  }
+  return res.status(200).json({ ok: true });
+}
+
 const stripeWebhook = async (req, res) => {
   res.setHeader("Cache-Control", "no-store");
 
@@ -565,6 +626,10 @@ const stripeWebhook = async (req, res) => {
     return res.status(200).json({ ok: true, ignored: true });
   }
 
+  if (event.type === "account.updated") {
+    return handleAccountUpdated(event, res);
+  }
+
   // Idempotency: first writer wins. A redelivered event is acknowledged only.
   const [ins] = await pool.execute(
     `INSERT IGNORE INTO webhook_events (event_id, type, status) VALUES (?, ?, 'received')`,
@@ -599,9 +664,6 @@ const stripeWebhook = async (req, res) => {
         break;
       case "charge.refunded":
         await onChargeRefunded(stripe, obj);
-        break;
-      case "account.updated":
-        await connect.syncAccountFromStripeObject(obj);
         break;
       case "transfer.reversed":
         await onTransferReversed(obj);
