@@ -3,7 +3,8 @@
 /**
  * Mirror of Stripe data into the sales team's database (migrations run
  * against sales_crm):
- *   sales_crm.stripe_payments         (008)  one row per invoice
+ *   sales_crm.stripe_payments         (008)  one row per invoice, with the
+ *                                     buyer's shipping address and phone (010)
  *   sales_crm.stripe_payout_accounts  (009)  one row per Connect payout account
  *
  * Two ways to reach it, chosen by configuration:
@@ -91,14 +92,36 @@ const KEEP_IF_NULL = new Set([
   "paid_at",
 ]);
 
-const UPSERT_SQL =
-  TABLE &&
-  `INSERT INTO ${TABLE} (${COLUMNS.map((c) => `\`${c}\``).join(", ")})
-   VALUES (${COLUMNS.map(() => "?").join(", ")})
+// Added by migration 010. The address belongs to the subscription and is found
+// only once Checkout has completed, so a later delivery without it keeps the
+// one already stored.
+const SHIPPING_COLUMNS = [
+  "shipping_address",
+  "shipping_name",
+  "phone",
+  "shipping_line1",
+  "shipping_line2",
+  "shipping_city",
+  "shipping_state",
+  "shipping_postal_code",
+  "shipping_country",
+];
+for (const c of SHIPPING_COLUMNS) KEEP_IF_NULL.add(c);
+
+function paymentUpsertSql(columns) {
+  return `INSERT INTO ${TABLE} (${columns.map((c) => `\`${c}\``).join(", ")})
+   VALUES (${columns.map(() => "?").join(", ")})
    ON DUPLICATE KEY UPDATE
-     ${COLUMNS.filter((c) => c !== "stripe_invoice_id")
+     ${columns.filter((c) => c !== "stripe_invoice_id")
        .map((c) => (KEEP_IF_NULL.has(c) ? `\`${c}\` = COALESCE(VALUES(\`${c}\`), \`${c}\`)` : `\`${c}\` = VALUES(\`${c}\`)`))
        .join(",\n     ")}`;
+}
+
+const ALL_COLUMNS = [...COLUMNS, ...SHIPPING_COLUMNS];
+const UPSERT_SQL = TABLE && paymentUpsertSql(ALL_COLUMNS);
+// A sales_crm that has not had 010 yet still gets the payment, without the address.
+const UPSERT_SQL_NO_SHIPPING = TABLE && paymentUpsertSql(COLUMNS);
+let shippingColumnsMissing = false;
 
 const PAYOUT_COLUMNS = [
   "stripe_account_id",
@@ -208,19 +231,37 @@ function mode() {
   return SALES_CRM_HOST ? "dedicated" : "shared";
 }
 
+function isMissingColumn(err) {
+  return err?.code === "ER_BAD_FIELD_ERROR" || err?.errno === 1054;
+}
+
 /**
  * Upsert one invoice row (keyed on stripe_invoice_id). `row` uses the column
- * names above; missing keys are stored as NULL, `livemode` as 0/1.
- * Returns { ok, skipped?, reason? } and never throws.
+ * names above (COLUMNS and SHIPPING_COLUMNS); missing keys are stored as NULL,
+ * `livemode` as 0/1. Returns { ok, skipped?, reason? } and never throws.
  */
 async function upsertPayment(row) {
   if (!TABLE) return { ok: false, skipped: true, reason: "SALES_CRM_DB_NAME not set" };
-  try {
-    const values = COLUMNS.map((c) => {
+  const valuesFor = (columns) =>
+    columns.map((c) => {
       if (c === "livemode") return row.livemode ? 1 : 0;
       return row[c] === undefined ? null : row[c];
     });
-    await executor().execute(UPSERT_SQL, values);
+  try {
+    if (!shippingColumnsMissing) {
+      try {
+        await executor().execute(UPSERT_SQL, valuesFor(ALL_COLUMNS));
+        return { ok: true };
+      } catch (err) {
+        if (!isMissingColumn(err)) throw err;
+        shippingColumnsMissing = true;
+        console.warn("SALES_CRM_SHIPPING_COLUMNS_MISSING:", {
+          mode: mode(),
+          note: "payments copied without the address; run database/migrations/010 on sales_crm",
+        });
+      }
+    }
+    await executor().execute(UPSERT_SQL_NO_SHIPPING, valuesFor(COLUMNS));
     return { ok: true };
   } catch (err) {
     console.warn("SALES_CRM_MIRROR_FAILED:", {
@@ -273,4 +314,4 @@ async function upsertPayoutAccount(row, { insertIfMissing = true } = {}) {
   }
 }
 
-module.exports = { upsertPayment, upsertPayoutAccount, isEnabled, mode, COLUMNS, PAYOUT_COLUMNS };
+module.exports = { upsertPayment, upsertPayoutAccount, isEnabled, mode, COLUMNS, SHIPPING_COLUMNS, PAYOUT_COLUMNS };

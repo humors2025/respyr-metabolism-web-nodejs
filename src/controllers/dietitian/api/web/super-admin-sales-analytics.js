@@ -44,6 +44,7 @@
 const pool = require("../../../../config/db");
 const { PLAN_CODE } = require("../../../../config/stripe");
 const { _helpers: H } = require("./admin-invite-trainer");
+const { FIRST_PAYMENT_COLUMNS, firstPaymentAmounts } = require("../../../../services/firstPaymentAmount");
 
 const YMD = /^\d{4}-\d{2}-\d{2}$/;
 const PERIODS = new Set(["week", "month", "year"]);
@@ -131,44 +132,7 @@ async function loadPurchases(p) {
         rs.stripe_promotion_code_id, rs.qr_id,
         rs.purchase_code, rs.plan_code, rs.currency, rs.unit_amount_minor,
         rs.status, rs.current_period_end, rs.canceled_at, rs.created_at,
-        (
-          SELECT ps.list_price_minor - ps.referred_price_minor
-          FROM partner_promotion_codes ppc
-          JOIN pricing_settings ps ON ps.stripe_coupon_id = ppc.stripe_coupon_id
-          WHERE ppc.stripe_promotion_code_id = rs.stripe_promotion_code_id
-          ORDER BY ps.id DESC
-          LIMIT 1
-        ) AS coupon_off_minor,
-        (
-          -- Fallback when the coupon was replaced (pricing re-saved, e.g. after a
-          -- Stripe account change): the referral discount in effect that day.
-          SELECT ps.list_price_minor - ps.referred_price_minor
-          FROM pricing_settings ps
-          WHERE ps.effective_from <= rs.created_at
-          ORDER BY ps.effective_from DESC, ps.id DESC
-          LIMIT 1
-        ) AS pricing_off_minor,
-        (
-          SELECT ce.stripe_invoice_id
-          FROM commission_entries ce
-          WHERE ce.stripe_subscription_id = rs.stripe_subscription_id
-          ORDER BY ce.invoice_paid_at ASC, ce.id ASC
-          LIMIT 1
-        ) AS first_invoice_id,
-        (
-          SELECT ce.invoice_net_minor
-          FROM commission_entries ce
-          WHERE ce.stripe_subscription_id = rs.stripe_subscription_id
-          ORDER BY ce.invoice_paid_at ASC, ce.id ASC
-          LIMIT 1
-        ) AS first_invoice_net_minor,
-        (
-          SELECT ce.invoice_paid_at
-          FROM commission_entries ce
-          WHERE ce.stripe_subscription_id = rs.stripe_subscription_id
-          ORDER BY ce.invoice_paid_at ASC, ce.id ASC
-          LIMIT 1
-        ) AS first_invoice_paid_at,
+        ${FIRST_PAYMENT_COLUMNS},
         (
           SELECT tc.profile_name
           FROM table_clients tc
@@ -205,31 +169,9 @@ async function loadPurchases(p) {
     const code = String(r.attributed_partner_code || "").toUpperCase();
     // Trainer-code sale = a code is on the purchase (see "Source" above).
     const usedCodeAtCheckout = !!code;
-    // The referral coupon only exists when a promotion code or sticker was applied.
-    const discounted = !!(r.stripe_promotion_code_id || r.qr_id);
-    const gross = Number(r.unit_amount_minor) || 0;
-    const couponOff =
-      r.coupon_off_minor != null ? Math.max(0, Number(r.coupon_off_minor))
-      : r.pricing_off_minor != null ? Math.max(0, Number(r.pricing_off_minor))
-      : null;
-    // The earliest ledger invoice is the purchase itself only if it was paid
-    // at checkout time; a member attributed later has ledger rows for renewals only.
     const createdMs = toMs(r.created_at);
-    const invoiceMs = toMs(r.first_invoice_paid_at);
-    const isFirstPayment = invoiceMs != null && createdMs != null && Math.abs(invoiceMs - createdMs) <= 2 * 86400000;
-    const invoiceNet = isFirstPayment && r.first_invoice_net_minor != null ? Number(r.first_invoice_net_minor) : null;
-    const firstInvoiceId = isFirstPayment ? r.first_invoice_id : null;
-
-    let net;
-    let discount;
-    if (invoiceNet != null) {
-      net = invoiceNet;
-      discount = Math.max(0, gross - invoiceNet);
-    } else {
-      // A code or sticker at checkout always applies the referral coupon.
-      discount = discounted ? Math.min(gross, couponOff ?? 0) : 0;
-      net = Math.max(0, gross - discount);
-    }
+    // Gross / discount / net, shared with the Facilities Active members list.
+    const { gross, discount, net, amountSource, firstInvoiceId } = firstPaymentAmounts(r);
 
     let paymentStatus = "paid";
     if (UNPAID_SUB_STATUSES.has(String(r.status))) paymentStatus = "unpaid";
@@ -246,7 +188,7 @@ async function loadPurchases(p) {
       gross,
       discount,
       net,
-      amountSource: invoiceNet != null ? "invoice" : "price",
+      amountSource,
       paymentStatus,
       counts: paymentStatus === "paid",
       // A live plan with canceled_at set is a cancel-at-period-end request:
