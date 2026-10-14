@@ -15,7 +15,9 @@
  *   view=trainers  active trainers in the facility (same rule as
  *                  list-facilities.trainers_count)
  *   view=members   running referred subscriptions (same rule as
- *                  list-facilities.active_subscriptions)
+ *                  list-facilities.active_subscriptions); amount_minor is the
+ *                  list price (gross), discount_amount_minor the referral
+ *                  discount, net_amount_minor what the member paid
  *
  * Body: { facility_id?, view, page?, limit? }   (facility_id omitted = all facilities)
  *
@@ -29,6 +31,7 @@
 
 const pool = require("../../../../config/db");
 const { _helpers: H } = require("./admin-invite-trainer");
+const { FIRST_PAYMENT_COLUMNS, firstPaymentAmounts } = require("../../../../services/firstPaymentAmount");
 
 // mysql2 returns DATETIME as a Date built from the UTC wall clock on Lambda.
 function toIso(v) {
@@ -115,9 +118,10 @@ async function members(facilityId, parentEmail, paging) {
     `
       SELECT rs.id, rs.purchaser_name, rs.purchaser_email, rs.plan_code, rs.unit_amount_minor, rs.currency,
              rs.status, rs.current_period_start, rs.current_period_end, rs.created_at,
-             rs.attributed_partner_code, rs.qr_id, rs.profile_id,
+             rs.attributed_partner_code, rs.qr_id, rs.profile_id, rs.stripe_promotion_code_id,
              f.id AS facility_id, f.name AS facility_name,
-             (SELECT td.name FROM table_dietician td WHERE LOWER(td.email) = LOWER(rs.attributed_user_id) LIMIT 1) AS code_owner_name
+             (SELECT td.name FROM table_dietician td WHERE LOWER(td.email) = LOWER(rs.attributed_user_id) LIMIT 1) AS code_owner_name,
+             ${FIRST_PAYMENT_COLUMNS}
       FROM referral_subscriptions rs
       INNER JOIN facilities f ON f.id = rs.facility_id
       ${where}
@@ -127,24 +131,31 @@ async function members(facilityId, parentEmail, paging) {
     params
   );
   const total = paging ? await countRows(fromWhere, params) : rows.length;
-  const items = rows.map((m) => ({
-    id: Number(m.id),
-    name: m.purchaser_name || null,
-    email: lower(m.purchaser_email),
-    plan_code: m.plan_code,
-    amount_minor: Number(m.unit_amount_minor),
-    currency: m.currency ? String(m.currency).toUpperCase() : "USD",
-    status: m.status,
-    current_period_start: toIso(m.current_period_start),
-    current_period_end: toIso(m.current_period_end),
-    purchased_at: toIso(m.created_at),
-    partner_code: m.attributed_partner_code || null,
-    facility_id: Number(m.facility_id),
-    facility_name: m.facility_name,
-    code_owner_name: m.code_owner_name || null,
-    qr_id: m.qr_id || null,
-    app_linked: !!m.profile_id,
-  }));
+  const items = rows.map((m) => {
+    // Gross (list price) - discount = net (what the member paid), worked out
+    // as on the Sales analytics page.
+    const paid = firstPaymentAmounts(m);
+    return {
+      id: Number(m.id),
+      name: m.purchaser_name || null,
+      email: lower(m.purchaser_email),
+      plan_code: m.plan_code,
+      amount_minor: paid.gross,
+      discount_amount_minor: paid.discount,
+      net_amount_minor: paid.net,
+      currency: m.currency ? String(m.currency).toUpperCase() : "USD",
+      status: m.status,
+      current_period_start: toIso(m.current_period_start),
+      current_period_end: toIso(m.current_period_end),
+      purchased_at: toIso(m.created_at),
+      partner_code: m.attributed_partner_code || null,
+      facility_id: Number(m.facility_id),
+      facility_name: m.facility_name,
+      code_owner_name: m.code_owner_name || null,
+      qr_id: m.qr_id || null,
+      app_linked: !!m.profile_id,
+    };
+  });
   return { items, total };
 }
 
