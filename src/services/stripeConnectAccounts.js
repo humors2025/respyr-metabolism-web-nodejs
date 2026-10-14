@@ -19,9 +19,11 @@
  *   - when our copy is older than STALE_MS
  *   - always, right before a Transfer (payoutRuns.js)
  *
- * Once an account is verified, every write of partner_payout_accounts is
- * copied to sales_crm.stripe_payout_accounts (salesCrmMirror.js) when that is
- * enabled; see mirrorToSalesCrm.
+ * Every save goes to two databases independently (saveAccount):
+ * dietician_db.partner_payout_accounts and, once the account is verified,
+ * sales_crm.stripe_payout_accounts (salesCrmMirror.js). Both rows are built
+ * from Stripe's data, so either database can be down without blocking the
+ * other.
  */
 
 const pool = require("../config/db");
@@ -86,7 +88,8 @@ function requirementsSummary(acct) {
   };
 }
 
-async function upsertFromAccount(userId, acct) {
+/** What we store about an account, computed from Stripe's v2 Account. */
+function summarize(acct) {
   const status = statusFromAccount(acct);
   const active = transfersActive(acct);
   // "Submitted" = nothing is currently or past due (the form was completed),
@@ -94,8 +97,16 @@ async function upsertFromAccount(userId, acct) {
   const outstanding = (acct.requirements?.entries || []).some((e) =>
     ["currently_due", "past_due"].includes(e?.minimum_deadline?.status)
   );
-  const detailsSubmitted = active || !outstanding ? 1 : 0;
+  return {
+    status,
+    active,
+    detailsSubmitted: active || !outstanding ? 1 : 0,
+    requirements: requirementsSummary(acct),
+  };
+}
 
+/** dietician_db: partner_payout_accounts row (+ release held commission). Throws on failure. */
+async function saveToDieticianDb(userId, acct, s) {
   await pool.execute(
     `
       INSERT INTO partner_payout_accounts (
@@ -112,77 +123,131 @@ async function upsertFromAccount(userId, acct) {
     [
       lower(userId),
       acct.id,
-      status,
-      detailsSubmitted,
-      active ? 1 : 0,               // payouts_enabled column now means "stripe_transfers active"
-      JSON.stringify(requirementsSummary(acct)),
+      s.status,
+      s.detailsSubmitted,
+      s.active ? 1 : 0,               // payouts_enabled column now means "stripe_transfers active"
+      JSON.stringify(s.requirements),
     ]
   );
 
-  await mirrorToSalesCrm(userId, acct);
-
-  if (active) {
+  if (s.active) {
     await ledger.releaseHeldForPayee(userId);
   }
+}
 
-  return status;
+// How long the sales_crm write waits for dietician_db to name the payee.
+const PAYEE_LOOKUP_MS = 2000;
+
+/** Resolves to `promise`'s value, or to null after `ms` (the promise keeps running). */
+function withTimeout(promise, ms) {
+  let timer;
+  return Promise.race([
+    promise,
+    new Promise((resolve) => {
+      timer = setTimeout(() => resolve(null), ms);
+    }),
+  ]).finally(() => clearTimeout(timer));
 }
 
 /**
- * Copy the row just written, plus who the payee is, to sales_crm. The sales
- * team wants verified payees only: an account is added there the first time
- * it is verified, and from then on every change is copied (so a later
- * action_required or disabled still shows). Best-effort: a failure is logged
- * and never reaches onboarding, the status page, the webhook or a payout.
+ * Current name, role, code and facility of the payee from dietician_db. Only
+ * enriches the sales_crm row: null when dietician_db is slow or down, and the
+ * caller falls back to what Stripe holds.
  */
-async function mirrorToSalesCrm(userId, acct) {
-  if (!salesCrmMirror.isEnabled()) return;
+async function lookupPayee(userId) {
   try {
-    const [rows] = await pool.execute(
-      `
-        SELECT ppa.stripe_account_id, ppa.user_id, ppa.onboarding_status,
-               ppa.details_submitted, ppa.payouts_enabled, ppa.requirements_json,
-               ppa.created_at, ppa.last_synced_at,
-               aur.role, aur.partner_code, aur.facility_id,
-               f.name AS facility_name,
-               (SELECT td.name FROM table_dietician td
-                 WHERE LOWER(td.email) = LOWER(aur.user_id) LIMIT 1) AS user_name
-        FROM partner_payout_accounts ppa
-        LEFT JOIN app_user_roles aur ON LOWER(aur.user_id) = LOWER(ppa.user_id)
-        LEFT JOIN facilities f ON f.id = aur.facility_id
-        WHERE LOWER(ppa.user_id) = ?
-        ORDER BY (aur.status = 'active') DESC
-        LIMIT 1
-      `,
-      [lower(userId)]
+    const res = await withTimeout(
+      pool.execute(
+        `
+          SELECT aur.role, aur.partner_code, aur.facility_id,
+                 f.name AS facility_name,
+                 (SELECT td.name FROM table_dietician td
+                   WHERE LOWER(td.email) = LOWER(aur.user_id) LIMIT 1) AS user_name
+          FROM app_user_roles aur
+          LEFT JOIN facilities f ON f.id = aur.facility_id
+          WHERE LOWER(aur.user_id) = ?
+          ORDER BY (aur.status = 'active') DESC
+          LIMIT 1
+        `,
+        [lower(userId)]
+      ),
+      PAYEE_LOOKUP_MS
     );
-    const row = rows[0];
-    if (!row) return;
-    const verified = row.onboarding_status === "verified" && Number(row.payouts_enabled) === 1;
-    await salesCrmMirror.upsertPayoutAccount({
-      stripe_account_id: row.stripe_account_id,
-      user_email: row.user_id,
-      user_name: row.user_name,
-      role: row.role,
-      partner_code: row.partner_code,
-      facility_id: row.facility_id,
-      facility_name: row.facility_name,
-      livemode: typeof acct?.livemode === "boolean" ? acct.livemode : isLive,
-      onboarding_status: row.onboarding_status,
-      details_submitted: row.details_submitted,
-      payouts_enabled: row.payouts_enabled,
-      requirements_json: row.requirements_json,
-      setup_started_at: row.created_at,
-      last_synced_at: row.last_synced_at,
-    }, { insertIfMissing: verified });
-  } catch (err) {
-    console.warn("SALES_CRM_MIRROR_FAILED:", {
-      stripe_account: acct?.id,
-      step: "read payee",
-      code: err?.code,
-      message: err?.message,
-    });
+    return res ? res[0][0] || null : null;
+  } catch {
+    return null;
   }
+}
+
+/**
+ * sales_crm: stripe_payout_accounts row, built from Stripe's data so it does
+ * not depend on dietician_db (the payee's role, code and facility were put in
+ * the account's metadata when we created it). The sales team wants verified
+ * payees only: an account is added the first time it is verified, and from
+ * then on every change is copied (so a later action_required or disabled
+ * still shows). Never throws; returns { ok, skipped?, reason? }.
+ */
+async function saveToSalesCrm(userId, acct, s) {
+  if (!salesCrmMirror.isEnabled()) return { ok: true, skipped: true };
+  try {
+    const meta = acct.metadata || {};
+    const payee = await lookupPayee(userId);
+    const displayName =
+      typeof acct.display_name === "string" && lower(acct.display_name) !== lower(userId) ? acct.display_name : null;
+    const metaFacilityId = /^\d+$/.test(String(meta.facility_id || "")) ? Number(meta.facility_id) : null;
+    const result = await salesCrmMirror.upsertPayoutAccount(
+      {
+        stripe_account_id: acct.id,
+        user_email: lower(userId),
+        user_name: payee?.user_name || displayName,
+        role: payee?.role || meta.role || null,
+        partner_code: payee?.partner_code || meta.partner_code || null,
+        facility_id: payee ? payee.facility_id : metaFacilityId,
+        facility_name: payee?.facility_name || null,
+        livemode: typeof acct.livemode === "boolean" ? acct.livemode : isLive,
+        onboarding_status: s.status,
+        details_submitted: s.detailsSubmitted,
+        payouts_enabled: s.active ? 1 : 0,
+        requirements_json: s.requirements,
+        setup_started_at: acct.created ? new Date(acct.created) : null,
+        last_synced_at: new Date(),
+      },
+      { insertIfMissing: s.status === "verified" && s.active }
+    );
+    return result.skipped ? { ok: true, skipped: true } : result;
+  } catch (err) {
+    console.warn("SALES_CRM_MIRROR_FAILED:", { stripe_account: acct?.id, code: err?.code, message: err?.message });
+    return { ok: false, reason: err?.message || "sales_crm write failed" };
+  }
+}
+
+/**
+ * Save Stripe's current view of an account to both databases. The two writes
+ * run side by side and neither depends on the other, so if one database is
+ * down the other is still written. Returns
+ * { status, dieticianDb: { ok, error?, reason? }, salesCrm: { ok, reason? } }.
+ */
+async function saveAccount(userId, acct) {
+  const s = summarize(acct);
+  const [dieticianDb, salesCrm] = await Promise.all([
+    saveToDieticianDb(userId, acct, s).then(
+      () => ({ ok: true }),
+      (err) => ({ ok: false, error: err, reason: err?.message || "dietician_db write failed" })
+    ),
+    saveToSalesCrm(userId, acct, s),
+  ]);
+  return { status: s.status, dieticianDb, salesCrm };
+}
+
+/**
+ * Dashboard paths (onboarding, status page, pre-payout check). Both databases
+ * are written as in saveAccount; a dietician_db failure is re-thrown because
+ * these callers read that row back, a sales_crm failure is only logged.
+ */
+async function upsertFromAccount(userId, acct) {
+  const r = await saveAccount(userId, acct);
+  if (!r.dieticianDb.ok) throw r.dieticianDb.error;
+  return r.status;
 }
 
 async function getAccountRow(userId) {
@@ -273,15 +338,33 @@ async function canReceiveTransfers(stripeAccountId) {
   return transfersActive(acct);
 }
 
-/** Classic account.updated (v1 accounts only) — kept for accounts created before v2. */
-async function syncAccountFromStripeObject(acct) {
-  const [rows] = await pool.execute(
-    `SELECT user_id FROM partner_payout_accounts WHERE stripe_account_id = ? LIMIT 1`,
-    [acct.id]
-  );
-  const userId = rows[0]?.user_id || acct.metadata?.user_id;
-  if (!userId) return;
-  await syncAccount(userId, acct.id);
+/**
+ * account.updated from the Connected-accounts webhook. Re-reads the account
+ * from Stripe (the source of truth) and saves it to both databases
+ * independently (saveAccount). The payee comes from the account's metadata,
+ * set when we created it, so a dietician_db outage does not stop the
+ * sales_crm write; our own row is only consulted for an account without it.
+ * Returns { handled, dieticianDb, salesCrm }. Throws when Stripe cannot be
+ * read (or, for an account without metadata, dietician_db), so the webhook
+ * answers with an error and Stripe retries.
+ */
+async function syncFromWebhook(eventAccount) {
+  const stripe = requireStripe();
+  const acct = await stripe.v2.core.accounts.retrieve(eventAccount.id, { include: ACCOUNT_INCLUDE });
+  let userId = lower(acct.metadata?.user_id) || lower(eventAccount.metadata?.user_id);
+  if (!userId) {
+    const [rows] = await pool.execute(
+      `SELECT user_id FROM partner_payout_accounts WHERE stripe_account_id = ? LIMIT 1`,
+      [acct.id]
+    );
+    userId = lower(rows[0]?.user_id);
+  }
+  if (!userId) {
+    // Not one of our payees.
+    return { handled: false, dieticianDb: { ok: true, skipped: true }, salesCrm: { ok: true, skipped: true } };
+  }
+  const r = await saveAccount(userId, acct);
+  return { handled: true, dieticianDb: r.dieticianDb, salesCrm: r.salesCrm };
 }
 
 module.exports = {
@@ -291,7 +374,7 @@ module.exports = {
   createDashboardLink,
   syncAccount,
   canReceiveTransfers,
-  syncAccountFromStripeObject,
+  syncFromWebhook,
   statusFromAccount,
   transfersActive,
 };
