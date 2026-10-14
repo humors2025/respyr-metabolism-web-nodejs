@@ -1,9 +1,12 @@
 "use strict";
 
 /**
- * POST /dietitian/api/web/super-admin-orders   (super_admin only)
+ * POST /dietitian/api/web/super-admin-orders
+ *   (super_admin, plus trainer admins listed in ORDERS_VIEWER_EMAILS)
  *
  * Website (/order) purchases as recorded by the Stripe webhook. Read-only.
+ * Listed trainer admins see the same rows as a super admin (every buyer, not
+ * just their network); test codes and cancelling stay super_admin only.
  *
  *   view=shipping  subscription_shipping_addresses, one row per purchase:
  *                  who to ship the device to (name, phone, address)
@@ -25,6 +28,16 @@ const { _helpers: H } = require("./admin-invite-trainer");
 const SEARCH_MIN_LENGTH = 3;
 const MAX_LIMIT = 100;
 const PAYMENT_STATUSES = ["open", "paid", "failed", "refunded", "partially_refunded"];
+
+// Trainer admins (app_user_roles role "admin") who may also read orders.
+// Comma-separated; override with ORDERS_VIEWER_EMAILS=a@x.com,b@y.com.
+// Mirrored in the frontend's src/lib/ordersAccess.js for the menu link.
+const ORDERS_VIEWER_EMAILS = String(
+  process.env.ORDERS_VIEWER_EMAILS || "evan.gaudet@gmail.com,derek.lopez88@gmail.com"
+)
+  .split(",")
+  .map((email) => email.trim().toLowerCase())
+  .filter(Boolean);
 
 const minorToMajor = (v) => (v == null ? null : Math.round(Number(v)) / 100);
 
@@ -236,8 +249,12 @@ const superAdminOrders = async (req, res) => {
   let resolved = null;
 
   try {
-    resolved = await H.resolveActorFromToken(req, "super_admin");
+    resolved = await H.resolveActorFromToken(req, ["super_admin", "admin"]);
     if (resolved.error) return res.status(resolved.error.status).json({ status: false, ...resolved.error.body });
+    const actorRole = String(resolved.actor.role);
+    if (actorRole !== "super_admin" && !ORDERS_VIEWER_EMAILS.includes(resolved.actorEmail)) {
+      return res.status(403).json({ status: false, ok: false, message: "You are not allowed to perform this action" });
+    }
 
     let payload;
     if (view === "shipping") payload = await shipping(body);
@@ -248,7 +265,7 @@ const superAdminOrders = async (req, res) => {
     await H.writeAuthLogSafe(req, {
       eventType: "super_admin_orders_viewed",
       userId: resolved.actorEmail,
-      role: "super_admin",
+      role: resolved.actor.role,
       partnerCode: null,
       identifier: resolved.actorEmail,
       success: true,
@@ -263,7 +280,7 @@ const superAdminOrders = async (req, res) => {
       await H.writeAuthLogSafe(req, {
         eventType: "super_admin_orders_error",
         userId: resolved.actorEmail,
-        role: "super_admin",
+        role: resolved.actor.role,
         partnerCode: null,
         identifier: resolved.actorEmail,
         success: false,
