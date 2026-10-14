@@ -1,8 +1,10 @@
 "use strict";
 
 /**
- * Mirror of Stripe payment rows into the sales team's database
- * (sales_crm.stripe_payments, migration 008, run against sales_crm).
+ * Mirror of Stripe data into the sales team's database (migrations run
+ * against sales_crm):
+ *   sales_crm.stripe_payments         (008)  one row per invoice
+ *   sales_crm.stripe_payout_accounts  (009)  one row per Connect payout account
  *
  * Two ways to reach it, chosen by configuration:
  *
@@ -26,9 +28,12 @@
  * Neither set → mirroring is off. Best-effort by design: any failure here
  * (table missing, no GRANT, host unreachable, bad TLS) is logged as
  * SALES_CRM_MIRROR_FAILED and never fails the webhook, so the dietician_db
- * row, the buyer's emails and the commission ledger are unaffected. The
- * caller is paymentTransactions.syncInvoice, which runs for every invoice
- * event (paid, failed, refunded) and the checkout backfill.
+ * row, the buyer's emails and the commission ledger are unaffected. Callers:
+ *   upsertPayment        paymentTransactions.syncInvoice, which runs for every
+ *                        invoice event (paid, failed, refunded) and the
+ *                        checkout backfill
+ *   upsertPayoutAccount  stripeConnectAccounts.upsertFromAccount, which runs
+ *                        whenever partner_payout_accounts is written
  */
 
 const fs = require("fs");
@@ -42,6 +47,7 @@ if (SALES_CRM_DB && !/^[A-Za-z0-9_]{1,64}$/.test(SALES_CRM_DB)) {
   throw new Error("SALES_CRM_DB_NAME must be a plain MySQL schema name (letters, digits, underscore)");
 }
 const TABLE = SALES_CRM_DB ? `\`${SALES_CRM_DB}\`.\`stripe_payments\`` : null;
+const PAYOUT_TABLE = SALES_CRM_DB ? `\`${SALES_CRM_DB}\`.\`stripe_payout_accounts\`` : null;
 
 const COLUMNS = [
   "stripe_invoice_id",
@@ -93,6 +99,52 @@ const UPSERT_SQL =
      ${COLUMNS.filter((c) => c !== "stripe_invoice_id")
        .map((c) => (KEEP_IF_NULL.has(c) ? `\`${c}\` = COALESCE(VALUES(\`${c}\`), \`${c}\`)` : `\`${c}\` = VALUES(\`${c}\`)`))
        .join(",\n     ")}`;
+
+const PAYOUT_COLUMNS = [
+  "stripe_account_id",
+  "user_email",
+  "user_name",
+  "role",
+  "partner_code",
+  "facility_id",
+  "facility_name",
+  "livemode",
+  "onboarding_status",
+  "details_submitted",
+  "payouts_enabled",
+  "requirements_json",
+  "setup_started_at",
+  "last_synced_at",
+];
+
+// The payee's details come from a join that can miss (user row removed);
+// keep what an earlier copy recorded rather than blanking it.
+const PAYOUT_KEEP_IF_NULL = new Set([
+  "user_name",
+  "role",
+  "partner_code",
+  "facility_id",
+  "facility_name",
+  "setup_started_at",
+]);
+
+const PAYOUT_UPSERT_SQL =
+  PAYOUT_TABLE &&
+  `INSERT INTO ${PAYOUT_TABLE} (${PAYOUT_COLUMNS.map((c) => `\`${c}\``).join(", ")})
+   VALUES (${PAYOUT_COLUMNS.map(() => "?").join(", ")})
+   ON DUPLICATE KEY UPDATE
+     ${PAYOUT_COLUMNS.filter((c) => c !== "stripe_account_id")
+       .map((c) => (PAYOUT_KEEP_IF_NULL.has(c) ? `\`${c}\` = COALESCE(VALUES(\`${c}\`), \`${c}\`)` : `\`${c}\` = VALUES(\`${c}\`)`))
+       .join(",\n     ")}`;
+
+// Same column rules, for a row that must already exist (no insert).
+const PAYOUT_UPDATE_SQL =
+  PAYOUT_TABLE &&
+  `UPDATE ${PAYOUT_TABLE} SET
+     ${PAYOUT_COLUMNS.filter((c) => c !== "stripe_account_id")
+       .map((c) => (PAYOUT_KEEP_IF_NULL.has(c) ? `\`${c}\` = COALESCE(?, \`${c}\`)` : `\`${c}\` = ?`))
+       .join(",\n     ")}
+   WHERE \`stripe_account_id\` = ?`;
 
 // ── Dedicated pool for a sales_crm that the main database does not share ────
 
@@ -181,4 +233,44 @@ async function upsertPayment(row) {
   }
 }
 
-module.exports = { upsertPayment, isEnabled, mode, COLUMNS };
+/**
+ * Write one payout account row (keyed on stripe_account_id). `row` uses the
+ * PAYOUT_COLUMNS names; `livemode`, `details_submitted` and `payouts_enabled`
+ * are stored as 0/1, `requirements_json` as JSON text.
+ * insertIfMissing = false only updates a row that is already there (an account
+ * that has not been verified yet is not added).
+ * Returns { ok, skipped?, reason? } and never throws.
+ */
+async function upsertPayoutAccount(row, { insertIfMissing = true } = {}) {
+  if (!PAYOUT_TABLE) return { ok: false, skipped: true, reason: "SALES_CRM_DB_NAME not set" };
+  try {
+    const values = PAYOUT_COLUMNS.map((c) => {
+      if (["livemode", "details_submitted", "payouts_enabled"].includes(c)) {
+        return row[c] && Number(row[c]) !== 0 ? 1 : 0;
+      }
+      if (c === "requirements_json") {
+        const v = row[c];
+        if (v === undefined || v === null) return null;
+        return typeof v === "string" ? v : JSON.stringify(v);
+      }
+      return row[c] === undefined ? null : row[c];
+    });
+    if (insertIfMissing) {
+      await executor().execute(PAYOUT_UPSERT_SQL, values);
+    } else {
+      // UPDATE takes the key last instead of first.
+      await executor().execute(PAYOUT_UPDATE_SQL, [...values.slice(1), values[0]]);
+    }
+    return { ok: true };
+  } catch (err) {
+    console.warn("SALES_CRM_MIRROR_FAILED:", {
+      stripe_account: row?.stripe_account_id,
+      mode: mode(),
+      code: err?.code,
+      message: err?.message,
+    });
+    return { ok: false, reason: err?.message || "mirror failed" };
+  }
+}
+
+module.exports = { upsertPayment, upsertPayoutAccount, isEnabled, mode, COLUMNS, PAYOUT_COLUMNS };

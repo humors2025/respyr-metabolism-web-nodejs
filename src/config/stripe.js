@@ -9,6 +9,10 @@
  *                            key, rk_…, scoped to Checkout, Billing, Customers,
  *                            Connect accounts/transfers and webhooks)
  *   STRIPE_WEBHOOK_SECRET    whsec_… for the /stripe/webhook endpoint
+ *   STRIPE_CONNECT_WEBHOOK_SECRET
+ *                            optional whsec_… of a second Stripe endpoint on the
+ *                            same URL with "Events from: Connected accounts",
+ *                            subscribed to account.updated only (payout setup)
  *   STRIPE_PRICE_LOOKUP_KEY  lookup_key of the recurring price (rysflo_monthly_29)
  *   STRIPE_TERM_MONTHS       device term; the schedule releases after this (12)
  *   ORDER_SUCCESS_URL / ORDER_CANCEL_URL
@@ -19,6 +23,7 @@ const Stripe = require("stripe");
 
 const STRIPE_SECRET_KEY = String(process.env.STRIPE_SECRET_KEY || "").trim();
 const STRIPE_WEBHOOK_SECRET = String(process.env.STRIPE_WEBHOOK_SECRET || "").trim();
+const STRIPE_CONNECT_WEBHOOK_SECRET = String(process.env.STRIPE_CONNECT_WEBHOOK_SECRET || "").trim();
 const STRIPE_PRICE_LOOKUP_KEY =
   String(process.env.STRIPE_PRICE_LOOKUP_KEY || "rysflo_monthly_29").trim();
 const STRIPE_TERM_MONTHS = Math.max(
@@ -74,6 +79,7 @@ module.exports = {
   requireStripe,
   isLive,
   STRIPE_WEBHOOK_SECRET,
+  STRIPE_CONNECT_WEBHOOK_SECRET,
   STRIPE_PRICE_LOOKUP_KEY,
   STRIPE_TERM_MONTHS,
   ORDER_SUCCESS_URL,
