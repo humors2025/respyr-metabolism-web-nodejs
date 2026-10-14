@@ -11,16 +11,23 @@
  *   configuration.recipient.capabilities.stripe_balance.stripe_transfers.status === "active"
  * (payouts_enabled / charges_enabled are v1 fields and are not used).
  *
- * v2 accounts emit v2 "thin" events (v2.core.account[requirements].updated)
- * rather than the classic account.updated webhook, so status is pulled:
+ * v2 accounts emit both v2 "thin" events (Your account scope) and the classic
+ * v1 account.updated (Connected accounts scope only, so it reaches
+ * /stripe/webhook only through a second, Connect-scoped endpoint signed with
+ * STRIPE_CONNECT_WEBHOOK_SECRET). Status is therefore also pulled:
  *   - when the user returns from onboarding (status endpoint, force=true)
  *   - when our copy is older than STALE_MS
  *   - always, right before a Transfer (payoutRuns.js)
+ *
+ * Once an account is verified, every write of partner_payout_accounts is
+ * copied to sales_crm.stripe_payout_accounts (salesCrmMirror.js) when that is
+ * enabled; see mirrorToSalesCrm.
  */
 
 const pool = require("../config/db");
-const { requireStripe } = require("../config/stripe");
+const { requireStripe, isLive } = require("../config/stripe");
 const ledger = require("./commissionLedger");
+const salesCrmMirror = require("./salesCrmMirror");
 
 function lower(v) {
   return typeof v === "string" ? v.trim().toLowerCase() : "";
@@ -112,11 +119,70 @@ async function upsertFromAccount(userId, acct) {
     ]
   );
 
+  await mirrorToSalesCrm(userId, acct);
+
   if (active) {
     await ledger.releaseHeldForPayee(userId);
   }
 
   return status;
+}
+
+/**
+ * Copy the row just written, plus who the payee is, to sales_crm. The sales
+ * team wants verified payees only: an account is added there the first time
+ * it is verified, and from then on every change is copied (so a later
+ * action_required or disabled still shows). Best-effort: a failure is logged
+ * and never reaches onboarding, the status page, the webhook or a payout.
+ */
+async function mirrorToSalesCrm(userId, acct) {
+  if (!salesCrmMirror.isEnabled()) return;
+  try {
+    const [rows] = await pool.execute(
+      `
+        SELECT ppa.stripe_account_id, ppa.user_id, ppa.onboarding_status,
+               ppa.details_submitted, ppa.payouts_enabled, ppa.requirements_json,
+               ppa.created_at, ppa.last_synced_at,
+               aur.role, aur.partner_code, aur.facility_id,
+               f.name AS facility_name,
+               (SELECT td.name FROM table_dietician td
+                 WHERE LOWER(td.email) = LOWER(aur.user_id) LIMIT 1) AS user_name
+        FROM partner_payout_accounts ppa
+        LEFT JOIN app_user_roles aur ON LOWER(aur.user_id) = LOWER(ppa.user_id)
+        LEFT JOIN facilities f ON f.id = aur.facility_id
+        WHERE LOWER(ppa.user_id) = ?
+        ORDER BY (aur.status = 'active') DESC
+        LIMIT 1
+      `,
+      [lower(userId)]
+    );
+    const row = rows[0];
+    if (!row) return;
+    const verified = row.onboarding_status === "verified" && Number(row.payouts_enabled) === 1;
+    await salesCrmMirror.upsertPayoutAccount({
+      stripe_account_id: row.stripe_account_id,
+      user_email: row.user_id,
+      user_name: row.user_name,
+      role: row.role,
+      partner_code: row.partner_code,
+      facility_id: row.facility_id,
+      facility_name: row.facility_name,
+      livemode: typeof acct?.livemode === "boolean" ? acct.livemode : isLive,
+      onboarding_status: row.onboarding_status,
+      details_submitted: row.details_submitted,
+      payouts_enabled: row.payouts_enabled,
+      requirements_json: row.requirements_json,
+      setup_started_at: row.created_at,
+      last_synced_at: row.last_synced_at,
+    }, { insertIfMissing: verified });
+  } catch (err) {
+    console.warn("SALES_CRM_MIRROR_FAILED:", {
+      stripe_account: acct?.id,
+      step: "read payee",
+      code: err?.code,
+      message: err?.message,
+    });
+  }
 }
 
 async function getAccountRow(userId) {

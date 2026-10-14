@@ -24,6 +24,7 @@
  *   charge.refunded              -> payment_transactions refund amount/status
  *                                   + reverse ledger entries for that invoice
  *   account.updated              -> partner_payout_accounts status
+ *                                   (+ sales_crm.stripe_payout_accounts copy)
  *   transfer.reversed            -> payouts + ledger entries reversed
  *   (a Transfer settles synchronously on create; there is no transfer.paid)
  *
@@ -31,13 +32,27 @@
  * copied to the team as an internal alert (paymentEmails.sendPaymentAlert,
  * recipients in PAYMENT_ALERT_EMAILS). It never throws.
  *
+ * Two Stripe endpoints can point at this URL. The main one ("Events from: Your
+ * account") is signed with STRIPE_WEBHOOK_SECRET. For Accounts v2 payees
+ * Stripe sends account.updated only in the "Connected accounts" scope, so a
+ * second endpoint with that scope, subscribed to account.updated alone, is
+ * signed with STRIPE_CONNECT_WEBHOOK_SECRET. Events from a connected account
+ * (event.account set) other than account.updated are acknowledged and ignored:
+ * they belong to the gym's own Stripe account, not to Rysflo's sales.
+ *
  * Anything else is acknowledged and ignored. Always returns 200 once the event
  * is recorded, even if handling failed — Stripe retries are not useful for a
  * bug; the error is logged and visible for a super_admin to replay.
  */
 
 const pool = require("../../config/db");
-const { requireStripe, STRIPE_WEBHOOK_SECRET, STRIPE_TERM_MONTHS, PLAN_CODE } = require("../../config/stripe");
+const {
+  requireStripe,
+  STRIPE_WEBHOOK_SECRET,
+  STRIPE_CONNECT_WEBHOOK_SECRET,
+  STRIPE_TERM_MONTHS,
+  PLAN_CODE,
+} = require("../../config/stripe");
 const ledger = require("../../services/commissionLedger");
 const connect = require("../../services/stripeConnectAccounts");
 const pricing = require("../../services/pricing");
@@ -529,12 +544,25 @@ const stripeWebhook = async (req, res) => {
     return res.status(400).json({ ok: false, message: "Missing signature or body" });
   }
 
-  let event;
-  try {
-    event = stripe.webhooks.constructEvent(rawBody, signature, STRIPE_WEBHOOK_SECRET);
-  } catch (err) {
-    console.warn("STRIPE_WEBHOOK_SIGNATURE_INVALID:", err?.message);
+  // Main endpoint first, then the Connected-accounts one when configured.
+  let event = null;
+  let lastErr = null;
+  for (const secret of [STRIPE_WEBHOOK_SECRET, STRIPE_CONNECT_WEBHOOK_SECRET]) {
+    if (!secret) continue;
+    try {
+      event = stripe.webhooks.constructEvent(rawBody, signature, secret);
+      break;
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+  if (!event) {
+    console.warn("STRIPE_WEBHOOK_SIGNATURE_INVALID:", lastErr?.message);
     return res.status(400).json({ ok: false, message: "Invalid signature" });
+  }
+
+  if (event.account && event.type !== "account.updated") {
+    return res.status(200).json({ ok: true, ignored: true });
   }
 
   // Idempotency: first writer wins. A redelivered event is acknowledged only.
