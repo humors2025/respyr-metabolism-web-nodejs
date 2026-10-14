@@ -33,7 +33,7 @@ const PAYMENT_STATUSES = ["open", "paid", "failed", "refunded", "partially_refun
 // Comma-separated; override with ORDERS_VIEWER_EMAILS=a@x.com,b@y.com.
 // Mirrored in the frontend's src/lib/ordersAccess.js for the menu link.
 const ORDERS_VIEWER_EMAILS = String(
-  process.env.ORDERS_VIEWER_EMAILS || "evan.gaudet@gmail.com,derek.lopez88@gmail.com"
+  process.env.ORDERS_VIEWER_EMAILS || "evan.gaudet@gmail.com,derek.lopez88@gmail.com,sagar@respyr.in"
 )
   .split(",")
   .map((email) => email.trim().toLowerCase())
