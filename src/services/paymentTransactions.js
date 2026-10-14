@@ -38,13 +38,13 @@ function clip(v, max) {
 
 // Production has chosen not to create the migration-006 tables. Their absence
 // must not cost the buyer, the commission ledger or the sales_crm copy, so a
-// missing table is logged once per container and the row is skipped. Any
-// other database error still propagates.
+// missing table is logged once per container and the row is skipped (or, for
+// a read, nothing is found). Any other database error still propagates.
 const missingTableWarned = new Set();
 function isMissingTable(err) {
   return err?.code === "ER_NO_SUCH_TABLE" || err?.errno === 1146;
 }
-async function writeOptional(table, run) {
+async function optionalTable(table, run) {
   try {
     await run();
     return true;
@@ -72,6 +72,55 @@ async function referralSubscriptionFor(stripeSubscriptionId) {
 async function referralSubscriptionIdFor(stripeSubscriptionId) {
   const rs = await referralSubscriptionFor(stripeSubscriptionId);
   return rs ? Number(rs.id) : null;
+}
+
+/**
+ * Shipping columns for the sales_crm copy of an invoice: the address saved
+ * from Checkout (subscription_shipping_addresses), else Stripe's copy on the
+ * invoice. All null when neither has one yet: invoice.paid can arrive before
+ * checkout.session.completed, whose invoice backfill then fills them in.
+ * Renewals carry the subscription's address too.
+ */
+async function shippingForSalesCrm(stripeSubscriptionId, invoice) {
+  let saved = null;
+  if (stripeSubscriptionId) {
+    await optionalTable("subscription_shipping_addresses", async () => {
+      const [rows] = await pool.execute(
+        `SELECT name, phone, line1, line2, city, state, postal_code, country
+           FROM subscription_shipping_addresses WHERE stripe_subscription_id = ? LIMIT 1`,
+        [stripeSubscriptionId]
+      );
+      saved = rows[0] || null;
+    });
+  }
+  const snap = invoice.customer_shipping || {};
+  const a = saved || {
+    name: snap.name,
+    phone: snap.phone || invoice.customer_phone,
+    ...(snap.address || {}),
+  };
+
+  const line1 = clip(a.line1, 255);
+  const line2 = clip(a.line2, 255);
+  const city = clip(a.city, 100);
+  const state = clip(a.state, 100);
+  const postalCode = clip(a.postal_code, 20);
+  const country = clip(a.country, 2);
+  // One line for the sales console: "915 W Price Rd, A, Brownsville, TX 78520, US".
+  const oneLine = [line1, line2, city, [state, postalCode].filter(Boolean).join(" "), country]
+    .filter(Boolean)
+    .join(", ");
+  return {
+    shipping_address: oneLine || null,
+    shipping_name: clip(a.name, 150),
+    phone: clip(a.phone, 32),
+    shipping_line1: line1,
+    shipping_line2: line2,
+    shipping_city: city,
+    shipping_state: state,
+    shipping_postal_code: postalCode,
+    shipping_country: country,
+  };
 }
 
 /** The invoice id a PaymentIntent paid, or null. */
@@ -135,7 +184,7 @@ async function syncInvoice(stripe, invoiceOrId, { failure = false } = {}) {
 
   const rs = await referralSubscriptionFor(subscriptionId);
 
-  await writeOptional("payment_transactions", () => pool.execute(
+  await optionalTable("payment_transactions", () => pool.execute(
     `
       INSERT INTO payment_transactions (
         referral_subscription_id, stripe_subscription_id, stripe_customer_id,
@@ -184,6 +233,7 @@ async function syncInvoice(stripe, invoiceOrId, { failure = false } = {}) {
   // on, so a sales_crm problem can never cost the ledger or the buyer.
   const md = invoice.parent?.subscription_details?.metadata || invoice.subscription_details?.metadata || invoice.metadata || {};
   const purchaserEmail = clip(invoice.customer_email || rs?.purchaser_email, 255);
+  const shipping = salesCrm.isEnabled() ? await shippingForSalesCrm(subscriptionId, invoice) : {};
   await salesCrm.upsertPayment({
     stripe_invoice_id: invoice.id,
     stripe_subscription_id: subscriptionId,
@@ -207,6 +257,7 @@ async function syncInvoice(stripe, invoiceOrId, { failure = false } = {}) {
     payment_method_type: clip(pmDetails?.type, 32),
     card_last4: clip(pmDetails?.card?.last4, 4),
     paid_at: toMysqlDateTime(invoice.status_transitions?.paid_at),
+    ...shipping,
   });
 
   return { invoice: invoice.id, status, failureMessage };
@@ -223,7 +274,7 @@ async function saveShippingAddress({ session, stripeSubscriptionId }) {
   const phone = clip(session.customer_details?.phone, 32);
   if (!addr && !phone) return false;
 
-  return writeOptional("subscription_shipping_addresses", async () => pool.execute(
+  return optionalTable("subscription_shipping_addresses", async () => pool.execute(
     `
       INSERT INTO subscription_shipping_addresses (
         referral_subscription_id, stripe_subscription_id, stripe_checkout_session_id,
