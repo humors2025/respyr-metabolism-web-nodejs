@@ -7,29 +7,39 @@
  *                                     buyer's shipping address and phone (010)
  *   sales_crm.stripe_payout_accounts  (009)  one row per Connect payout account
  *
- * Two ways to reach it, chosen by configuration:
+ * Three ways to reach it, chosen by configuration (the first one set wins):
+ *
+ *   Sales CRM API (production): SALES_CRM_API_URL + SALES_CRM_API_KEY. The
+ *   production Lambda's network cannot reach the sales_crm database, but it
+ *   can reach the internet, so the row is posted to the sales_crm Lambda
+ *   (rysflo-field-console-api, /v1/internal/stripe/*), which writes it.
+ *   SALES_CRM_API_KEY must match that Lambda's INGEST_API_KEY;
+ *   SALES_CRM_API_TIMEOUT_MS (default 5000) caps each call. No database
+ *   settings are needed in this mode.
  *
  *   Shared server (UAT): SALES_CRM_DB_NAME only. sales_crm sits on the same
  *   MySQL server as dietician_db, so the row is written with a cross-database
  *   statement through the main pool. No second connection, no second secret.
  *
- *   Separate server (production): SALES_CRM_DB_HOST as well. The production
- *   database is on its own EC2 server while sales_crm lives on an RDS
- *   instance, so the mirror opens its own small pool to the RDS:
+ *   Separate server: SALES_CRM_DB_HOST as well. When sales_crm lives on a
+ *   different MySQL server that this Lambda can reach, the mirror opens its
+ *   own small pool to it:
  *     SALES_CRM_DB_HOST, SALES_CRM_DB_PORT (3306), SALES_CRM_DB_USER,
  *     SALES_CRM_DB_PASSWORD, SALES_CRM_DB_NAME (sales_crm)
  *     SALES_CRM_DB_SSL_MODE  pinned (default, verifies the RDS certificate
  *                            against src/config/rds-global-bundle.pem or
  *                            SALES_CRM_DB_CA_PATH) | encrypted | disabled
- *   These keys may live in the Lambda's Secrets Manager secret
- *   (secretsManager.js copies them into process.env) or as plain env vars.
  *   The Lambda's VPC must be able to reach the RDS; the connect timeout is
  *   short so an unreachable host cannot stall the webhook.
  *
- * Neither set → mirroring is off. Best-effort by design: any failure here
- * (table missing, no GRANT, host unreachable, bad TLS) is logged as
- * SALES_CRM_MIRROR_FAILED and never fails the webhook, so the dietician_db
- * row, the buyer's emails and the commission ledger are unaffected. Callers:
+ * All these keys may live in the Lambda's Secrets Manager secret
+ * (secretsManager.js copies them into process.env) or as plain env vars.
+ * None set → mirroring is off. The mode is logged once per cold start
+ * ("sales_crm mirror: { mode }"). Best-effort by design: any failure here
+ * (API down or refusing the key, table missing, no GRANT, host unreachable,
+ * bad TLS) is logged as SALES_CRM_MIRROR_FAILED and never fails the webhook,
+ * so the dietician_db row, the buyer's emails and the commission ledger are
+ * unaffected. Callers:
  *   upsertPayment        paymentTransactions.syncInvoice, which runs for every
  *                        invoice event (paid, failed, refunded) and the
  *                        checkout backfill
@@ -39,8 +49,19 @@
 
 const fs = require("fs");
 const path = require("path");
+const axios = require("axios");
 const mysql = require("mysql2/promise");
 const mainPool = require("../config/db");
+
+const SALES_CRM_API_URL = String(process.env.SALES_CRM_API_URL || "").trim().replace(/\/+$/, "");
+const SALES_CRM_API_KEY = String(process.env.SALES_CRM_API_KEY || "").trim();
+const API_TIMEOUT_MS = Number(process.env.SALES_CRM_API_TIMEOUT_MS) > 0 ? Number(process.env.SALES_CRM_API_TIMEOUT_MS) : 5000;
+// https only (plain http just for a local test server). A bad URL or a URL
+// without its key turns the API off and says so at load (see the end of
+// this file) rather than taking the whole Lambda down.
+const API_URL_OK =
+  /^https:\/\/[^/\s]+/.test(SALES_CRM_API_URL) || /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?(\/|$)/.test(SALES_CRM_API_URL);
+const API_ON = !!(SALES_CRM_API_URL && SALES_CRM_API_KEY && API_URL_OK);
 
 const SALES_CRM_DB = String(process.env.SALES_CRM_DB_NAME || "").trim();
 const SALES_CRM_HOST = String(process.env.SALES_CRM_DB_HOST || "").trim();
@@ -222,11 +243,15 @@ function executor() {
 }
 
 function isEnabled() {
-  return !!TABLE;
+  return API_ON || !!TABLE;
 }
 
-/** "shared" (cross-database through the main pool), "dedicated" (own RDS pool) or "off". */
+/**
+ * "api" (post to the sales_crm Lambda), "shared" (cross-database through the
+ * main pool), "dedicated" (own RDS pool) or "off".
+ */
 function mode() {
+  if (API_ON) return "api";
   if (!TABLE) return "off";
   return SALES_CRM_HOST ? "dedicated" : "shared";
 }
@@ -236,17 +261,46 @@ function isMissingColumn(err) {
 }
 
 /**
+ * Post one row to the sales_crm Lambda. The row's values go as JSON (dates as
+ * ISO strings); that Lambda checks them and runs the same upsert as below.
+ * Returns { ok, reason? } and never throws. `ref` only labels the log line.
+ */
+async function postToApi(route, body, ref) {
+  try {
+    const res = await axios.post(`${SALES_CRM_API_URL}${route}`, body, {
+      headers: { "Content-Type": "application/json", "X-Sales-Crm-Key": SALES_CRM_API_KEY },
+      timeout: API_TIMEOUT_MS,
+      maxRedirects: 0,
+      validateStatus: () => true,
+    });
+    if (res.status >= 200 && res.status < 300 && res.data?.ok === true) return { ok: true };
+    const detail = res.data?.error || res.data?.code || "";
+    const reason = `sales_crm api ${res.status}${detail ? `: ${detail}` : ""}`;
+    console.warn("SALES_CRM_MIRROR_FAILED:", { ...ref, mode: "api", status: res.status, reason });
+    return { ok: false, reason };
+  } catch (err) {
+    // A timeout or a network error; the key is in a header, never in the message.
+    console.warn("SALES_CRM_MIRROR_FAILED:", { ...ref, mode: "api", code: err?.code, message: err?.message });
+    return { ok: false, reason: err?.message || "mirror failed" };
+  }
+}
+
+/**
  * Upsert one invoice row (keyed on stripe_invoice_id). `row` uses the column
  * names above (COLUMNS and SHIPPING_COLUMNS); missing keys are stored as NULL,
  * `livemode` as 0/1. Returns { ok, skipped?, reason? } and never throws.
  */
 async function upsertPayment(row) {
+  const valueOf = (c) => {
+    if (c === "livemode") return row.livemode ? 1 : 0;
+    return row[c] === undefined ? null : row[c];
+  };
+  if (API_ON) {
+    const payment = Object.fromEntries(ALL_COLUMNS.map((c) => [c, valueOf(c)]));
+    return postToApi("/v1/internal/stripe/payments", { payment }, { invoice: row?.stripe_invoice_id });
+  }
   if (!TABLE) return { ok: false, skipped: true, reason: "SALES_CRM_DB_NAME not set" };
-  const valuesFor = (columns) =>
-    columns.map((c) => {
-      if (c === "livemode") return row.livemode ? 1 : 0;
-      return row[c] === undefined ? null : row[c];
-    });
+  const valuesFor = (columns) => columns.map(valueOf);
   try {
     if (!shippingColumnsMissing) {
       try {
@@ -283,19 +337,28 @@ async function upsertPayment(row) {
  * Returns { ok, skipped?, reason? } and never throws.
  */
 async function upsertPayoutAccount(row, { insertIfMissing = true } = {}) {
+  const valueOf = (c) => {
+    if (["livemode", "details_submitted", "payouts_enabled"].includes(c)) {
+      return row[c] && Number(row[c]) !== 0 ? 1 : 0;
+    }
+    if (c === "requirements_json") {
+      const v = row[c];
+      if (v === undefined || v === null) return null;
+      return typeof v === "string" ? v : JSON.stringify(v);
+    }
+    return row[c] === undefined ? null : row[c];
+  };
+  if (API_ON) {
+    const account = Object.fromEntries(PAYOUT_COLUMNS.map((c) => [c, valueOf(c)]));
+    return postToApi(
+      "/v1/internal/stripe/payout-accounts",
+      { account, insert_if_missing: insertIfMissing },
+      { stripe_account: row?.stripe_account_id }
+    );
+  }
   if (!PAYOUT_TABLE) return { ok: false, skipped: true, reason: "SALES_CRM_DB_NAME not set" };
   try {
-    const values = PAYOUT_COLUMNS.map((c) => {
-      if (["livemode", "details_submitted", "payouts_enabled"].includes(c)) {
-        return row[c] && Number(row[c]) !== 0 ? 1 : 0;
-      }
-      if (c === "requirements_json") {
-        const v = row[c];
-        if (v === undefined || v === null) return null;
-        return typeof v === "string" ? v : JSON.stringify(v);
-      }
-      return row[c] === undefined ? null : row[c];
-    });
+    const values = PAYOUT_COLUMNS.map(valueOf);
     if (insertIfMissing) {
       await executor().execute(PAYOUT_UPSERT_SQL, values);
     } else {
@@ -313,5 +376,14 @@ async function upsertPayoutAccount(row, { insertIfMissing = true } = {}) {
     return { ok: false, reason: err?.message || "mirror failed" };
   }
 }
+
+// Once per cold start, so CloudWatch shows which way rows go (or that they
+// go nowhere) without waiting for a payment.
+if (SALES_CRM_API_URL && !API_URL_OK) {
+  console.error("SALES_CRM_API_URL must be an https:// address; the sales_crm API is off");
+} else if (SALES_CRM_API_URL && !SALES_CRM_API_KEY) {
+  console.error("SALES_CRM_API_URL is set but SALES_CRM_API_KEY is empty; the sales_crm API is off");
+}
+console.log("sales_crm mirror:", { mode: mode(), ...(API_ON ? { url: SALES_CRM_API_URL } : {}) });
 
 module.exports = { upsertPayment, upsertPayoutAccount, isEnabled, mode, COLUMNS, SHIPPING_COLUMNS, PAYOUT_COLUMNS };

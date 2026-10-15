@@ -24,9 +24,10 @@ const secretsManagerClient = new SecretsManagerClient({
 // Each canonical DB key is resolved from the first non-blank alias below.
 // The three non-DB keys are taken from the secret when present (prod) and
 // otherwise MUST already exist as plain Lambda environment variables (UAT).
-// The SALES_CRM_DB_* keys are optional: copied from the secret when present
-// (production's sales_crm mirror connects to a separate RDS), otherwise
-// whatever is in the environment, possibly nothing, is used.
+// The SALES_CRM_API_* and SALES_CRM_DB_* keys are optional: copied from the
+// secret when present (production's sales_crm mirror posts to the sales_crm
+// API with a shared key), otherwise whatever is in the environment, possibly
+// nothing, is used.
 // Either way every key is present in process.env before ./src/index is
 // required, which is what the module-load-time constants in the controllers
 // depend on.
@@ -48,6 +49,8 @@ const SECRET_OR_ENV_KEYS = [
 
 // Never required; see salesCrmMirror.js.
 const OPTIONAL_SECRET_KEYS = [
+  "SALES_CRM_API_URL",
+  "SALES_CRM_API_KEY",
   "SALES_CRM_DB_HOST",
   "SALES_CRM_DB_PORT",
   "SALES_CRM_DB_NAME",
