@@ -23,7 +23,10 @@
  * admin — see admin-invite-trainer), never showed up on All Clients or in the
  * overview counts. This module is the one place that rule lives now; callers:
  * super-admin-all-clients-overview(-newtest), super-admin-overview,
- * trainer-admin-overview, trainer-admin-clients-list-dir.
+ * trainer-admin-overview, trainer-admin-clients-list-dir,
+ * trainer-clients-overview-for-super-admin,
+ * get-clients-data-total-missed-test-masked,
+ * get-data-points-score-all-ranges-coach-masking.
  *
  * Plain SQL without recursive CTEs (MySQL 5.7-safe); app_user_roles is small.
  * The actor's own code is NOT included — each caller adds it itself.
