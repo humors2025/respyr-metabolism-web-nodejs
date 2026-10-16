@@ -16,9 +16,10 @@
  *    for a selected date, with a tested/missed/all summary for that date.
  *  - RBAC (ctd_actor_can_access_code):
  *      trainer     → own code only
- *      admin       → own code + active trainers directly parented to the admin
- *      super_admin → own code + self/children + active trainers parented to it or
- *                    to one of its active admins (one level — no extra recursion).
+ *      admin       → own code + its network (services/partnerNetwork.js:
+ *                    facility admins under it, trainers under it or them)
+ *      super_admin → own code + its network (admins, facility admins and
+ *                    trainers under it — see services/partnerNetwork.js)
  *  - Client identity is MASKED (name / email / phone / age-band). dob, region,
  *    location, profile_image are never returned.
  *  - metabolism_score / zone / last test come from the LATEST test ON the
@@ -62,6 +63,7 @@
 
 const crypto = require("crypto");
 const pool = require("../../../../config/db");
+const { listNetworkAccounts } = require("../../../../services/partnerNetwork");
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -425,8 +427,10 @@ async function resolveActorFromToken(req) {
 // ─── RBAC: can the actor view this dietician's clients? ───────────────────────
 
 /**
- * Port of PHP ctd_actor_can_access_code(). One level of nesting, exactly as the
- * PHP — no extra recursion is introduced.
+ * Port of PHP ctd_actor_can_access_code(), with the network widened to
+ * services/partnerNetwork.js. The PHP only followed admin → trainer, from
+ * before facility admins existed, so a client of a trainer invited by a
+ * facility admin was a 403 for the super admin while All Clients listed it.
  */
 async function actorCanAccessCode(actor, actorEmail, targetCode) {
   const target = normalizeCode(targetCode);
@@ -443,55 +447,18 @@ async function actorCanAccessCode(actor, actorEmail, targetCode) {
     return false;
   }
 
-  if (role === "admin") {
-    const [rows] = await pool.execute(
-      `
-        SELECT aur.id
-        FROM app_user_roles aur
-        LEFT JOIN table_dietician td
-          ON LOWER(td.email) = LOWER(aur.user_id)
-        WHERE aur.role = 'trainer'
-          AND aur.status = 'active'
-          AND LOWER(aur.parent_user_id) = LOWER(?)
-          AND (
-                UPPER(aur.partner_code) = UPPER(?)
-             OR UPPER(td.dietician_id) = UPPER(?)
-          )
-        LIMIT 1
-      `,
-      [actorEmail, target, target]
-    );
-    return rows.length > 0;
+  // The PHP's super_admin query also matched the actor's own row by either code.
+  if (role === "super_admin" && normalizeCode(actor.dietician_id) === target) {
+    return true;
   }
 
-  if (role === "super_admin") {
-    const [rows] = await pool.execute(
-      `
-        SELECT aur.id
-        FROM app_user_roles aur
-        LEFT JOIN table_dietician td
-          ON LOWER(td.email) = LOWER(aur.user_id)
-        WHERE aur.status = 'active'
-          AND (
-                UPPER(aur.partner_code) = UPPER(?)
-             OR UPPER(td.dietician_id) = UPPER(?)
-          )
-          AND (
-                LOWER(aur.user_id) = LOWER(?)
-             OR LOWER(aur.parent_user_id) = LOWER(?)
-             OR LOWER(aur.parent_user_id) IN (
-                    SELECT LOWER(user_id)
-                    FROM app_user_roles
-                    WHERE role = 'admin'
-                      AND status = 'active'
-                      AND LOWER(parent_user_id) = LOWER(?)
-                )
-          )
-        LIMIT 1
-      `,
-      [target, target, actorEmail, actorEmail, actorEmail]
+  if (role === "admin" || role === "super_admin") {
+    // A code matches on partner_code or the older table_dietician.dietician_id,
+    // as the PHP queries did.
+    const accounts = await listNetworkAccounts(actorEmail, role);
+    return accounts.some(
+      (a) => normalizeCode(a.partner_code) === target || normalizeCode(a.dietician_id) === target
     );
-    return rows.length > 0;
   }
 
   return false;
