@@ -17,10 +17,10 @@
  *  - The actor may only view the target if the target's effective code (or its
  *    dietician_id) belongs to the actor's network:
  *      trainer    → own effective code only
- *      admin      → own code + active trainers directly parented to the admin
- *      super_admin→ own code + active admins parented to it + active trainers
- *                   parented to it OR to one of those admins (one level, exactly
- *                   as the PHP — no extra recursion introduced).
+ *      admin      → own code + its network (services/partnerNetwork.js:
+ *                   facility admins under it, trainers under it or them)
+ *      super_admin→ own code + its network (admins, facility admins and
+ *                   trainers under it — see services/partnerNetwork.js)
  *  - Client identity is MASKED (name + email). Zone is never returned. Raw
  *    name/email are never returned.
  *  - metabolism_score = latest test fat_loss_metabolism_score only.
@@ -64,6 +64,7 @@
 
 const crypto = require("crypto");
 const pool = require("../../../../config/db");
+const { listNetworkCodes } = require("../../../../services/partnerNetwork");
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -317,8 +318,11 @@ async function resolveActorFromToken(req) {
 // ─── Network resolution (PHP getAllowedCodesForActor) ────────────────────────
 
 /**
- * Build the actor's allowed network of UPPER-cased codes. One level of nesting,
- * exactly as the PHP — no extra recursion is introduced.
+ * Build the actor's allowed network of UPPER-cased codes: the actor's own code,
+ * plus (admin / super_admin) every active account under them per
+ * services/partnerNetwork.js — facility admins and the trainers they invited
+ * included. The PHP only followed admin → trainer, so a facility admin's page
+ * was a 403 for the super admin.
  */
 async function getAllowedCodesForActor(actor, actorEmail) {
   const codes = new Map();
@@ -332,60 +336,8 @@ async function getAllowedCodesForActor(actor, actorEmail) {
 
   const role = String(actor.role);
 
-  if (role === "trainer") {
-    return [...codes.values()];
-  }
-
-  if (role === "admin") {
-    const [rows] = await pool.execute(
-      `
-        SELECT partner_code
-        FROM app_user_roles
-        WHERE role = 'trainer'
-          AND status = 'active'
-          AND partner_code IS NOT NULL
-          AND partner_code <> ''
-          AND LOWER(parent_user_id) = LOWER(?)
-      `,
-      [actorEmail]
-    );
-    for (const row of rows) addCode(row.partner_code);
-    return [...codes.values()];
-  }
-
-  if (role === "super_admin") {
-    const [rows] = await pool.execute(
-      `
-        SELECT partner_code
-        FROM app_user_roles
-        WHERE status = 'active'
-          AND partner_code IS NOT NULL
-          AND partner_code <> ''
-          AND (
-            (
-              role = 'admin'
-              AND LOWER(parent_user_id) = LOWER(?)
-            )
-            OR
-            (
-              role = 'trainer'
-              AND (
-                LOWER(parent_user_id) = LOWER(?)
-                OR LOWER(parent_user_id) IN (
-                  SELECT LOWER(user_id)
-                  FROM app_user_roles
-                  WHERE role = 'admin'
-                    AND status = 'active'
-                    AND LOWER(parent_user_id) = LOWER(?)
-                )
-              )
-            )
-          )
-      `,
-      [actorEmail, actorEmail, actorEmail]
-    );
-    for (const row of rows) addCode(row.partner_code);
-    return [...codes.values()];
+  if (role === "admin" || role === "super_admin") {
+    for (const code of await listNetworkCodes(actorEmail, role)) addCode(code);
   }
 
   return [...codes.values()];
