@@ -14,13 +14,20 @@
  * Purpose (group-centric admin view). Given a group_name, returns EVERYTHING
  * under that group from the single-table ta_admin_groups design:
  *   - group_members : the admin codes that belong to the group (ta_admin_groups)
- *   - trainers      : the trainers under each of those admins
- *                     (app_user_roles.role = 'trainer', parent_user_id = admin email)
- *                     PLUS the group's own admins as entries
- *   - clients       : all clients owned by (members + their trainers), paginated,
- *                     with name/email MASKED
+ *   - trainers      : the facility admins under each of those admins
+ *                     (role = 'facility_admin', parent_user_id = admin email),
+ *                     the trainers under those admins or those facility admins
+ *                     (role = 'trainer', parent_user_id = admin / facility admin
+ *                     email), PLUS the group's own admins as entries
+ *   - clients       : all clients owned by (members + facility admins + trainers),
+ *                     paginated, with name/email MASKED
  *   - period_overview : date-wise total readings (trainer self + client), optionally
- *                     scoped to ONE member/trainer subtree
+ *                     scoped to ONE member/facility admin/trainer subtree
+ *
+ * Facility admins (gym / studio owners) came after the PHP, which only followed
+ * admin → trainer, so a facility's members and the trainers a facility admin
+ * invites were missing from the analytics pages. Same parent-chain rule as
+ * services/partnerNetwork.js.
  *
  * Behaviour parity with the PHP:
  *  - Member codes come from ta_admin_groups (status = 'active').
@@ -41,8 +48,10 @@
  *      overview_date          -> that single day
  *      overview_from/_to      -> that range (a missing side defaults to the other)
  *      neither                -> today (Asia/Kolkata)
- *      overview_member        -> scope to an ADMIN member (self + child trainers +
- *                                their clients) or a TRAINER (self + own clients);
+ *      overview_member        -> scope to an ADMIN member (self + child facility
+ *                                admins + child trainers + their clients), a
+ *                                FACILITY ADMIN (self + its trainers + their
+ *                                clients) or a TRAINER (self + own clients);
  *                                a code outside the group's network -> 404
  *  - Response keys/shape match the PHP (status, message, group_name, actor,
  *    group_member_codes, network_codes, counts, period_overview, group_members,
@@ -621,8 +630,12 @@ async function getMembersInfo(codes, excludeEmails) {
   return members;
 }
 
-/** Port of PHP getChildTrainers(): child trainers under the given admin emails. */
-async function getChildTrainers(adminEmails, excludeEmails) {
+/**
+ * Port of PHP getChildTrainers(): active accounts of `role` ('trainer' or
+ * 'facility_admin') parented to one of the given emails, with the same
+ * per-provider counts.
+ */
+async function getChildTrainers(adminEmails, excludeEmails, role = "trainer") {
   if (adminEmails.length === 0) return [];
 
   const inList = adminEmails.map(() => "?").join(",");
@@ -701,7 +714,7 @@ async function getChildTrainers(adminEmails, excludeEmails) {
     FROM app_user_roles aur
     LEFT JOIN table_dietician td
       ON LOWER(td.email) = LOWER(aur.user_id)
-    WHERE aur.role = 'trainer'
+    WHERE aur.role = ?
       AND aur.status = 'active'
       AND LOWER(aur.parent_user_id) IN (${inList})
     ORDER BY aur.partner_code
@@ -711,6 +724,7 @@ async function getChildTrainers(adminEmails, excludeEmails) {
     ...keepClient.params,
     ...keepTest1.params,
     ...keepTest2.params,
+    role,
     ...adminEmails.map(normalizeEmail),
   ];
 
@@ -727,7 +741,7 @@ async function getChildTrainers(adminEmails, excludeEmails) {
       partner_code: code,
       name: cleanValue(row.name),
       email: row.email !== null && row.email !== undefined ? normalizeEmail(row.email) : null,
-      role: "trainer",
+      role,
       parent_admin_email:
         row.parent_user_id !== null && row.parent_user_id !== undefined
           ? normalizeEmail(row.parent_user_id)
@@ -1196,6 +1210,38 @@ function formatClientRows(rows, trainerMap = new Map()) {
   });
 }
 
+/**
+ * Every provider below `rootEmail` in the trainers list, matched on
+ * parent_admin_email: an admin's facility admins and trainers, plus the
+ * trainers under those facility admins; a facility admin's trainers.
+ */
+function providersUnder(rootEmail, providers) {
+  const below = [];
+  if (rootEmail === null || rootEmail === undefined || String(rootEmail).trim() === "") {
+    return below;
+  }
+
+  const parents = new Set([normalizeEmail(rootEmail)]);
+  const seen = new Set();
+  let grew = true;
+
+  while (grew) {
+    grew = false;
+    for (const p of providers) {
+      if (seen.has(p)) continue;
+      const parent = p.parent_admin_email ? normalizeEmail(p.parent_admin_email) : "";
+      if (parent !== "" && parents.has(parent)) {
+        seen.add(p);
+        below.push(p);
+        if (p.email) parents.add(normalizeEmail(p.email));
+        grew = true;
+      }
+    }
+  }
+
+  return below;
+}
+
 // ─── Input parsing ───────────────────────────────────────────────────────────
 
 function parseInputs(req) {
@@ -1450,7 +1496,17 @@ const getGroupDetails = async (req, res) => {
     const memberEmails = await getMemberEmails(memberCodes);
 
     const members = await getMembersInfo(memberCodes, memberEmails);
-    const childTrainers = await getChildTrainers(memberEmails, memberEmails);
+
+    // facility admins parented to a group admin, then trainers parented to a
+    // group admin or to one of those facility admins.
+    const childFacilityAdmins = await getChildTrainers(memberEmails, memberEmails, "facility_admin");
+    const facilityAdminEmails = childFacilityAdmins
+      .map((f) => f.email)
+      .filter((e) => e !== null && e !== undefined && e !== "");
+    const childTrainers = await getChildTrainers(
+      [...memberEmails, ...facilityAdminEmails],
+      memberEmails
+    );
 
     // include the group's admins (group_members) as entries in the trainers list.
     const adminEntries = members.map((m) => ({
@@ -1465,13 +1521,13 @@ const getGroupDetails = async (req, res) => {
       total_tested_clients: m.total_tested_clients,
     }));
 
-    const trainers = [...adminEntries, ...childTrainers];
+    const trainers = [...adminEntries, ...childFacilityAdmins, ...childTrainers];
 
-    // UPPER(partner_code) -> { partner_code, name } for every child trainer in
-    // the group (full list, not the paginated page) so each client row can name
-    // the trainer that owns it.
+    // UPPER(partner_code) -> { partner_code, name } for every child trainer and
+    // facility admin in the group (full list, not the paginated page) so each
+    // client row can name the trainer / facility admin that owns it.
     const trainerMap = new Map();
-    for (const t of childTrainers) {
+    for (const t of [...childFacilityAdmins, ...childTrainers]) {
       const code = normalizeCode(t.partner_code);
       if (code !== "") trainerMap.set(code, { partner_code: t.partner_code, name: t.name });
     }
@@ -1544,13 +1600,20 @@ const getGroupDetails = async (req, res) => {
         });
       }
 
-      if (memberCodes.includes(overviewMember)) {
-        // ---- admin member: self + child trainers ----
-        const member = members.find(
-          (m) =>
-            normalizeCode(m.partner_code) === overviewMember ||
-            normalizeCode(m.dietician_id) === overviewMember
-        );
+      const facilityAdmin = childFacilityAdmins.find(
+        (f) => normalizeCode(f.partner_code) === overviewMember
+      );
+
+      if (memberCodes.includes(overviewMember) || facilityAdmin) {
+        // ---- admin member: self + child facility admins + child trainers ----
+        // ---- facility admin: self + its trainers ----
+        const member = facilityAdmin
+          ? facilityAdmin
+          : members.find(
+              (m) =>
+                normalizeCode(m.partner_code) === overviewMember ||
+                normalizeCode(m.dietician_id) === overviewMember
+            );
 
         const memberEmail = member ? member.email : null;
         const memberName = member ? member.name : null;
@@ -1562,28 +1625,23 @@ const getGroupDetails = async (req, res) => {
           scopeEmails.set(memberEmail, memberEmail);
         }
 
-        // child trainers of this admin (matched on parent_admin_email)
-        for (const t of trainers) {
-          const parent = t.parent_admin_email ?? null;
+        for (const t of providersUnder(memberEmail, trainers)) {
+          const tc = normalizeCode(t.partner_code);
+          if (tc !== "") scopeCodes.set(tc, tc);
 
-          if (
-            parent !== null &&
-            memberEmail !== null &&
-            normalizeEmail(parent) === normalizeEmail(memberEmail)
-          ) {
-            const tc = normalizeCode(t.partner_code);
-            if (tc !== "") scopeCodes.set(tc, tc);
-
-            if (t.email !== null && t.email !== undefined && String(t.email).trim() !== "") {
-              const te = normalizeEmail(t.email);
-              scopeEmails.set(te, te);
-            }
+          if (t.email !== null && t.email !== undefined && String(t.email).trim() !== "") {
+            const te = normalizeEmail(t.email);
+            scopeEmails.set(te, te);
           }
         }
 
         overviewScopeCodes = [...scopeCodes.values()];
         overviewScopeEmails = [...scopeEmails.values()];
-        overviewScope = { type: "member", partner_code: overviewMember, name: memberName };
+        overviewScope = {
+          type: facilityAdmin ? "facility_admin" : "member",
+          partner_code: overviewMember,
+          name: memberName,
+        };
       } else {
         // ---- single trainer scope ----
         const trainer = trainers.find(
