@@ -260,6 +260,7 @@ async function trainerDirectory(codes, emailByCode = new Map()) {
  * (app_user_roles.parent_user_id) and its facility with the facility admin.
  * Falls back to the pending invitation, then to what was stamped on the
  * purchase (attributed_role / facility_id) for codes with no role row.
+ * Also used by super-admin-orders for the shipping rows' facility.
  */
 async function trainerHierarchy(codes, items) {
   const map = new Map();
@@ -793,4 +794,4 @@ const superAdminSalesAnalytics = async (req, res) => {
   }
 };
 
-module.exports = { superAdminSalesAnalytics };
+module.exports = { superAdminSalesAnalytics, trainerHierarchy };

@@ -17,6 +17,9 @@
  * email / name and the partner code used. Shipping rows also carry the plan's
  * current_period_start / current_period_end and a derived subscription_status:
  * a Stripe "active" plan whose period end has passed is reported as "expired".
+ * Shipping rows also carry the facility behind the partner code (the gym and
+ * its facility admin, same lookup as Sales Analytics' top_trainers), or null
+ * for a website purchase / a trainer outside any facility.
  *
  * Body: { view: "shipping" | "payments", search?, page?, limit?,
  *         payments only: status? ("all" | open | paid | failed | refunded | partially_refunded) }
@@ -24,6 +27,7 @@
 
 const pool = require("../../../../config/db");
 const { _helpers: H } = require("./admin-invite-trainer");
+const { trainerHierarchy } = require("./super-admin-sales-analytics");
 
 const SEARCH_MIN_LENGTH = 3;
 const MAX_LIMIT = 100;
@@ -85,6 +89,23 @@ function parseSearch(body) {
 
 const like = (s) => `%${s.replace(/[\\%_]/g, (c) => `\\${c}`)}%`;
 
+// Partner code → { id, name, partner_code, status, admin_user_id, admin_name }
+// for the codes on this page. Only names a column, so a failed lookup leaves
+// the facility empty instead of failing the shipping list.
+async function facilityByCode(rows, codeOf) {
+  const codes = [...new Set(rows.map(codeOf).filter(Boolean))];
+  const out = new Map();
+  if (!codes.length) return out;
+  try {
+    const items = rows.filter((r) => codeOf(r)).map((r) => ({ code: codeOf(r), linkedCode: null, raw: r }));
+    const hierarchy = await trainerHierarchy(codes, items);
+    for (const [code, h] of hierarchy) if (h.facility) out.set(code, h.facility);
+  } catch (err) {
+    console.error("SUPER_ADMIN_ORDERS_FACILITY_LOOKUP_ERROR:", { code: err?.code, message: err?.message });
+  }
+  return out;
+}
+
 async function shipping(body) {
   const { page, limit, offset } = parsePaging(body);
   const search = parseSearch(body);
@@ -112,6 +133,7 @@ async function shipping(body) {
         sa.id, sa.stripe_subscription_id, sa.name, sa.phone, sa.line1, sa.line2, sa.city,
         sa.state, sa.postal_code, sa.country, sa.created_at,
         rs.purchaser_email, rs.purchaser_name, rs.attributed_partner_code, rs.status AS subscription_status,
+        rs.attributed_user_id, rs.attributed_role, rs.facility_id,
         rs.current_period_start, rs.current_period_end, rs.canceled_at,
         rs.created_at AS purchased_at
       ${from} ${whereSql}
@@ -120,6 +142,9 @@ async function shipping(body) {
     `,
     [...params, limit, offset]
   );
+
+  const codeOf = (r) => String(r.attributed_partner_code || "").toUpperCase() || null;
+  const facilities = await facilityByCode(rows, codeOf);
 
   const now = Date.now();
   return {
@@ -139,6 +164,7 @@ async function shipping(body) {
         country: r.country || null,
       },
       partner_code: r.attributed_partner_code || null,
+      facility: (codeOf(r) && facilities.get(codeOf(r))) || null,
       subscription_status: deriveSubscriptionStatus(r, now),
       stripe_status: r.subscription_status || null,
       current_period_start: toIso(r.current_period_start),
