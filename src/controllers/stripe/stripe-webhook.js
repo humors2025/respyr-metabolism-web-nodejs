@@ -21,6 +21,7 @@
  *   customer.subscription.*      -> keep status / period in sync
  *   invoice.paid                 -> payment_transactions row
  *                                   + commission_entries (the ledger)
+ *                                   + "membership renewed" email (renewals)
  *   charge.refunded              -> payment_transactions refund amount/status
  *                                   + reverse ledger entries for that invoice
  *   account.updated              -> dietician_db.partner_payout_accounts and
@@ -469,6 +470,7 @@ async function onInvoicePaid(stripe, invoice) {
 
   // First invoices are announced by checkout.session.completed; renewals here.
   if (!synced || invoice.billing_reason === "subscription_create") return;
+  if (invoice.billing_reason === "subscription_cycle") await paymentEmails.sendRenewalConfirmation(invoice);
   const subId = invoiceSubscriptionId(invoice);
   await paymentEmails.sendPaymentAlert({
     outcome: "success",
