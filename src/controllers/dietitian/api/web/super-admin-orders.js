@@ -17,6 +17,15 @@
  *                  then counts renewals only. Each row carries renewal_number
  *                  (1 = first renewal; null for other invoices), the plan as it
  *                  stands now and the facility behind the partner code.
+ *                  paid_only=true drops invoices that never went through
+ *                  (failed / open): the Renewals tab lists members who did
+ *                  renew. Refunds stay, since the renewal was paid first.
+ *   view=upcoming_renewals
+ *                  referral_subscriptions still set to renew (active or
+ *                  trialing, not cancelled) whose current_period_end falls in
+ *                  the next `days` days (default 7), soonest first. Each row
+ *                  carries the renewals paid so far and the last payment.
+ *                  Super-admin test codes (test_… rows) are left out.
  *
  * Both join referral_subscriptions (by stripe_subscription_id) for the buyer's
  * email / name and the partner code used. Shipping rows also carry the plan's
@@ -26,9 +35,10 @@
  * its facility admin, same lookup as Sales Analytics' top_trainers), or null
  * for a website purchase / a trainer outside any facility.
  *
- * Body: { view: "shipping" | "payments", search?, page?, limit?,
+ * Body: { view: "shipping" | "payments" | "upcoming_renewals", search?, page?, limit?,
  *         payments only: status? ("all" | open | paid | failed | refunded | partially_refunded),
- *                        type? ("all" | first_payment | renewal) }
+ *                        type? ("all" | first_payment | renewal), paid_only? (boolean),
+ *         upcoming_renewals only: days? (1-31, default 7) }
  */
 
 const pool = require("../../../../config/db");
@@ -38,8 +48,12 @@ const { trainerHierarchy } = require("./super-admin-sales-analytics");
 const SEARCH_MIN_LENGTH = 3;
 const MAX_LIMIT = 100;
 const PAYMENT_STATUSES = ["open", "paid", "failed", "refunded", "partially_refunded"];
+// Invoices that were paid (a refund came later, if at all).
+const PAID_STATUSES = ["paid", "partially_refunded", "refunded"];
 // Payment type filter -> Stripe invoice billing_reason.
 const PAYMENT_TYPES = { first_payment: "subscription_create", renewal: "subscription_cycle" };
+const UPCOMING_DAYS = 7;
+const UPCOMING_MAX_DAYS = 31;
 
 // Trainer admins (app_user_roles role "admin") who may also read orders.
 // Comma-separated; override with ORDERS_VIEWER_EMAILS=a@x.com,b@y.com.
@@ -187,9 +201,11 @@ async function shipping(body) {
 async function payments(body) {
   const { page, limit, offset } = parsePaging(body);
   const search = parseSearch(body);
+  const paidOnly = body.paid_only === true || body.paid_only === "true";
+  const statusOptions = paidOnly ? PAID_STATUSES : PAYMENT_STATUSES;
   const status = String(body.status || "all").toLowerCase();
-  if (status !== "all" && !PAYMENT_STATUSES.includes(status)) {
-    throw httpError(422, `status must be all or one of ${PAYMENT_STATUSES.join(", ")}`);
+  if (status !== "all" && !statusOptions.includes(status)) {
+    throw httpError(422, `status must be all or one of ${statusOptions.join(", ")}`);
   }
   const type = String(body.type || "all").toLowerCase();
   if (type !== "all" && !PAYMENT_TYPES[type]) {
@@ -197,16 +213,26 @@ async function payments(body) {
   }
   const billingReason = type === "all" ? null : PAYMENT_TYPES[type];
 
+  // Type and paid-only scope both the list and the summary chips.
+  const scope = [];
+  const scopeParams = [];
+  if (billingReason) {
+    scope.push("pt.billing_reason = ?");
+    scopeParams.push(billingReason);
+  }
+  if (paidOnly) {
+    scope.push(`pt.status IN (${PAID_STATUSES.map(() => "?").join(", ")})`);
+    scopeParams.push(...PAID_STATUSES);
+  }
+
   const where = [];
   const params = [];
   if (status !== "all") {
     where.push("pt.status = ?");
     params.push(status);
   }
-  if (billingReason) {
-    where.push("pt.billing_reason = ?");
-    params.push(billingReason);
-  }
+  where.push(...scope);
+  params.push(...scopeParams);
   if (search) {
     where.push(`(
       rs.purchaser_email LIKE ? OR rs.purchaser_name LIKE ? OR pt.stripe_invoice_id LIKE ?
@@ -250,8 +276,8 @@ async function payments(body) {
   // just this page, and ignoring the status and search filters).
   const [counts] = await pool.query(
     `SELECT status, currency, COUNT(*) AS n, SUM(amount_paid_minor) AS paid, SUM(amount_refunded_minor) AS refunded
-     FROM payment_transactions ${billingReason ? "WHERE billing_reason = ?" : ""} GROUP BY status, currency`,
-    billingReason ? [billingReason] : []
+     FROM payment_transactions pt ${scope.length ? `WHERE ${scope.join(" AND ")}` : ""} GROUP BY status, currency`,
+    scopeParams
   );
 
   const codeOf = (r) => String(r.attributed_partner_code || "").toUpperCase() || null;
@@ -259,7 +285,7 @@ async function payments(body) {
 
   const now = Date.now();
   return {
-    filters: { status, type, search, search_min_length: SEARCH_MIN_LENGTH },
+    filters: { status, type, paid_only: paidOnly, search, search_min_length: SEARCH_MIN_LENGTH },
     payments: rows.map((r) => ({
       id: Number(r.id),
       date: toIso(r.paid_at || r.created_at),
@@ -300,7 +326,105 @@ async function payments(body) {
       amount_paid: minorToMajor(c.paid),
       amount_refunded: minorToMajor(c.refunded),
     })),
-    status_options: PAYMENT_STATUSES,
+    status_options: statusOptions,
+    pagination: { page, limit, total: Number(total), total_pages: Math.max(1, Math.ceil(Number(total) / limit)) },
+  };
+}
+
+async function upcomingRenewals(body) {
+  const { page, limit, offset } = parsePaging(body);
+  const search = parseSearch(body);
+  const days = Math.min(UPCOMING_MAX_DAYS, Math.max(1, parseInt(body.days, 10) || UPCOMING_DAYS));
+
+  // Still set to renew: running, not cancelled (cancel at period end sets
+  // canceled_at too), and the period ends within the window. Test-code rows
+  // (test_…) have no Stripe subscription behind them.
+  const where = [
+    "rs.status IN ('active', 'trialing')",
+    "rs.canceled_at IS NULL",
+    "rs.current_period_end > UTC_TIMESTAMP()",
+    "rs.current_period_end <= UTC_TIMESTAMP() + INTERVAL ? DAY",
+    "LEFT(rs.stripe_subscription_id, 5) <> 'test_'",
+  ];
+  const params = [days];
+  if (search) {
+    where.push(`(
+      rs.purchaser_email LIKE ? OR rs.purchaser_name LIKE ? OR rs.attributed_partner_code LIKE ?
+      OR rs.stripe_subscription_id LIKE ?
+    )`);
+    params.push(...Array(4).fill(like(search)));
+  }
+  const whereSql = `WHERE ${where.join(" AND ")}`;
+
+  const [[{ total }]] = await pool.query(`SELECT COUNT(*) AS total FROM referral_subscriptions rs ${whereSql}`, params);
+  const [rows] = await pool.query(
+    `
+      SELECT
+        rs.id, rs.stripe_subscription_id, rs.purchaser_email, rs.purchaser_name, rs.attributed_partner_code,
+        rs.status AS subscription_status, rs.current_period_start, rs.current_period_end, rs.canceled_at,
+        rs.currency, rs.unit_amount_minor, rs.created_at AS purchased_at
+      FROM referral_subscriptions rs
+      ${whereSql}
+      ORDER BY rs.current_period_end ASC, rs.id ASC
+      LIMIT ? OFFSET ?
+    `,
+    [...params, limit, offset]
+  );
+
+  // Paid invoices of these subscriptions: renewals so far and the last payment.
+  const subIds = rows.map((r) => r.stripe_subscription_id);
+  const history = new Map();
+  if (subIds.length) {
+    const [paid] = await pool.query(
+      `
+        SELECT stripe_subscription_id, billing_reason, amount_paid_minor, currency, paid_at, created_at
+        FROM payment_transactions
+        WHERE stripe_subscription_id IN (?) AND status IN (?)
+        ORDER BY COALESCE(paid_at, created_at) ASC, id ASC
+      `,
+      [subIds, PAID_STATUSES]
+    );
+    for (const p of paid) {
+      const h = history.get(p.stripe_subscription_id) || { renewals: 0, last: null };
+      if (p.billing_reason === "subscription_cycle") h.renewals += 1;
+      h.last = p;
+      history.set(p.stripe_subscription_id, h);
+    }
+  }
+
+  const codeOf = (r) => String(r.attributed_partner_code || "").toUpperCase() || null;
+  const facilities = await facilityByCode(rows, codeOf);
+
+  const now = Date.now();
+  return {
+    filters: { days, search, search_min_length: SEARCH_MIN_LENGTH },
+    upcoming: rows.map((r) => {
+      const h = history.get(r.stripe_subscription_id) || { renewals: 0, last: null };
+      return {
+        id: Number(r.id),
+        renews_at: toIso(r.current_period_end),
+        customer: { name: r.purchaser_name || null, email: r.purchaser_email || null },
+        partner_code: r.attributed_partner_code || null,
+        facility: (codeOf(r) && facilities.get(codeOf(r))) || null,
+        purchased_at: toIso(r.purchased_at),
+        // This coming renewal is renewals_so_far + 1.
+        renewals_so_far: h.renewals,
+        last_payment: h.last
+          ? {
+              amount_paid: minorToMajor(h.last.amount_paid_minor),
+              currency: h.last.currency,
+              date: toIso(h.last.paid_at || h.last.created_at),
+              type: h.last.billing_reason === "subscription_create" ? "first_payment" : h.last.billing_reason === "subscription_cycle" ? "renewal" : h.last.billing_reason || null,
+            }
+          : null,
+        plan_price: { amount: minorToMajor(r.unit_amount_minor), currency: r.currency },
+        subscription_status: deriveSubscriptionStatus(r, now),
+        stripe_status: r.subscription_status || null,
+        current_period_start: toIso(r.current_period_start),
+        current_period_end: toIso(r.current_period_end),
+        stripe_subscription_id: r.stripe_subscription_id,
+      };
+    }),
     pagination: { page, limit, total: Number(total), total_pages: Math.max(1, Math.ceil(Number(total) / limit)) },
   };
 }
@@ -327,7 +451,8 @@ const superAdminOrders = async (req, res) => {
     let payload;
     if (view === "shipping") payload = await shipping(body);
     else if (view === "payments") payload = await payments(body);
-    else return res.status(422).json({ status: false, ok: false, message: "view must be shipping or payments" });
+    else if (view === "upcoming_renewals") payload = await upcomingRenewals(body);
+    else return res.status(422).json({ status: false, ok: false, message: "view must be shipping, payments or upcoming_renewals" });
 
     // Shipping rows carry buyers' home addresses and phones: log every read.
     await H.writeAuthLogSafe(req, {
