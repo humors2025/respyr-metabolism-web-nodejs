@@ -11,7 +11,12 @@
  *   view=shipping  subscription_shipping_addresses, one row per purchase:
  *                  who to ship the device to (name, phone, address)
  *   view=payments  payment_transactions, one row per Stripe invoice: the first
- *                  payment, each renewal, failed payments and refunds
+ *                  payment, each renewal, failed payments and refunds.
+ *                  type=renewal keeps renewal invoices only (billing_reason
+ *                  subscription_cycle) for the Renewals tab, and the summary
+ *                  then counts renewals only. Each row carries renewal_number
+ *                  (1 = first renewal; null for other invoices), the plan as it
+ *                  stands now and the facility behind the partner code.
  *
  * Both join referral_subscriptions (by stripe_subscription_id) for the buyer's
  * email / name and the partner code used. Shipping rows also carry the plan's
@@ -22,7 +27,8 @@
  * for a website purchase / a trainer outside any facility.
  *
  * Body: { view: "shipping" | "payments", search?, page?, limit?,
- *         payments only: status? ("all" | open | paid | failed | refunded | partially_refunded) }
+ *         payments only: status? ("all" | open | paid | failed | refunded | partially_refunded),
+ *                        type? ("all" | first_payment | renewal) }
  */
 
 const pool = require("../../../../config/db");
@@ -32,6 +38,8 @@ const { trainerHierarchy } = require("./super-admin-sales-analytics");
 const SEARCH_MIN_LENGTH = 3;
 const MAX_LIMIT = 100;
 const PAYMENT_STATUSES = ["open", "paid", "failed", "refunded", "partially_refunded"];
+// Payment type filter -> Stripe invoice billing_reason.
+const PAYMENT_TYPES = { first_payment: "subscription_create", renewal: "subscription_cycle" };
 
 // Trainer admins (app_user_roles role "admin") who may also read orders.
 // Comma-separated; override with ORDERS_VIEWER_EMAILS=a@x.com,b@y.com.
@@ -183,12 +191,21 @@ async function payments(body) {
   if (status !== "all" && !PAYMENT_STATUSES.includes(status)) {
     throw httpError(422, `status must be all or one of ${PAYMENT_STATUSES.join(", ")}`);
   }
+  const type = String(body.type || "all").toLowerCase();
+  if (type !== "all" && !PAYMENT_TYPES[type]) {
+    throw httpError(422, `type must be all or one of ${Object.keys(PAYMENT_TYPES).join(", ")}`);
+  }
+  const billingReason = type === "all" ? null : PAYMENT_TYPES[type];
 
   const where = [];
   const params = [];
   if (status !== "all") {
     where.push("pt.status = ?");
     params.push(status);
+  }
+  if (billingReason) {
+    where.push("pt.billing_reason = ?");
+    params.push(billingReason);
   }
   if (search) {
     where.push(`(
@@ -212,7 +229,16 @@ async function payments(body) {
         pt.billing_reason, pt.period_start, pt.period_end, pt.amount_paid_minor, pt.amount_refunded_minor,
         pt.currency, pt.fee_minor, pt.net_minor, pt.status, pt.failure_message, pt.payment_method_type,
         pt.card_last4, pt.paid_at, pt.created_at,
-        rs.purchaser_email, rs.purchaser_name, rs.attributed_partner_code
+        rs.purchaser_email, rs.purchaser_name, rs.attributed_partner_code,
+        rs.status AS subscription_status, rs.current_period_start, rs.current_period_end, rs.canceled_at,
+        -- Which renewal of its subscription this invoice is (rows are written
+        -- in billing order, so earlier renewals have lower ids).
+        CASE WHEN pt.billing_reason = 'subscription_cycle' THEN (
+          SELECT COUNT(*) FROM payment_transactions p2
+          WHERE p2.stripe_subscription_id = pt.stripe_subscription_id
+            AND p2.billing_reason = 'subscription_cycle'
+            AND p2.id <= pt.id
+        ) END AS renewal_number
       ${from} ${whereSql}
       ORDER BY COALESCE(pt.paid_at, pt.created_at) DESC, pt.id DESC
       LIMIT ? OFFSET ?
@@ -220,20 +246,28 @@ async function payments(body) {
     [...params, limit, offset]
   );
 
-  // Totals per status and currency across every payment (not just this page).
+  // Totals per status and currency across every payment of this type (not
+  // just this page, and ignoring the status and search filters).
   const [counts] = await pool.query(
     `SELECT status, currency, COUNT(*) AS n, SUM(amount_paid_minor) AS paid, SUM(amount_refunded_minor) AS refunded
-     FROM payment_transactions GROUP BY status, currency`
+     FROM payment_transactions ${billingReason ? "WHERE billing_reason = ?" : ""} GROUP BY status, currency`,
+    billingReason ? [billingReason] : []
   );
 
+  const codeOf = (r) => String(r.attributed_partner_code || "").toUpperCase() || null;
+  const facilities = await facilityByCode(rows, codeOf);
+
+  const now = Date.now();
   return {
-    filters: { status, search, search_min_length: SEARCH_MIN_LENGTH },
+    filters: { status, type, search, search_min_length: SEARCH_MIN_LENGTH },
     payments: rows.map((r) => ({
       id: Number(r.id),
       date: toIso(r.paid_at || r.created_at),
       customer: { name: r.purchaser_name || null, email: r.purchaser_email || null },
       partner_code: r.attributed_partner_code || null,
+      facility: (codeOf(r) && facilities.get(codeOf(r))) || null,
       type: r.billing_reason === "subscription_create" ? "first_payment" : r.billing_reason === "subscription_cycle" ? "renewal" : r.billing_reason || null,
+      renewal_number: r.renewal_number == null ? null : Number(r.renewal_number),
       period_start: toIso(r.period_start),
       period_end: toIso(r.period_end),
       currency: r.currency,
@@ -249,6 +283,14 @@ async function payments(body) {
         invoice_id: r.stripe_invoice_id,
         payment_intent_id: r.stripe_payment_intent_id || null,
         charge_id: r.stripe_charge_id || null,
+      },
+      // The subscription as it stands now (same fields as a shipping row).
+      plan: {
+        subscription_status: deriveSubscriptionStatus(r, now),
+        stripe_status: r.subscription_status || null,
+        current_period_start: toIso(r.current_period_start),
+        current_period_end: toIso(r.current_period_end),
+        canceled_at: toIso(r.canceled_at),
       },
     })),
     summary: counts.map((c) => ({

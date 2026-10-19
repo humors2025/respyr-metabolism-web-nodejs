@@ -11,6 +11,9 @@
  *                         / checkout.session.async_payment_failed: the decline
  *                         reason and a link back to the order page. Sent once
  *                         per PaymentIntent / invoice, not per retry.
+ *   sendRenewalConfirmation — invoice.paid for a renewal (month 2+): "Your
+ *                         membership has been renewed", with the amount, plan,
+ *                         renewal date and next billing date. Never throws.
  *   sendPaymentAlert    — internal copy of every attempt, success or failure,
  *                         to the team (PAYMENT_ALERT_EMAILS, default
  *                         connect@humorstech.com): outcome, amount, buyer, referral
@@ -55,6 +58,9 @@ const TEMPLATE = {
   receipt: process.env.RESEND_PAYMENT_RECEIPT_TEMPLATE_ID || "",
   failed: process.env.RESEND_PAYMENT_FAILED_TEMPLATE_ID || "",
   renewal: process.env.RESEND_RENEWAL_FAILED_TEMPLATE_ID || "",
+  // "Membership Renewal Confirmation", designed in Resend, so it defaults to
+  // that template's ID; an empty env value sends the inline HTML instead.
+  renewalPaid: process.env.RESEND_RENEWAL_CONFIRMATION_TEMPLATE_ID ?? "448aa7e5-46bf-4fbb-99f2-05c9ac638a4e",
 };
 
 const APP_CODE_NOTE = "Your Rysflo Referral Code for the app is in a separate email — you'll need it when you create your account.";
@@ -128,6 +134,24 @@ function renewalHtml(v) {
       <p style="color:#535359">This month's payment of <strong>${v.AMOUNT}</strong> was not completed. Nothing has been charged.</p>
       <div style="background:#FFF4E0;color:#A66B00;padding:12px 16px;border-radius:10px;margin:16px 0">${v.REASON}</div>
       <p style="color:#535359">Please update your card so your membership stays active — Stripe will retry automatically over the next few days.</p>
+    `
+  );
+}
+
+function renewalPaidHtml(v) {
+  return shell(
+    "Your Rysflo membership has been renewed",
+    `
+      <p style="color:#535359">Hi ${v.customer_name}, thanks for continuing with Rysflo. Your renewal payment went through and your membership remains active.</p>
+      <table style="width:100%;border-collapse:collapse;background:#F5F7FA;border-radius:10px;padding:12px 16px;margin:16px 0" cellpadding="0" cellspacing="0">
+        ${row("Amount paid", v.amount_paid)}
+        ${row("Membership plan", v.plan_name)}
+        ${row("Account email", v.customer_email)}
+        ${row("Renewal date", v.renewal_date)}
+        ${row("Next billing date", v.next_billing_date)}
+      </table>
+      <p style="color:#535359">Every day you take a reading, 20¢ comes off next month's bill — up to $6.</p>
+      <p style="color:#535359">No action is needed: keep using your Rysflo device and app as usual.</p>
     `
   );
 }
@@ -288,6 +312,71 @@ async function sendPaymentFailed({ to, reason, amountMinor, currency, retryUrl, 
 }
 
 /**
+ * Renewal paid. `invoice` is the paid renewal invoice from the invoice.paid
+ * event (billing_reason subscription_cycle). Buyer email and name come from
+ * the invoice, else from the purchase (referral_subscriptions). Sent once per
+ * invoice.
+ *
+ * The Resend template's variables are lower-case and in double braces, so
+ * Resend escapes them itself: they go in raw, and only the inline copy is
+ * escaped here. If the template send is refused (not published, a variable
+ * not created on it) the inline copy goes out instead, so the member still
+ * hears about it. Never throws: the webhook must still record the payment.
+ */
+async function sendRenewalConfirmation(invoice) {
+  try {
+    if (!invoice?.id) return { ok: false, reason: "no invoice" };
+    const sub = invoice.parent?.subscription_details?.subscription || invoice.subscription || null;
+    const subId = sub ? (typeof sub === "string" ? sub : sub.id) : null;
+
+    let to = String(invoice.customer_email || "").trim().toLowerCase();
+    let name = String(invoice.customer_name || "").trim();
+    if ((!to || !name) && subId) {
+      const [rows] = await pool.execute(
+        `SELECT purchaser_email, purchaser_name FROM referral_subscriptions WHERE stripe_subscription_id = ? LIMIT 1`,
+        [subId]
+      );
+      to = to || String(rows[0]?.purchaser_email || "").trim().toLowerCase();
+      name = name || String(rows[0]?.purchaser_name || "").trim();
+    }
+    if (!to) return { ok: false, reason: "no recipient" };
+    if (!(await claimOnce("renewal_paid", invoice.id))) return { ok: true, skipped: true };
+
+    // The subscription line covers the period just paid for; its end is the
+    // next billing date (invoice.period_end is the previous period).
+    const line = (invoice.lines?.data || []).find((l) => l?.period?.end) || null;
+    const variables = {
+      customer_name: name || "there",
+      customer_email: to,
+      amount_paid: money(invoice.amount_paid, invoice.currency),
+      plan_name: "Rysflo Monthly Membership",
+      renewal_date: dateOf(invoice.status_transitions?.paid_at ?? invoice.created) || "—",
+      next_billing_date: dateOf(line?.period?.end) || "—",
+    };
+    const escaped = Object.fromEntries(Object.entries(variables).map(([k, v]) => [k, escapeHtml(v)]));
+    const message = {
+      to,
+      subject: `Your Rysflo membership has been renewed — ${variables.amount_paid}`,
+      variables,
+      html: renewalPaidHtml(escaped),
+      kind: "renewal_paid",
+      refId: invoice.id,
+    };
+
+    let res = await send({ ...message, templateId: TEMPLATE.renewalPaid });
+    if (!res.ok && TEMPLATE.renewalPaid && RESEND_API_KEY) {
+      console.warn("RENEWAL_CONFIRMATION_TEMPLATE_FAILED:", { invoice: invoice.id, reason: res.reason });
+      res = await send({ ...message, templateId: "" });
+    }
+    if (!res.ok) console.warn("RENEWAL_CONFIRMATION_EMAIL_NOT_SENT:", { invoice: invoice.id, reason: res.reason });
+    return res;
+  } catch (err) {
+    console.warn("RENEWAL_CONFIRMATION_EMAIL_NOT_SENT:", { invoice: invoice?.id, reason: err?.message });
+    return { ok: false, reason: err?.message || "renewal confirmation failed" };
+  }
+}
+
+/**
  * Internal alert to the team for one payment attempt.
  *   outcome     "success" | "failed" | "pending" (delayed payment method)
  *   kind        short label: "New purchase", "Renewal", "Checkout card declined"…
@@ -348,4 +437,4 @@ function invoiceIsOurs(invoice) {
   return md.plan_code === PLAN_CODE;
 }
 
-module.exports = { sendPaymentReceipt, sendPaymentFailed, sendPaymentAlert, retryUrlFor, invoiceIsOurs };
+module.exports = { sendPaymentReceipt, sendPaymentFailed, sendRenewalConfirmation, sendPaymentAlert, retryUrlFor, invoiceIsOurs };

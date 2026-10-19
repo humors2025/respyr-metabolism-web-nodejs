@@ -11,6 +11,7 @@ before the templates exist.
 | `payment_received.html`  | `RESEND_PAYMENT_RECEIPT_TEMPLATE_ID` | `payment_received`    | `checkout.session.completed`                                       |
 | `payment_failed.html`    | `RESEND_PAYMENT_FAILED_TEMPLATE_ID`  | `payment_failed`      | `payment_intent.payment_failed`, `checkout.session.async_payment_failed` |
 | `renewal_failed.html`    | `RESEND_RENEWAL_FAILED_TEMPLATE_ID`  | `renewal_failed`      | `invoice.payment_failed` (month 2+)                                |
+| (designed in Resend: "Membership Renewal Confirmation") | `RESEND_RENEWAL_CONFIRMATION_TEMPLATE_ID` (defaults to `448aa7e5-46bf-4fbb-99f2-05c9ac638a4e`; empty = inline HTML) | — | `invoice.paid` for a renewal (`billing_reason` `subscription_cycle`) |
 | `purchase_code.html`     | `RESEND_PURCHASE_CODE_TEMPLATE_ID`   | `purchase_code`       | `checkout.session.completed` (new app users) and the resend-purchase-code endpoint — sent by `src/services/purchaseCodes.js` |
 
 Subject and from are set by the code on every send (they override the
@@ -23,6 +24,22 @@ so the code always sends every variable below — with `—` or an empty string
 when there is nothing to show. Do not add variables to the template without
 adding them to `paymentEmails.js`. Values are already HTML-escaped by the
 code; use triple braces `{{{VAR}}}` so Resend does not escape them twice.
+
+### Membership Renewal Confirmation
+Unlike the others, this template uses lower-case variables in double braces
+(`{{customer_name}}`), so Resend escapes them and the code sends them raw.
+Each variable must also be created in the template's Variables panel, and the
+template published, or Resend refuses the send — the code then falls back to
+the inline HTML and logs `RENEWAL_CONFIRMATION_TEMPLATE_FAILED`.
+
+| Variable            | Example                                         |
+|---------------------|-------------------------------------------------|
+| `customer_name`     | `Sam Lee` (falls back to `there`)               |
+| `customer_email`    | `sam@example.com` (the address the email goes to) |
+| `amount_paid`       | `$29.00`                                        |
+| `plan_name`         | `Rysflo Monthly Membership`                     |
+| `renewal_date`      | `October 18, 2026` (when the invoice was paid)  |
+| `next_billing_date` | `November 18, 2026` (end of the period paid for) |
 
 ### payment_received
 | Variable            | Example                                      |
