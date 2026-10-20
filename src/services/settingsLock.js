@@ -5,7 +5,8 @@
  *
  * The Settings page changes platform pricing and the commission rate, so a
  * signed-in super admin must also enter the 6-digit code from their
- * authenticator app before the page unlocks.
+ * authenticator app before the page unlocks. The same unlock also opens the
+ * Test codes tab on Orders (super-admin-test-codes mints free memberships).
  *
  * FLOW
  *   First time (no authenticator yet):
@@ -512,7 +513,7 @@ async function verifyMfa(actorId, sid, submitted, ctx) {
 const actorIdOf = (req) => String(req.user?.sub || req.user?.dietician_id || "").trim();
 const sidOf = (req) => String(req.user?.sid || "").trim();
 
-/** Route guard for settings writes; runs after authMiddleware. */
+/** Route guard for settings writes and super-admin-test-codes; runs after authMiddleware. */
 async function requireSettingsUnlock(req, res, next) {
   if (req.method === "OPTIONS") return next();
   try {
