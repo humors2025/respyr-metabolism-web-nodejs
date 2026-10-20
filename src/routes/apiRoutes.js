@@ -1115,8 +1115,12 @@ router.post("/dietitian/api/web/settings-mfa-setup", authMiddleware, settingsLoc
 router.post("/dietitian/api/web/settings-mfa-confirm", authMiddleware, settingsLock.settingsCodeRateLimiter, settingsLock.settingsMfaConfirm);
 router.post("/dietitian/api/web/settings-mfa-verify", authMiddleware, settingsLock.settingsCodeRateLimiter, settingsLock.settingsMfaVerify);
 
-// Orders › Test codes Google Authenticator gate: same authenticator, own APIs and unlock (test-codes-lock.js).
+// Orders › Test codes Google Authenticator gate: its own authenticator, APIs and unlock (test-codes-lock.js).
 router.post("/dietitian/api/web/test-codes-lock-status", authMiddleware, testCodesLock.testCodesLockStatus);
+router.post("/dietitian/api/web/test-codes-lock-request", authMiddleware, testCodesLock.testCodesLockRequest);
+router.post("/dietitian/api/web/test-codes-lock-verify", authMiddleware, settingsLock.settingsCodeRateLimiter, testCodesLock.testCodesLockVerify);
+router.post("/dietitian/api/web/test-codes-mfa-setup", authMiddleware, testCodesLock.testCodesMfaSetup);
+router.post("/dietitian/api/web/test-codes-mfa-confirm", authMiddleware, settingsLock.settingsCodeRateLimiter, testCodesLock.testCodesMfaConfirm);
 router.post("/dietitian/api/web/test-codes-mfa-verify", authMiddleware, settingsLock.settingsCodeRateLimiter, testCodesLock.testCodesMfaVerify);
 
 

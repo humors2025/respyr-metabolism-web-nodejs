@@ -6,9 +6,10 @@
  * The Settings page changes platform pricing and the commission rate, so a
  * signed-in super admin must also enter the 6-digit code from their
  * authenticator app before the page unlocks. The Test codes tab on Orders
- * (super-admin-test-codes mints free memberships) uses the same authenticator
- * entry but its own APIs (controllers/.../test-codes-lock.js) and its own
- * unlock: opening one never opens the other.
+ * (super-admin-test-codes mints free memberships) is a second, fully separate
+ * area: its own APIs (controllers/.../test-codes-lock.js), its own
+ * authenticator entry ("Rysflo Test codes"), backup codes and unlock. Every
+ * function below takes the area ("settings" | "test_codes", default settings).
  *
  * FLOW
  *   First time (no authenticator yet):
@@ -18,7 +19,7 @@
  *        Authenticator, confirmed with one app code; 8 backup codes issued
  *   Every time after:
  *     verifyMfa(code, area)  -> app code (or a one-time backup code) unlocks
- *                               that area ("settings" or "test_codes")
+ *                               that area
  *   Guards:
  *     requireSettingsUnlock / requireTestCodesUnlock -> that area unlocked for
  *     this session AND authenticator enrolled
@@ -34,7 +35,8 @@
  *   too many wrong codes. Each names the account, IP, browser and time.
  *
  * STORAGE
- *   admin_mfa (one row per super admin; created manually, see below):
+ *   admin_mfa (one row per super admin and area; created manually, see below):
+ *     dietician_id    the admin's id for Settings, "tc:<id>" for Test codes
  *     secret_enc      AES-256-GCM encrypted TOTP secret (SETTINGS_MFA_KEY,
  *                     falls back to a key derived from JWT_SECRET — rotating
  *                     that secret means re-enrolling)
@@ -46,10 +48,16 @@
  *     settings_otp    : email "sa:<dietician_id>", otp_code = bcrypt(email code)
  *     settings_unlock : email "su:" + sha256(dietician_id:sid), one row per
  *                       login session, expires_at = end of the unlock
- *     test_codes_unlock : same, with "tu:" — the Test codes tab's unlock
+ *     test_codes_otp / test_codes_unlock : the same with "ta:" / "tu:"
  *
- * Lost phone and backup codes: DELETE FROM admin_mfa WHERE dietician_id = ?;
- * the next visit starts enrolment again via the email code.
+ * Lost phone and backup codes: DELETE FROM admin_mfa WHERE dietician_id = ?
+ * (Settings) or = 'tc:<id>' (Test codes); the next visit starts enrolment
+ * again via the email code.
+ *
+ * Entry names: SETTINGS_MFA_ISSUER / TEST_CODES_MFA_ISSUER, else "Rysflo
+ * Settings" / "Rysflo Test codes", with " UAT" added when the request comes
+ * through a UAT host. UAT and live have separate keys, and two entries with
+ * the same name on one phone is how a correct-looking code ends up "wrong".
  *
  *   CREATE TABLE admin_mfa (
  *     dietician_id VARCHAR(64) NOT NULL PRIMARY KEY, email VARCHAR(255) NOT NULL,
@@ -68,17 +76,42 @@ const { escapeHtml } = require("../utils/securityValidation");
 
 const TABLE = "otp_verifications";
 const MFA_TABLE = "admin_mfa";
-const PURPOSE_OTP = "settings_otp";
-// Each locked area keeps its own unlock row per login session.
-const UNLOCK_AREAS = {
-  settings: { prefix: "su", purpose: "settings_unlock", label: "Settings" },
-  test_codes: { prefix: "tu", purpose: "test_codes_unlock", label: "Test codes" },
+// Each locked area has its own email code, authenticator (admin_mfa row),
+// backup codes and unlock row per login session.
+const AREAS = {
+  settings: {
+    label: "Settings",
+    where: "Super Admin › Settings",
+    otpPrefix: "sa", otpPurpose: "settings_otp",
+    unlockPrefix: "su", unlockPurpose: "settings_unlock",
+    mfaPrefix: "",
+    issuer: process.env.SETTINGS_MFA_ISSUER || "",
+    defaultIssuer: "Rysflo Settings",
+  },
+  test_codes: {
+    label: "Test codes",
+    where: "the Test codes tab on Super Admin › Orders",
+    otpPrefix: "ta", otpPurpose: "test_codes_otp",
+    unlockPrefix: "tu", unlockPurpose: "test_codes_unlock",
+    mfaPrefix: "tc:",
+    issuer: process.env.TEST_CODES_MFA_ISSUER || "",
+    defaultIssuer: "Rysflo Test codes",
+  },
 };
 const areaOf = (area) => {
-  const a = UNLOCK_AREAS[area];
-  if (!a) throw new Error(`Unknown unlock area: ${area}`);
+  const a = AREAS[area];
+  if (!a) throw new Error(`Unknown lock area: ${area}`);
   return a;
 };
+/** admin_mfa.dietician_id for this admin in this area. */
+const mfaIdFor = (actorId, area) => `${areaOf(area).mfaPrefix}${String(actorId)}`;
+/** Authenticator entry name; `hosts` = request host / origin, to tell UAT apart. */
+function issuerFor(area, hosts = []) {
+  const a = areaOf(area);
+  if (a.issuer) return a.issuer;
+  const uat = hosts.some((h) => /(^|[./-])uat[.-]/i.test(String(h || "")));
+  return uat ? `${a.defaultIssuer} UAT` : a.defaultIssuer;
+}
 
 function intEnv(name, def, min, max) {
   const v = parseInt(process.env[name], 10);
@@ -94,14 +127,13 @@ const OTP_TTL_SECONDS = intEnv("SETTINGS_OTP_TTL_SECONDS", 300, 60, 1800);
 const OTP_RESEND_COOLDOWN_SECONDS = intEnv("SETTINGS_OTP_RESEND_COOLDOWN_SECONDS", 60, 0, 3600);
 const OTP_MAX_VERIFY_ATTEMPTS = intEnv("SETTINGS_OTP_MAX_ATTEMPTS", 5, 1, 10);
 const UNLOCK_HOURS = intEnv("SETTINGS_UNLOCK_HOURS", 8, 1, 720);
-const MFA_ISSUER = process.env.SETTINGS_MFA_ISSUER || "Rysflo Settings";
 const MFA_SETUP_TTL_SECONDS = 600;
 const BACKUP_CODE_COUNT = 8;
 
 const RESEND_API_KEY = process.env.RESEND_API_KEY || "";
 const RESEND_FROM_EMAIL = process.env.RESEND_FROM_EMAIL || "Rysflo <no-reply@respyr.ai>";
 
-const keyFor = (actorId) => `sa:${String(actorId).trim()}`;
+const keyFor = (actorId, area) => `${areaOf(area).otpPrefix}:${String(actorId).trim()}`;
 const sha256 = (v) => crypto.createHash("sha256").update(String(v)).digest("hex");
 
 /** "harsh@respyr.in" -> "h***h@respyr.in" — shown on the lock screen. Lists are masked per address. */
@@ -116,8 +148,8 @@ function maskEmail(email) {
 async function pruneExpired() {
   try {
     await pool.execute(
-      `DELETE FROM ${TABLE} WHERE purpose IN (?, ?, ?) AND expires_at <= NOW()`,
-      [PURPOSE_OTP, UNLOCK_AREAS.settings.purpose, UNLOCK_AREAS.test_codes.purpose]
+      `DELETE FROM ${TABLE} WHERE purpose IN (?, ?, ?, ?) AND expires_at <= NOW()`,
+      [AREAS.settings.otpPurpose, AREAS.settings.unlockPurpose, AREAS.test_codes.otpPurpose, AREAS.test_codes.unlockPurpose]
     );
   } catch (err) {
     console.error("SETTINGS_LOCK_PRUNE_FAILED:", err?.code || err?.message);
@@ -221,6 +253,22 @@ function matchTotp(secretB32, code) {
   return null;
 }
 
+/**
+ * Diagnosis only, never unlocks: steps (30 s each) between now and the step
+ * this code belongs to, if that is 2-40 steps (1-20 minutes) away, i.e. the
+ * phone's clock is wrong; else null.
+ */
+function totpDriftSteps(secretB32, code) {
+  const secret = base32Decode(secretB32);
+  const now = currentStep();
+  for (let d = 2; d <= 40; d++) {
+    for (const off of [-d, d]) {
+      if (crypto.timingSafeEqual(Buffer.from(hotp(secret, now + off)), Buffer.from(code))) return off;
+    }
+  }
+  return null;
+}
+
 // ─── Secret encryption ────────────────────────────────────────────────────────
 
 function mfaKey() {
@@ -246,14 +294,14 @@ function decryptSecret(stored) {
 
 // ─── Session unlock ───────────────────────────────────────────────────────────
 
-const unlockKeyFor = (actorId, sid, area) => `${areaOf(area).prefix}:${sha256(`${String(actorId).trim()}:${sid}`)}`;
+const unlockKeyFor = (actorId, sid, area) => `${areaOf(area).unlockPrefix}:${sha256(`${String(actorId).trim()}:${sid}`)}`;
 
 async function grantUnlock(actorId, sid, area = "settings") {
   await pool.execute(
     `INSERT INTO ${TABLE} (email, otp_code, purpose, is_verified, attempts, expires_at, verified_at)
      VALUES (?, '', ?, 1, 0, DATE_ADD(NOW(), INTERVAL ? HOUR), NOW())
      ON DUPLICATE KEY UPDATE expires_at = VALUES(expires_at), verified_at = NOW()`,
-    [unlockKeyFor(actorId, sid, area), areaOf(area).purpose, UNLOCK_HOURS]
+    [unlockKeyFor(actorId, sid, area), areaOf(area).unlockPurpose, UNLOCK_HOURS]
   );
   return UNLOCK_HOURS * 3600;
 }
@@ -266,7 +314,7 @@ async function unlockRemaining(actorId, sid, area = "settings") {
        FROM ${TABLE}
       WHERE email = ? AND purpose = ? AND expires_at > NOW()
       LIMIT 1`,
-    [unlockKeyFor(actorId, sid, area), areaOf(area).purpose]
+    [unlockKeyFor(actorId, sid, area), areaOf(area).unlockPurpose]
   );
   const remaining = Number(rows?.[0]?.remaining);
   return remaining > 0 ? remaining : 0;
@@ -275,7 +323,7 @@ async function unlockRemaining(actorId, sid, area = "settings") {
 // ─── Email code (first-time enrolment only) ──────────────────────────────────
 
 /** Seconds until this admin may ask for another code (0 = now). */
-async function getResendCooldown(actorId) {
+async function getResendCooldown(actorId, area) {
   if (OTP_RESEND_COOLDOWN_SECONDS <= 0) return 0;
   const [rows] = await pool.execute(
     `SELECT TIMESTAMPDIFF(SECOND, NOW(), DATE_ADD(created_at, INTERVAL ? SECOND)) AS remaining
@@ -283,18 +331,19 @@ async function getResendCooldown(actorId) {
       WHERE email = ? AND purpose = ?
       ORDER BY id DESC
       LIMIT 1`,
-    [OTP_RESEND_COOLDOWN_SECONDS, keyFor(actorId), PURPOSE_OTP]
+    [OTP_RESEND_COOLDOWN_SECONDS, keyFor(actorId, area), areaOf(area).otpPurpose]
   );
   const remaining = Number(rows?.[0]?.remaining);
   return remaining > 0 ? remaining : 0;
 }
 
-function codeEmailHtml(code, requestedBy) {
+function codeEmailHtml(code, requestedBy, area) {
   const minutes = Math.round(OTP_TTL_SECONDS / 60);
+  const { label, where } = areaOf(area);
   return `
     <div style="font-family:Poppins,Arial,sans-serif;max-width:560px;margin:0 auto;color:#252525">
-      <h2 style="margin:0 0 8px">Rysflo Settings access code</h2>
-      <p style="color:#535359">Someone signed in as <b>${escapeHtml(String(requestedBy))}</b> asked to set up Google Authenticator for Super Admin › Settings.</p>
+      <h2 style="margin:0 0 8px">Rysflo ${label} access code</h2>
+      <p style="color:#535359">Someone signed in as <b>${escapeHtml(String(requestedBy))}</b> asked to set up Google Authenticator for ${where}.</p>
       <p style="font-size:32px;font-weight:700;letter-spacing:6px;margin:16px 0">${code}</p>
       <p style="color:#535359">The code expires in ${minutes} minutes. If you did not expect this, do not share it.</p>
     </div>`;
@@ -304,27 +353,28 @@ function codeEmailHtml(code, requestedBy) {
  * Issue a fresh email code for this admin.
  * -> { ok: true, ttl, sentTo } | { ok: false, reason: 'cooldown', retryAfter } | { ok: false, reason: 'send_failed' }
  */
-async function requestCode(actorId, requestedBy) {
-  const retryAfter = await getResendCooldown(actorId);
+async function requestCode(actorId, requestedBy, area = "settings") {
+  const retryAfter = await getResendCooldown(actorId, area);
   if (retryAfter > 0) return { ok: false, reason: "cooldown", retryAfter };
 
   const code = String(crypto.randomInt(0, 1_000_000)).padStart(6, "0");
   const codeHash = await bcrypt.hash(code, 10);
-  const key = keyFor(actorId);
+  const key = keyFor(actorId, area);
+  const { otpPurpose, label } = areaOf(area);
 
-  await pool.execute(`DELETE FROM ${TABLE} WHERE email = ? AND purpose = ?`, [key, PURPOSE_OTP]);
+  await pool.execute(`DELETE FROM ${TABLE} WHERE email = ? AND purpose = ?`, [key, otpPurpose]);
   await pool.execute(
     `INSERT INTO ${TABLE} (email, otp_code, purpose, is_verified, attempts, expires_at)
      VALUES (?, ?, ?, 0, 0, DATE_ADD(NOW(), INTERVAL ? SECOND))`,
-    [key, codeHash, PURPOSE_OTP, OTP_TTL_SECONDS]
+    [key, codeHash, otpPurpose, OTP_TTL_SECONDS]
   );
   pruneExpired().catch(() => {});
 
-  const sent = await sendEmail(SETTINGS_OTP_EMAIL, "Your Rysflo Settings access code", codeEmailHtml(code, requestedBy), "settings_otp");
+  const sent = await sendEmail(SETTINGS_OTP_EMAIL, `Your Rysflo ${label} access code`, codeEmailHtml(code, requestedBy, area), otpPurpose);
   if (!sent.ok) {
-    console.error("SETTINGS_OTP_SEND_FAILED:", sent.reason);
+    console.error("SETTINGS_OTP_SEND_FAILED:", area, sent.reason);
     // Drop the row so the cooldown does not block a retry after a send failure.
-    await pool.execute(`DELETE FROM ${TABLE} WHERE email = ? AND purpose = ?`, [key, PURPOSE_OTP]);
+    await pool.execute(`DELETE FROM ${TABLE} WHERE email = ? AND purpose = ?`, [key, otpPurpose]);
     return { ok: false, reason: "send_failed" };
   }
   return { ok: true, ttl: OTP_TTL_SECONDS, sentTo: maskEmail(SETTINGS_OTP_EMAIL) };
@@ -334,15 +384,15 @@ async function requestCode(actorId, requestedBy) {
  * Check an email code; on success unlock this login session (setup still required).
  * -> { ok: true, expiresInSeconds } | { ok: false, reason: 'not_found' | 'locked' | 'mismatch', attemptsLeft? }
  */
-async function verifyCode(actorId, sid, submitted) {
-  const key = keyFor(actorId);
+async function verifyCode(actorId, sid, submitted, area = "settings") {
+  const key = keyFor(actorId, area);
   const [rows] = await pool.execute(
     `SELECT id, otp_code, attempts
        FROM ${TABLE}
       WHERE email = ? AND purpose = ? AND is_verified = 0 AND expires_at > NOW()
       ORDER BY id DESC
       LIMIT 1`,
-    [key, PURPOSE_OTP]
+    [key, areaOf(area).otpPurpose]
   );
   const record = rows?.[0];
   if (!record) return { ok: false, reason: "not_found" };
@@ -360,7 +410,7 @@ async function verifyCode(actorId, sid, submitted) {
   }
 
   await pool.execute(`DELETE FROM ${TABLE} WHERE id = ?`, [record.id]);
-  return { ok: true, expiresInSeconds: await grantUnlock(actorId, sid) };
+  return { ok: true, expiresInSeconds: await grantUnlock(actorId, sid, area) };
 }
 
 // ─── Google Authenticator (admin_mfa) ─────────────────────────────────────────
@@ -377,16 +427,16 @@ function parseBackup(value) {
   }
 }
 
-async function mfaEnrolled(actorId) {
+async function mfaEnrolled(actorId, area = "settings") {
   const [rows] = await pool.execute(
     `SELECT 1 FROM ${MFA_TABLE} WHERE dietician_id = ? AND confirmed_at IS NOT NULL LIMIT 1`,
-    [String(actorId)]
+    [mfaIdFor(actorId, area)]
   );
   return rows.length > 0;
 }
 
-/** New secret for the QR code; stays unconfirmed until confirmMfaSetup. */
-async function startMfaSetup(actorId, email) {
+/** New secret for the QR code; stays unconfirmed until confirmMfaSetup. hosts: see issuerFor. */
+async function startMfaSetup(actorId, email, area = "settings", hosts = []) {
   const secret = base32Encode(crypto.randomBytes(20));
   // Only replaces an unconfirmed row; a confirmed authenticator is never overwritten.
   await pool.execute(
@@ -396,11 +446,12 @@ async function startMfaSetup(actorId, email) {
        email      = IF(confirmed_at IS NULL, VALUES(email), email),
        secret_enc = IF(confirmed_at IS NULL, VALUES(secret_enc), secret_enc),
        created_at = IF(confirmed_at IS NULL, NOW(), created_at)`,
-    [String(actorId), clip(email, 255), encryptSecret(secret)]
+    [mfaIdFor(actorId, area), clip(email, 255), encryptSecret(secret)]
   );
-  const label = `${encodeURIComponent(MFA_ISSUER)}:${encodeURIComponent(email)}`;
-  const otpauthUrl = `otpauth://totp/${label}?secret=${secret}&issuer=${encodeURIComponent(MFA_ISSUER)}&algorithm=SHA1&digits=6&period=30`;
-  return { secret, otpauthUrl };
+  const issuer = issuerFor(area, hosts);
+  const label = `${encodeURIComponent(issuer)}:${encodeURIComponent(email)}`;
+  const otpauthUrl = `otpauth://totp/${label}?secret=${secret}&issuer=${encodeURIComponent(issuer)}&algorithm=SHA1&digits=6&period=30`;
+  return { secret, otpauthUrl, issuer };
 }
 
 /**
@@ -409,13 +460,13 @@ async function startMfaSetup(actorId, email) {
  * alert is sent. ctx = { email, ip, userAgent, country }.
  * -> { ok: true, backupCodes, expiresInSeconds } | { ok: false, reason: 'not_found' | 'mismatch' }
  */
-async function confirmMfaSetup(actorId, sid, submitted, ctx) {
+async function confirmMfaSetup(actorId, sid, submitted, ctx, area = "settings") {
   const [rows] = await pool.execute(
     `SELECT secret_enc FROM ${MFA_TABLE}
       WHERE dietician_id = ? AND confirmed_at IS NULL
         AND created_at > DATE_SUB(NOW(), INTERVAL ? SECOND)
       LIMIT 1`,
-    [String(actorId), MFA_SETUP_TTL_SECONDS]
+    [mfaIdFor(actorId, area), MFA_SETUP_TTL_SECONDS]
   );
   const pending = rows?.[0];
   if (!pending) return { ok: false, reason: "not_found" };
@@ -436,25 +487,28 @@ async function confirmMfaSetup(actorId, sid, submitted, ctx) {
             confirmed_ip = ?, confirmed_user_agent = ?,
             last_used_at = NOW(), last_used_ip = ?
       WHERE dietician_id = ? AND confirmed_at IS NULL`,
-    [step, JSON.stringify(backupHashes), clip(ctx.ip, 45), clip(ctx.userAgent, 255), clip(ctx.ip, 45), String(actorId)]
+    [step, JSON.stringify(backupHashes), clip(ctx.ip, 45), clip(ctx.userAgent, 255), clip(ctx.ip, 45), mfaIdFor(actorId, area)]
   );
   if (r.affectedRows !== 1) return { ok: false, reason: "not_found" };
 
-  const expiresInSeconds = await grantUnlock(actorId, sid);
-  await sendAlert("Google Authenticator set up", "A super admin set up Google Authenticator for the Settings page.", ctx);
+  const expiresInSeconds = await grantUnlock(actorId, sid, area);
+  await sendAlert("Google Authenticator set up", `A super admin set up Google Authenticator for ${areaOf(area).where}.`, ctx);
   return { ok: true, backupCodes, expiresInSeconds };
 }
 
 /**
  * Unlock with an app code, or a one-time backup code ("abcd-1234").
  * Alerts on a backup code or an IP this admin has not used before.
- * Unlocks `area` only ("settings" or "test_codes"); the authenticator is shared.
- * 'reused' = right code, but it already unlocked something (each code works once).
- * -> { ok: true, expiresInSeconds, usedBackup, backupLeft? } | { ok: false, reason: 'not_enrolled' | 'mismatch' | 'reused' }
+ * Uses and unlocks `area` only.
+ * 'reused' = right code, but it was already used (each code works once).
+ * 'clock'  = the code belongs to a time minutes away: the phone's clock is off
+ *            (clockOffsetMinutes says by how much); nothing is unlocked.
+ * -> { ok: true, expiresInSeconds, usedBackup, backupLeft? }
+ *  | { ok: false, reason: 'not_enrolled' | 'mismatch' | 'reused' | 'clock', clockOffsetMinutes? }
  */
 async function verifyMfa(actorId, sid, submitted, ctx, area = "settings") {
   const code = String(submitted == null ? "" : submitted).trim().toLowerCase();
-  const id = String(actorId);
+  const id = mfaIdFor(actorId, area);
   const { label } = areaOf(area);
 
   const [rows] = await pool.execute(
@@ -467,8 +521,13 @@ async function verifyMfa(actorId, sid, submitted, ctx, area = "settings") {
   const newIp = ctx.ip && ctx.ip !== mfa.last_used_ip && ctx.ip !== mfa.confirmed_ip;
 
   if (/^\d{6}$/.test(code)) {
-    const step = matchTotp(decryptSecret(mfa.secret_enc), code);
-    if (step == null) return { ok: false, reason: "mismatch" };
+    const secretB32 = decryptSecret(mfa.secret_enc);
+    const step = matchTotp(secretB32, code);
+    if (step == null) {
+      const drift = totpDriftSteps(secretB32, code);
+      if (drift != null) return { ok: false, reason: "clock", clockOffsetMinutes: Math.round((drift * 30) / 60) };
+      return { ok: false, reason: "mismatch" };
+    }
     // A code is good once: the step must be newer than the last accepted one.
     const [r] = await pool.execute(
       `UPDATE ${MFA_TABLE} SET last_used_step = ?, last_used_at = NOW(), last_used_ip = ?
@@ -537,7 +596,7 @@ function requireUnlock(area, code) {
     if (req.method === "OPTIONS") return next();
     try {
       const actorId = actorIdOf(req);
-      if ((await unlockRemaining(actorId, sidOf(req), area)) > 0 && (await mfaEnrolled(actorId))) return next();
+      if ((await unlockRemaining(actorId, sidOf(req), area)) > 0 && (await mfaEnrolled(actorId, area))) return next();
       return res.status(403).json({ ok: false, code, message: `${label} are locked. Enter your Google Authenticator code to unlock.` });
     } catch (err) {
       console.error("SETTINGS_LOCK_CHECK_FAILED:", area, err?.code || err?.message);
@@ -554,6 +613,7 @@ const requireTestCodesUnlock = requireUnlock("test_codes", "TEST_CODES_LOCKED");
 module.exports = {
   maskEmail,
   settingsOtpEmail: () => SETTINGS_OTP_EMAIL,
+  issuerFor,
   requestCode,
   verifyCode,
   unlockRemaining,
@@ -567,5 +627,5 @@ module.exports = {
   requireSettingsUnlock,
   requireTestCodesUnlock,
   // exposed for tests
-  _totp: { base32Encode, base32Decode, hotp, matchTotp, encryptSecret, decryptSecret },
+  _totp: { base32Encode, base32Decode, hotp, matchTotp, totpDriftSteps, encryptSecret, decryptSecret },
 };
