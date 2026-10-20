@@ -310,7 +310,8 @@ const {
   setCommissionRate,
 } = require("../controllers/dietitian/api/web/commission-rate");
 const settingsLock = require("../controllers/dietitian/api/web/settings-lock");
-const { requireSettingsUnlock } = require("../services/settingsLock");
+const { requireSettingsUnlock, requireTestCodesUnlock } = require("../services/settingsLock");
+const testCodesLock = require("../controllers/dietitian/api/web/test-codes-lock");
 
 const { earningsSummary } = require("../controllers/dietitian/api/web/earnings-summary");
 const referralOps = require("../controllers/dietitian/api/web/referral-ops");
@@ -1078,8 +1079,8 @@ router.post("/dietitian/api/web/list-payouts", authMiddleware, listPayouts);
 router.post("/dietitian/api/web/commission-overview", authMiddleware, commissionOverview);
 router.post("/dietitian/api/web/super-admin-sales-analytics", authMiddleware, superAdminSalesAnalytics);
 router.post("/dietitian/api/web/super-admin-orders", authMiddleware, superAdminOrders);
-// Test codes are free memberships: same Google Authenticator unlock as Settings.
-router.post("/dietitian/api/web/super-admin-test-codes", authMiddleware, requireSettingsUnlock, superAdminTestCodes);
+// Test codes are free memberships: locked behind their own Google Authenticator unlock.
+router.post("/dietitian/api/web/super-admin-test-codes", authMiddleware, requireTestCodesUnlock, superAdminTestCodes);
 router.post("/dietitian/api/web/cancel-order-subscription", authMiddleware, cancelOrderSubscription);
 router.post("/dietitian/api/web/simulate-renewal", authMiddleware, simulateRenewal);
 router.post("/dietitian/api/web/restore-subscription-discount", authMiddleware, restoreSubscriptionDiscount);
@@ -1113,6 +1114,10 @@ router.post("/dietitian/api/web/settings-lock-verify", authMiddleware, settingsL
 router.post("/dietitian/api/web/settings-mfa-setup", authMiddleware, settingsLock.settingsMfaSetup);
 router.post("/dietitian/api/web/settings-mfa-confirm", authMiddleware, settingsLock.settingsCodeRateLimiter, settingsLock.settingsMfaConfirm);
 router.post("/dietitian/api/web/settings-mfa-verify", authMiddleware, settingsLock.settingsCodeRateLimiter, settingsLock.settingsMfaVerify);
+
+// Orders › Test codes Google Authenticator gate: same authenticator, own APIs and unlock (test-codes-lock.js).
+router.post("/dietitian/api/web/test-codes-lock-status", authMiddleware, testCodesLock.testCodesLockStatus);
+router.post("/dietitian/api/web/test-codes-mfa-verify", authMiddleware, settingsLock.settingsCodeRateLimiter, testCodesLock.testCodesMfaVerify);
 
 
 router.post(

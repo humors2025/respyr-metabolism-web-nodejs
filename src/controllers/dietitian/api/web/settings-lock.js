@@ -30,7 +30,7 @@ function requestContext(req, email) {
   };
 }
 
-function guard(fn) {
+function guard(fn, errorTag = "SETTINGS_LOCK_ERROR") {
   return async (req, res) => {
     res.setHeader("Cache-Control", "no-store");
     if (req.method !== "POST") return res.status(405).json({ ok: false, message: "Method not allowed" });
@@ -43,7 +43,7 @@ function guard(fn) {
       const actorEmail = resolved.actorEmail || actorId;
       return await fn(req, res, { actorId, sid, actorEmail, ctx: requestContext(req, actorEmail) });
     } catch (err) {
-      console.error("SETTINGS_LOCK_ERROR:", err?.code || err?.message);
+      console.error(`${errorTag}:`, err?.code || err?.message);
       return res.status(500).json({ ok: false, message: "Something went wrong" });
     }
   };
@@ -53,7 +53,8 @@ const alreadyEnrolled = (res) =>
   res.status(409).json({ ok: false, code: "MFA_ENROLLED", message: "Google Authenticator is already set up. Use the code from the app." });
 
 // Wrong-code throttle per admin; the codes are 6 digits, so this is the
-// brute-force brake on top of the per-code attempt cap.
+// brute-force brake on top of the per-code attempt cap. The Test codes verify
+// route mounts this same instance, so wrong codes on either screen share it.
 const settingsCodeRateLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 10,
@@ -65,7 +66,7 @@ const settingsCodeRateLimiter = rateLimit({
     // Alert once, on the first request over the limit, not on every retry after it.
     if (req.rateLimit?.current === req.rateLimit?.limit + 1) {
       const email = req.user?.email || req.user?.dietician?.email || lock.actorIdOf(req);
-      await lock.sendAlert("Too many wrong Settings codes", "Someone entered 10 wrong codes on the Settings lock screen within 15 minutes.", requestContext(req, email));
+      await lock.sendAlert("Too many wrong Google Authenticator codes", "Someone entered 10 wrong codes on the Settings or Test codes lock screen within 15 minutes.", requestContext(req, email));
     }
     return res.status(429).json({ ok: false, message: "Too many attempts. Try again in 15 minutes." });
   },
@@ -123,16 +124,23 @@ const settingsMfaConfirm = guard(async (req, res, { actorId, sid, ctx }) => {
   return res.status(400).json({ ok: false, reason: r.reason, message });
 });
 
-const settingsMfaVerify = guard(async (req, res, { actorId, sid, ctx }) => {
-  const r = await lock.verifyMfa(actorId, sid, req.body?.code, ctx);
-  if (r.ok) {
-    return res.json({ ok: true, unlocked: true, used_backup: r.usedBackup, backup_codes_left: r.backupLeft, expires_in_seconds: r.expiresInSeconds });
-  }
-  if (r.reason === "not_enrolled") {
-    return res.status(409).json({ ok: false, code: "MFA_NOT_ENROLLED", message: "Google Authenticator is not set up yet." });
-  }
-  return res.status(400).json({ ok: false, reason: r.reason, message: "Incorrect code." });
-});
+/** settings-mfa-verify and test-codes-mfa-verify: same answers, different unlock. */
+function mfaVerifyHandler(area) {
+  return async (req, res, { actorId, sid, ctx }) => {
+    const r = await lock.verifyMfa(actorId, sid, req.body?.code, ctx, area);
+    if (r.ok) {
+      return res.json({ ok: true, unlocked: true, used_backup: r.usedBackup, backup_codes_left: r.backupLeft, expires_in_seconds: r.expiresInSeconds });
+    }
+    if (r.reason === "not_enrolled") {
+      return res.status(409).json({ ok: false, code: "MFA_NOT_ENROLLED", message: "Google Authenticator is not set up yet." });
+    }
+    const message =
+      r.reason === "reused" ? "This code was already used. Wait for the next code in Google Authenticator." : "Incorrect code.";
+    return res.status(400).json({ ok: false, reason: r.reason, message });
+  };
+}
+
+const settingsMfaVerify = guard(mfaVerifyHandler("settings"));
 
 module.exports = {
   settingsCodeRateLimiter,
@@ -142,4 +150,5 @@ module.exports = {
   settingsMfaSetup,
   settingsMfaConfirm,
   settingsMfaVerify,
+  _helpers: { guard, mfaVerifyHandler },
 };

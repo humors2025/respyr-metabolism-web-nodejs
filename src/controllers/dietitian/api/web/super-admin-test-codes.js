@@ -20,9 +20,10 @@
  * account (SUPER_ADMIN_TEST_CODE_TRAINER_EMAIL, default connect@respyr.in) so
  * the members they onboard land in that trainer's client list.
  *
- * Both actions sit behind requireSettingsUnlock (services/settingsLock.js):
- * a listed code is a usable free membership, so the super admin unlocks with
- * the same Google Authenticator code as Settings. Locked -> 403 SETTINGS_LOCKED.
+ * Both actions sit behind requireTestCodesUnlock (services/settingsLock.js):
+ * a listed code is a usable free membership, so the super admin first unlocks
+ * the tab with Google Authenticator via test-codes-lock-status /
+ * test-codes-mfa-verify (test-codes-lock.js). Locked -> 403 TEST_CODES_LOCKED.
  *
  * Body: { action: "generate", count? (1–20, default 1) }
  *       { action: "list", page?, limit? }
