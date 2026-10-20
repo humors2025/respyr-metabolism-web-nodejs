@@ -5,8 +5,10 @@
  *
  * The Settings page changes platform pricing and the commission rate, so a
  * signed-in super admin must also enter the 6-digit code from their
- * authenticator app before the page unlocks. The same unlock also opens the
- * Test codes tab on Orders (super-admin-test-codes mints free memberships).
+ * authenticator app before the page unlocks. The Test codes tab on Orders
+ * (super-admin-test-codes mints free memberships) uses the same authenticator
+ * entry but its own APIs (controllers/.../test-codes-lock.js) and its own
+ * unlock: opening one never opens the other.
  *
  * FLOW
  *   First time (no authenticator yet):
@@ -15,9 +17,11 @@
  *     2. startMfaSetup / confirmMfaSetup -> QR code scanned into Google
  *        Authenticator, confirmed with one app code; 8 backup codes issued
  *   Every time after:
- *     verifyMfa(code)  -> app code (or a one-time backup code) unlocks
- *   Guard:
- *     requireSettingsUnlock -> session unlocked AND authenticator enrolled
+ *     verifyMfa(code, area)  -> app code (or a one-time backup code) unlocks
+ *                               that area ("settings" or "test_codes")
+ *   Guards:
+ *     requireSettingsUnlock / requireTestCodesUnlock -> that area unlocked for
+ *     this session AND authenticator enrolled
  *
  * The unlock is bound to the login session id (JWT `sid` =
  * dietician_refresh_tokens.id), which stays the same across access-token
@@ -42,6 +46,7 @@
  *     settings_otp    : email "sa:<dietician_id>", otp_code = bcrypt(email code)
  *     settings_unlock : email "su:" + sha256(dietician_id:sid), one row per
  *                       login session, expires_at = end of the unlock
+ *     test_codes_unlock : same, with "tu:" — the Test codes tab's unlock
  *
  * Lost phone and backup codes: DELETE FROM admin_mfa WHERE dietician_id = ?;
  * the next visit starts enrolment again via the email code.
@@ -64,7 +69,16 @@ const { escapeHtml } = require("../utils/securityValidation");
 const TABLE = "otp_verifications";
 const MFA_TABLE = "admin_mfa";
 const PURPOSE_OTP = "settings_otp";
-const PURPOSE_UNLOCK = "settings_unlock";
+// Each locked area keeps its own unlock row per login session.
+const UNLOCK_AREAS = {
+  settings: { prefix: "su", purpose: "settings_unlock", label: "Settings" },
+  test_codes: { prefix: "tu", purpose: "test_codes_unlock", label: "Test codes" },
+};
+const areaOf = (area) => {
+  const a = UNLOCK_AREAS[area];
+  if (!a) throw new Error(`Unknown unlock area: ${area}`);
+  return a;
+};
 
 function intEnv(name, def, min, max) {
   const v = parseInt(process.env[name], 10);
@@ -102,8 +116,8 @@ function maskEmail(email) {
 async function pruneExpired() {
   try {
     await pool.execute(
-      `DELETE FROM ${TABLE} WHERE purpose IN (?, ?) AND expires_at <= NOW()`,
-      [PURPOSE_OTP, PURPOSE_UNLOCK]
+      `DELETE FROM ${TABLE} WHERE purpose IN (?, ?, ?) AND expires_at <= NOW()`,
+      [PURPOSE_OTP, UNLOCK_AREAS.settings.purpose, UNLOCK_AREAS.test_codes.purpose]
     );
   } catch (err) {
     console.error("SETTINGS_LOCK_PRUNE_FAILED:", err?.code || err?.message);
@@ -232,27 +246,27 @@ function decryptSecret(stored) {
 
 // ─── Session unlock ───────────────────────────────────────────────────────────
 
-const unlockKeyFor = (actorId, sid) => `su:${sha256(`${String(actorId).trim()}:${sid}`)}`;
+const unlockKeyFor = (actorId, sid, area) => `${areaOf(area).prefix}:${sha256(`${String(actorId).trim()}:${sid}`)}`;
 
-async function grantUnlock(actorId, sid) {
+async function grantUnlock(actorId, sid, area = "settings") {
   await pool.execute(
     `INSERT INTO ${TABLE} (email, otp_code, purpose, is_verified, attempts, expires_at, verified_at)
      VALUES (?, '', ?, 1, 0, DATE_ADD(NOW(), INTERVAL ? HOUR), NOW())
      ON DUPLICATE KEY UPDATE expires_at = VALUES(expires_at), verified_at = NOW()`,
-    [unlockKeyFor(actorId, sid), PURPOSE_UNLOCK, UNLOCK_HOURS]
+    [unlockKeyFor(actorId, sid, area), areaOf(area).purpose, UNLOCK_HOURS]
   );
   return UNLOCK_HOURS * 3600;
 }
 
-/** Seconds of unlock left for this admin's login session (0 = locked). */
-async function unlockRemaining(actorId, sid) {
+/** Seconds of unlock left for this admin's login session in `area` (0 = locked). */
+async function unlockRemaining(actorId, sid, area = "settings") {
   if (!actorId || !sid) return 0;
   const [rows] = await pool.execute(
     `SELECT TIMESTAMPDIFF(SECOND, NOW(), expires_at) AS remaining
        FROM ${TABLE}
       WHERE email = ? AND purpose = ? AND expires_at > NOW()
       LIMIT 1`,
-    [unlockKeyFor(actorId, sid), PURPOSE_UNLOCK]
+    [unlockKeyFor(actorId, sid, area), areaOf(area).purpose]
   );
   const remaining = Number(rows?.[0]?.remaining);
   return remaining > 0 ? remaining : 0;
@@ -434,11 +448,14 @@ async function confirmMfaSetup(actorId, sid, submitted, ctx) {
 /**
  * Unlock with an app code, or a one-time backup code ("abcd-1234").
  * Alerts on a backup code or an IP this admin has not used before.
- * -> { ok: true, expiresInSeconds, usedBackup, backupLeft? } | { ok: false, reason: 'not_enrolled' | 'mismatch' }
+ * Unlocks `area` only ("settings" or "test_codes"); the authenticator is shared.
+ * 'reused' = right code, but it already unlocked something (each code works once).
+ * -> { ok: true, expiresInSeconds, usedBackup, backupLeft? } | { ok: false, reason: 'not_enrolled' | 'mismatch' | 'reused' }
  */
-async function verifyMfa(actorId, sid, submitted, ctx) {
+async function verifyMfa(actorId, sid, submitted, ctx, area = "settings") {
   const code = String(submitted == null ? "" : submitted).trim().toLowerCase();
   const id = String(actorId);
+  const { label } = areaOf(area);
 
   const [rows] = await pool.execute(
     `SELECT secret_enc, last_used_step, backup_codes, confirmed_ip, last_used_ip
@@ -458,9 +475,9 @@ async function verifyMfa(actorId, sid, submitted, ctx) {
         WHERE dietician_id = ? AND last_used_step < ?`,
       [step, clip(ctx.ip, 45), id, step]
     );
-    if (r.affectedRows !== 1) return { ok: false, reason: "mismatch" };
-    const expiresInSeconds = await grantUnlock(actorId, sid);
-    if (newIp) await sendAlert("Settings unlocked from a new IP address", "A super admin unlocked the Settings page from an IP address they have not used before.", ctx);
+    if (r.affectedRows !== 1) return { ok: false, reason: "reused" };
+    const expiresInSeconds = await grantUnlock(actorId, sid, area);
+    if (newIp) await sendAlert(`${label} unlocked from a new IP address`, `A super admin unlocked ${label} from an IP address they have not used before.`, ctx);
     return { ok: true, usedBackup: false, expiresInSeconds };
   }
 
@@ -491,10 +508,10 @@ async function verifyMfa(actorId, sid, submitted, ctx) {
         [JSON.stringify(left), clip(ctx.ip, 45), id]
       );
       await conn.commit();
-      const expiresInSeconds = await grantUnlock(actorId, sid);
+      const expiresInSeconds = await grantUnlock(actorId, sid, area);
       await sendAlert(
         "Backup code used",
-        `A super admin unlocked Settings with a backup code (${left.length} left). This usually means a lost phone.`,
+        `A super admin unlocked ${label} with a backup code (${left.length} left). This usually means a lost phone.`,
         ctx
       );
       return { ok: true, usedBackup: true, backupLeft: left.length, expiresInSeconds };
@@ -513,18 +530,26 @@ async function verifyMfa(actorId, sid, submitted, ctx) {
 const actorIdOf = (req) => String(req.user?.sub || req.user?.dietician_id || "").trim();
 const sidOf = (req) => String(req.user?.sid || "").trim();
 
-/** Route guard for settings writes and super-admin-test-codes; runs after authMiddleware. */
-async function requireSettingsUnlock(req, res, next) {
-  if (req.method === "OPTIONS") return next();
-  try {
-    const actorId = actorIdOf(req);
-    if ((await unlockRemaining(actorId, sidOf(req))) > 0 && (await mfaEnrolled(actorId))) return next();
-    return res.status(403).json({ ok: false, code: "SETTINGS_LOCKED", message: "Settings are locked. Enter your Google Authenticator code to unlock." });
-  } catch (err) {
-    console.error("SETTINGS_LOCK_CHECK_FAILED:", err?.code || err?.message);
-    return res.status(500).json({ ok: false, message: "Unable to verify settings access" });
-  }
+/** Route guard for one locked area; runs after authMiddleware. */
+function requireUnlock(area, code) {
+  const { label } = areaOf(area);
+  return async (req, res, next) => {
+    if (req.method === "OPTIONS") return next();
+    try {
+      const actorId = actorIdOf(req);
+      if ((await unlockRemaining(actorId, sidOf(req), area)) > 0 && (await mfaEnrolled(actorId))) return next();
+      return res.status(403).json({ ok: false, code, message: `${label} are locked. Enter your Google Authenticator code to unlock.` });
+    } catch (err) {
+      console.error("SETTINGS_LOCK_CHECK_FAILED:", area, err?.code || err?.message);
+      return res.status(500).json({ ok: false, message: `Unable to verify ${label.toLowerCase()} access` });
+    }
+  };
 }
+
+/** Settings writes (set-pricing, set-commission-rate). */
+const requireSettingsUnlock = requireUnlock("settings", "SETTINGS_LOCKED");
+/** super-admin-test-codes (list and generate). */
+const requireTestCodesUnlock = requireUnlock("test_codes", "TEST_CODES_LOCKED");
 
 module.exports = {
   maskEmail,
@@ -540,6 +565,7 @@ module.exports = {
   actorIdOf,
   sidOf,
   requireSettingsUnlock,
+  requireTestCodesUnlock,
   // exposed for tests
   _totp: { base32Encode, base32Decode, hotp, matchTotp, encryptSecret, decryptSecret },
 };
