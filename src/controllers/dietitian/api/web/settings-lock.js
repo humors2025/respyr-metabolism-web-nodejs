@@ -8,10 +8,13 @@
  *  First-time enrolment (no authenticator yet):
  *  POST /dietitian/api/web/settings-lock-request     -> email code to SETTINGS_OTP_EMAIL
  *  POST /dietitian/api/web/settings-lock-verify      body { code } -> email code accepted
- *  POST /dietitian/api/web/settings-mfa-setup        -> { secret, otpauth_url } (needs email step)
+ *  POST /dietitian/api/web/settings-mfa-setup        -> { secret, otpauth_url, issuer } (needs email step)
  *  POST /dietitian/api/web/settings-mfa-confirm      body { code } -> { backup_codes }
  *  Every visit after:
  *  POST /dietitian/api/web/settings-mfa-verify       body { code } (app code or backup code)
+ *
+ * The Test codes tab has the same set under test-codes-* (test-codes-lock.js),
+ * built from lockHandlers() below with its own authenticator and unlock.
  */
 
 const rateLimit = require("express-rate-limit");
@@ -49,12 +52,9 @@ function guard(fn, errorTag = "SETTINGS_LOCK_ERROR") {
   };
 }
 
-const alreadyEnrolled = (res) =>
-  res.status(409).json({ ok: false, code: "MFA_ENROLLED", message: "Google Authenticator is already set up. Use the code from the app." });
-
 // Wrong-code throttle per admin; the codes are 6 digits, so this is the
-// brute-force brake on top of the per-code attempt cap. The Test codes verify
-// route mounts this same instance, so wrong codes on either screen share it.
+// brute-force brake on top of the per-code attempt cap. The Test codes routes
+// mount this same instance, so wrong codes on either screen share it.
 const settingsCodeRateLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 10,
@@ -72,61 +72,67 @@ const settingsCodeRateLimiter = rateLimit({
   },
 });
 
-const settingsLockStatus = guard(async (req, res, { actorId, sid }) => {
-  const [remaining, enrolled] = await Promise.all([lock.unlockRemaining(actorId, sid), lock.mfaEnrolled(actorId)]);
-  return res.json({
-    ok: true,
-    unlocked: remaining > 0,
-    mfa_enrolled: enrolled,
-    expires_in_seconds: remaining,
-    sent_to: lock.maskEmail(lock.settingsOtpEmail()),
+/**
+ * The six handlers for one locked area ("settings" | "test_codes").
+ * lockedCode is the 403 code its guarded routes answer with.
+ */
+function lockHandlers(area, lockedCode) {
+  const errorTag = area === "settings" ? "SETTINGS_LOCK_ERROR" : "TEST_CODES_LOCK_ERROR";
+  const g = (fn) => guard(fn, errorTag);
+  const alreadyEnrolled = (res) =>
+    res.status(409).json({ ok: false, code: "MFA_ENROLLED", message: "Google Authenticator is already set up. Use the code from the app." });
+  const needEmailStep = (res) => res.status(403).json({ ok: false, code: lockedCode, message: "Verify the email code first." });
+
+  const status = g(async (req, res, { actorId, sid }) => {
+    const [remaining, enrolled] = await Promise.all([lock.unlockRemaining(actorId, sid, area), lock.mfaEnrolled(actorId, area)]);
+    return res.json({
+      ok: true,
+      unlocked: remaining > 0,
+      mfa_enrolled: enrolled,
+      expires_in_seconds: remaining,
+      sent_to: lock.maskEmail(lock.settingsOtpEmail()),
+    });
   });
-});
 
-const settingsLockRequest = guard(async (req, res, { actorId, actorEmail }) => {
-  if (await lock.mfaEnrolled(actorId)) return alreadyEnrolled(res);
-  const r = await lock.requestCode(actorId, actorEmail);
-  if (r.ok) return res.json({ ok: true, sent_to: r.sentTo, ttl_seconds: r.ttl });
-  if (r.reason === "cooldown") {
-    return res.status(429).json({ ok: false, message: `Please wait ${r.retryAfter}s before requesting another code.`, retry_after_seconds: r.retryAfter });
-  }
-  return res.status(502).json({ ok: false, message: "Could not send the code email. Try again." });
-});
+  const request = g(async (req, res, { actorId, actorEmail }) => {
+    if (await lock.mfaEnrolled(actorId, area)) return alreadyEnrolled(res);
+    const r = await lock.requestCode(actorId, actorEmail, area);
+    if (r.ok) return res.json({ ok: true, sent_to: r.sentTo, ttl_seconds: r.ttl });
+    if (r.reason === "cooldown") {
+      return res.status(429).json({ ok: false, message: `Please wait ${r.retryAfter}s before requesting another code.`, retry_after_seconds: r.retryAfter });
+    }
+    return res.status(502).json({ ok: false, message: "Could not send the code email. Try again." });
+  });
 
-const settingsLockVerify = guard(async (req, res, { actorId, sid }) => {
-  if (await lock.mfaEnrolled(actorId)) return alreadyEnrolled(res);
-  const r = await lock.verifyCode(actorId, sid, req.body?.code);
-  if (r.ok) return res.json({ ok: true, unlocked: true, expires_in_seconds: r.expiresInSeconds });
-  const message =
-    r.reason === "mismatch" ? `Incorrect code. ${r.attemptsLeft} attempt${r.attemptsLeft === 1 ? "" : "s"} left.`
-    : r.reason === "locked" ? "Too many wrong attempts. Request a new code."
-    : "Code expired or not requested. Request a new code.";
-  return res.status(400).json({ ok: false, reason: r.reason, message, attempts_left: r.attemptsLeft });
-});
+  const verifyEmail = g(async (req, res, { actorId, sid }) => {
+    if (await lock.mfaEnrolled(actorId, area)) return alreadyEnrolled(res);
+    const r = await lock.verifyCode(actorId, sid, req.body?.code, area);
+    if (r.ok) return res.json({ ok: true, unlocked: true, expires_in_seconds: r.expiresInSeconds });
+    const message =
+      r.reason === "mismatch" ? `Incorrect code. ${r.attemptsLeft} attempt${r.attemptsLeft === 1 ? "" : "s"} left.`
+      : r.reason === "locked" ? "Too many wrong attempts. Request a new code."
+      : "Code expired or not requested. Request a new code.";
+    return res.status(400).json({ ok: false, reason: r.reason, message, attempts_left: r.attemptsLeft });
+  });
 
-const settingsMfaSetup = guard(async (req, res, { actorId, sid, actorEmail }) => {
-  if (await lock.mfaEnrolled(actorId)) return alreadyEnrolled(res);
-  if ((await lock.unlockRemaining(actorId, sid)) <= 0) {
-    return res.status(403).json({ ok: false, code: "SETTINGS_LOCKED", message: "Verify the email code first." });
-  }
-  const { secret, otpauthUrl } = await lock.startMfaSetup(actorId, actorEmail);
-  return res.json({ ok: true, secret, otpauth_url: otpauthUrl });
-});
+  const setup = g(async (req, res, { actorId, sid, actorEmail }) => {
+    if (await lock.mfaEnrolled(actorId, area)) return alreadyEnrolled(res);
+    if ((await lock.unlockRemaining(actorId, sid, area)) <= 0) return needEmailStep(res);
+    const hosts = [req.get?.("x-forwarded-host"), req.get?.("host"), req.get?.("origin")];
+    const { secret, otpauthUrl, issuer } = await lock.startMfaSetup(actorId, actorEmail, area, hosts);
+    return res.json({ ok: true, secret, otpauth_url: otpauthUrl, issuer });
+  });
 
-const settingsMfaConfirm = guard(async (req, res, { actorId, sid, ctx }) => {
-  if (await lock.mfaEnrolled(actorId)) return alreadyEnrolled(res);
-  if ((await lock.unlockRemaining(actorId, sid)) <= 0) {
-    return res.status(403).json({ ok: false, code: "SETTINGS_LOCKED", message: "Verify the email code first." });
-  }
-  const r = await lock.confirmMfaSetup(actorId, sid, req.body?.code, ctx);
-  if (r.ok) return res.json({ ok: true, unlocked: true, backup_codes: r.backupCodes, expires_in_seconds: r.expiresInSeconds });
-  const message = r.reason === "mismatch" ? "Incorrect code. Check the app and try again." : "Setup expired. Start again.";
-  return res.status(400).json({ ok: false, reason: r.reason, message });
-});
+  const confirm = g(async (req, res, { actorId, sid, ctx }) => {
+    if (await lock.mfaEnrolled(actorId, area)) return alreadyEnrolled(res);
+    if ((await lock.unlockRemaining(actorId, sid, area)) <= 0) return needEmailStep(res);
+    const r = await lock.confirmMfaSetup(actorId, sid, req.body?.code, ctx, area);
+    if (r.ok) return res.json({ ok: true, unlocked: true, backup_codes: r.backupCodes, expires_in_seconds: r.expiresInSeconds });
+    const message = r.reason === "mismatch" ? "Incorrect code. Check the app and try again." : "Setup expired. Start again.";
+    return res.status(400).json({ ok: false, reason: r.reason, message });
+  });
 
-/** settings-mfa-verify and test-codes-mfa-verify: same answers, different unlock. */
-function mfaVerifyHandler(area) {
-  return async (req, res, { actorId, sid, ctx }) => {
+  const verify = g(async (req, res, { actorId, sid, ctx }) => {
     const r = await lock.verifyMfa(actorId, sid, req.body?.code, ctx, area);
     if (r.ok) {
       return res.json({ ok: true, unlocked: true, used_backup: r.usedBackup, backup_codes_left: r.backupLeft, expires_in_seconds: r.expiresInSeconds });
@@ -134,21 +140,26 @@ function mfaVerifyHandler(area) {
     if (r.reason === "not_enrolled") {
       return res.status(409).json({ ok: false, code: "MFA_NOT_ENROLLED", message: "Google Authenticator is not set up yet." });
     }
+    const off = Math.abs(r.clockOffsetMinutes || 0);
     const message =
-      r.reason === "reused" ? "This code was already used. Wait for the next code in Google Authenticator." : "Incorrect code.";
-    return res.status(400).json({ ok: false, reason: r.reason, message });
-  };
+      r.reason === "reused" ? "This code was already used. Wait for the next code in Google Authenticator."
+      : r.reason === "clock" ? `Your phone's clock is about ${off || 1} minute${off === 1 ? "" : "s"} ${r.clockOffsetMinutes > 0 ? "fast" : "slow"}. Turn on automatic date and time, then try again.`
+      : `Incorrect code. Use the ${lock.issuerFor(area)} entry for this site in Google Authenticator (UAT and live each have their own).`;
+    return res.status(400).json({ ok: false, reason: r.reason, message, clock_offset_minutes: r.clockOffsetMinutes });
+  });
+
+  return { status, request, verifyEmail, setup, confirm, verify };
 }
 
-const settingsMfaVerify = guard(mfaVerifyHandler("settings"));
+const settings = lockHandlers("settings", "SETTINGS_LOCKED");
 
 module.exports = {
   settingsCodeRateLimiter,
-  settingsLockStatus,
-  settingsLockRequest,
-  settingsLockVerify,
-  settingsMfaSetup,
-  settingsMfaConfirm,
-  settingsMfaVerify,
-  _helpers: { guard, mfaVerifyHandler },
+  settingsLockStatus: settings.status,
+  settingsLockRequest: settings.request,
+  settingsLockVerify: settings.verifyEmail,
+  settingsMfaSetup: settings.setup,
+  settingsMfaConfirm: settings.confirm,
+  settingsMfaVerify: settings.verify,
+  _helpers: { lockHandlers },
 };
