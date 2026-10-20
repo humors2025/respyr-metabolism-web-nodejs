@@ -1078,7 +1078,8 @@ router.post("/dietitian/api/web/list-payouts", authMiddleware, listPayouts);
 router.post("/dietitian/api/web/commission-overview", authMiddleware, commissionOverview);
 router.post("/dietitian/api/web/super-admin-sales-analytics", authMiddleware, superAdminSalesAnalytics);
 router.post("/dietitian/api/web/super-admin-orders", authMiddleware, superAdminOrders);
-router.post("/dietitian/api/web/super-admin-test-codes", authMiddleware, superAdminTestCodes);
+// Test codes are free memberships: same Google Authenticator unlock as Settings.
+router.post("/dietitian/api/web/super-admin-test-codes", authMiddleware, requireSettingsUnlock, superAdminTestCodes);
 router.post("/dietitian/api/web/cancel-order-subscription", authMiddleware, cancelOrderSubscription);
 router.post("/dietitian/api/web/simulate-renewal", authMiddleware, simulateRenewal);
 router.post("/dietitian/api/web/restore-subscription-discount", authMiddleware, restoreSubscriptionDiscount);
