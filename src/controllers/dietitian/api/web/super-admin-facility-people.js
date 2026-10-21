@@ -19,11 +19,19 @@
  *                  list price (gross), discount_amount_minor the referral
  *                  discount, net_amount_minor what the member paid
  *
- * Body: { facility_id?, view, page?, limit? }   (facility_id omitted = all facilities)
+ * Body: { facility_id?, view, page?, limit?, search? }   (facility_id omitted = all facilities)
  *
  * Pagination is opt-in, as on list-facilities: send page and/or limit
  * (1..100, default 10) for one page plus a `pagination` block; without them
  * every row is returned.
+ *
+ * Search is opt-in, same rule as list-facilities: `search` (trimmed, 3..100
+ * chars — shorter is a 422) keeps rows where any of these contains the term
+ * (case-insensitive):
+ *   trainers  name, email, phone, partner code, facility name
+ *   members   name, email, code used, QR sticker id, code owner's name, facility name
+ * `total` / `pagination.total` then count the matches. The normalised term is
+ * echoed back as `search` ("" when none was given).
  *
  * Existing tables only. Member rows carry buyers' emails, so every read is
  * written to app_auth_logs.
@@ -44,6 +52,23 @@ const lower = (v) => (v == null || v === "" ? null : String(v).toLowerCase());
 
 const DEFAULT_LIMIT = 10;
 const MAX_LIMIT = 100;
+const SEARCH_MIN_LENGTH = 3;
+const SEARCH_MAX_LENGTH = 100;
+
+function parseSearch(body) {
+  return typeof body.search === "string" ? body.search.trim().slice(0, SEARCH_MAX_LENGTH) : "";
+}
+
+// Literal "contains" LIKE term: escape the wildcards so "100%" or "a_b" match
+// themselves (same helper as list-facilities).
+const like = (s) => `%${s.replace(/[\\%_]/g, (c) => `\\${c}`)}%`;
+
+// Name / phone live in table_dietician; EXISTS keeps one row per trainer or
+// member, so the page and its count stay in step.
+const TRAINER_SEARCH_SQL = `(aur.user_id LIKE ? OR aur.partner_code LIKE ? OR f.name LIKE ?
+  OR EXISTS (SELECT 1 FROM table_dietician tds WHERE LOWER(tds.email) = LOWER(aur.user_id) AND (tds.name LIKE ? OR tds.phone_no LIKE ?)))`;
+const MEMBER_SEARCH_SQL = `(rs.purchaser_name LIKE ? OR rs.purchaser_email LIKE ? OR rs.attributed_partner_code LIKE ? OR rs.qr_id LIKE ? OR f.name LIKE ?
+  OR EXISTS (SELECT 1 FROM table_dietician tds WHERE LOWER(tds.email) = LOWER(rs.attributed_user_id) AND tds.name LIKE ?))`;
 
 // null when the caller did not ask for a page (every row).
 function parsePaging(body) {
@@ -65,9 +90,13 @@ async function countRows(fromWhere, params) {
 // facilityId null = every facility in scope. parentEmail set (trainer admin)
 // limits rows to facilities under that parent, as list-facilities does. Rows
 // join facilities so the "all" list counts exactly what the totals count.
-async function trainers(facilityId, parentEmail, paging) {
-  const params = [...(facilityId ? [facilityId] : []), ...(parentEmail ? [parentEmail] : [])];
-  const where = `WHERE aur.role = 'trainer' AND aur.status = 'active' ${facilityId ? "AND aur.facility_id = ?" : ""} ${parentEmail ? "AND LOWER(f.parent_admin_user_id) = ?" : ""}`;
+async function trainers(facilityId, parentEmail, paging, search) {
+  const params = [
+    ...(facilityId ? [facilityId] : []),
+    ...(parentEmail ? [parentEmail] : []),
+    ...(search ? Array(5).fill(like(search)) : []),
+  ];
+  const where = `WHERE aur.role = 'trainer' AND aur.status = 'active' ${facilityId ? "AND aur.facility_id = ?" : ""} ${parentEmail ? "AND LOWER(f.parent_admin_user_id) = ?" : ""} ${search ? `AND ${TRAINER_SEARCH_SQL}` : ""}`;
   const fromWhere = `
       FROM app_user_roles aur
       INNER JOIN facilities f ON f.id = aur.facility_id
@@ -107,9 +136,13 @@ async function trainers(facilityId, parentEmail, paging) {
   return { items, total };
 }
 
-async function members(facilityId, parentEmail, paging) {
-  const params = [...(facilityId ? [facilityId] : []), ...(parentEmail ? [parentEmail] : [])];
-  const where = `WHERE rs.status IN ('active','trialing','past_due') ${facilityId ? "AND rs.facility_id = ?" : ""} ${parentEmail ? "AND LOWER(f.parent_admin_user_id) = ?" : ""}`;
+async function members(facilityId, parentEmail, paging, search) {
+  const params = [
+    ...(facilityId ? [facilityId] : []),
+    ...(parentEmail ? [parentEmail] : []),
+    ...(search ? Array(6).fill(like(search)) : []),
+  ];
+  const where = `WHERE rs.status IN ('active','trialing','past_due') ${facilityId ? "AND rs.facility_id = ?" : ""} ${parentEmail ? "AND LOWER(f.parent_admin_user_id) = ?" : ""} ${search ? `AND ${MEMBER_SEARCH_SQL}` : ""}`;
   const fromWhere = `
       FROM referral_subscriptions rs
       INNER JOIN facilities f ON f.id = rs.facility_id
@@ -182,6 +215,10 @@ const superAdminFacilityPeople = async (req, res) => {
     if (view !== "trainers" && view !== "members") {
       return res.status(422).json({ status: false, ok: false, message: "view must be trainers or members" });
     }
+    const search = parseSearch(body);
+    if (search && search.length < SEARCH_MIN_LENGTH) {
+      return res.status(422).json({ status: false, ok: false, message: `search must be at least ${SEARCH_MIN_LENGTH} characters` });
+    }
 
     let facility = null;
     if (!allFacilities) {
@@ -193,7 +230,8 @@ const superAdminFacilityPeople = async (req, res) => {
     }
 
     const paging = parsePaging(body);
-    const { items, total } = view === "trainers" ? await trainers(facilityId, parentEmail, paging) : await members(facilityId, parentEmail, paging);
+    const { items, total } =
+      view === "trainers" ? await trainers(facilityId, parentEmail, paging, search) : await members(facilityId, parentEmail, paging, search);
 
     await H.writeAuthLogSafe(req, {
       eventType: "super_admin_facility_people_viewed",
@@ -210,6 +248,7 @@ const superAdminFacilityPeople = async (req, res) => {
       ok: true,
       view,
       facility: facility ? { id: Number(facility.id), name: facility.name, partner_code: facility.partner_code } : null,
+      search,
       items,
       total,
       ...(paging && {
