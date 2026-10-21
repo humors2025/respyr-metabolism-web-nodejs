@@ -17,7 +17,10 @@
  * Body: { search?, page?, limit?,
  *         status? ("all" | open | paid | failed | refunded | partially_refunded),
  *         type? ("all" | first_payment | renewal),
- *         code? ("all" | one of the `sources` codes) }
+ *         code? ("all" | one of the `sources` codes),
+ *         date_from?, date_to? (YYYY-MM-DD, inclusive, viewer's calendar; either
+ *           may be left out), tz_offset_minutes? (viewer's minutes ahead of UTC) }
+ *   The date is the payment date (paid_at, or created_at for unpaid invoices).
  *
  * Response: { payments: [ { id, date, customer: { name, email }, partner_code,
  *               referred_by: { kind: "facility" | "trainer", name, user_id, status } | null,
@@ -25,7 +28,7 @@
  *               amount_paid, amount_refunded, status, failure_message,
  *               plan: { subscription_status, current_period_start, current_period_end, canceled_at } } ],
  *             summary: [ { status, currency, count, amount_paid, amount_refunded } ]
- *               (every payment of this type and code, ignoring status and search),
+ *               (every payment of this type, code and date range, ignoring status and search),
  *             sources: [ { code, kind, name, user_id, status } ], status_options, filters, pagination }
  */
 
@@ -34,6 +37,47 @@ const { _helpers: H } = require("./admin-invite-trainer");
 const { _helpers: O } = require("./super-admin-orders");
 
 const OWN_CODE_NAME = "Facility QR (direct)";
+const YMD = /^\d{4}-\d{2}-\d{2}$/;
+
+const pad = (n) => String(n).padStart(2, "0");
+
+function fmtUtc(ms) {
+  const d = new Date(ms);
+  return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`;
+}
+
+// Midnight UTC of a YYYY-MM-DD day; 422 when it is not a real date.
+function dayMs(ymd, field) {
+  if (!YMD.test(ymd)) throw O.httpError(422, `${field} must be YYYY-MM-DD`);
+  const [y, m, d] = ymd.split("-").map(Number);
+  const ms = Date.UTC(y, m - 1, d);
+  if (fmtUtc(ms).slice(0, 10) !== ymd) throw O.httpError(422, `${field} is not a valid date`);
+  return ms;
+}
+
+// date_from / date_to (inclusive days in the viewer's calendar) → a UTC
+// window [startUtc, endUtc) on the payment date. Same convention as Sales
+// Analytics (super-admin-sales-analytics parsePeriod), but either end may be open.
+function parseDateRange(body) {
+  const dateFrom = String(body.date_from || "").trim() || null;
+  const dateTo = String(body.date_to || "").trim() || null;
+  const offset = body.tz_offset_minutes == null || body.tz_offset_minutes === "" ? 0 : Number(body.tz_offset_minutes);
+  if (!Number.isInteger(offset) || offset < -840 || offset > 840) {
+    throw O.httpError(422, "tz_offset_minutes must be an integer between -840 and 840");
+  }
+  const start = dateFrom ? dayMs(dateFrom, "date_from") : null;
+  const end = dateTo ? dayMs(dateTo, "date_to") + 86400000 : null;
+  if (start != null && end != null && end <= start) {
+    throw O.httpError(422, "The end date must be on or after the start date");
+  }
+  return {
+    dateFrom,
+    dateTo,
+    offset,
+    startUtc: start == null ? null : fmtUtc(start - offset * 60000),
+    endUtc: end == null ? null : fmtUtc(end - offset * 60000),
+  };
+}
 
 // Codes whose sales belong to this facility admin, own code first.
 async function facilitySources(actor, actorEmail) {
@@ -80,18 +124,36 @@ async function payments(body, sources) {
   const allCodes = sources.map((s) => s.code);
   if (code && !allCodes.includes(code)) throw O.httpError(422, "code must be all or one of your facility's codes");
   const codes = code ? [code] : allCodes;
+  const range = parseDateRange(body);
 
-  const filters = { status, type, code: code || "all", search, search_min_length: O.SEARCH_MIN_LENGTH };
+  const filters = {
+    status,
+    type,
+    code: code || "all",
+    date_from: range.dateFrom,
+    date_to: range.dateTo,
+    tz_offset_minutes: range.offset,
+    search,
+    search_min_length: O.SEARCH_MIN_LENGTH,
+  };
   const pagination = (total) => ({ page, limit, total, total_pages: Math.max(1, Math.ceil(total / limit)) });
   const base = { filters, sources, status_options: O.PAYMENT_STATUSES };
   if (!codes.length) return { ...base, payments: [], summary: [], pagination: pagination(0) };
 
-  // The facility's codes, and the type and code filters: list and summary chips.
+  // The facility's codes, and the type, code and date filters: list and summary chips.
   const scope = ["UPPER(rs.attributed_partner_code) IN (?)"];
   const scopeParams = [codes];
   if (billingReason) {
     scope.push("pt.billing_reason = ?");
     scopeParams.push(billingReason);
+  }
+  if (range.startUtc) {
+    scope.push("COALESCE(pt.paid_at, pt.created_at) >= ?");
+    scopeParams.push(range.startUtc);
+  }
+  if (range.endUtc) {
+    scope.push("COALESCE(pt.paid_at, pt.created_at) < ?");
+    scopeParams.push(range.endUtc);
   }
 
   const where = [...scope];
