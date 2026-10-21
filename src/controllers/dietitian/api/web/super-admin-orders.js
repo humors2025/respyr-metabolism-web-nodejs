@@ -484,4 +484,19 @@ const superAdminOrders = async (req, res) => {
   }
 };
 
-module.exports = { superAdminOrders };
+module.exports = {
+  superAdminOrders,
+  // Shared with facility-admin-payments.js (a facility admin's own payments).
+  _helpers: {
+    SEARCH_MIN_LENGTH,
+    PAYMENT_STATUSES,
+    PAYMENT_TYPES,
+    minorToMajor,
+    toIso,
+    deriveSubscriptionStatus,
+    httpError,
+    parsePaging,
+    parseSearch,
+    like,
+  },
+};
