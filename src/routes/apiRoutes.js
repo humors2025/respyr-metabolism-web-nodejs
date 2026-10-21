@@ -327,6 +327,7 @@ const {
 } = require("../controllers/dietitian/api/web/commission-ops");
 const { superAdminSalesAnalytics } = require("../controllers/dietitian/api/web/super-admin-sales-analytics");
 const { superAdminOrders } = require("../controllers/dietitian/api/web/super-admin-orders");
+const { facilityAdminPayments } = require("../controllers/dietitian/api/web/facility-admin-payments");
 const { superAdminTestCodes } = require("../controllers/dietitian/api/web/super-admin-test-codes");
 const { cancelOrderSubscription } = require("../controllers/dietitian/api/web/cancel-order-subscription");
 const { simulateRenewal } = require("../controllers/dietitian/api/web/simulate-renewal");
@@ -1079,6 +1080,7 @@ router.post("/dietitian/api/web/list-payouts", authMiddleware, listPayouts);
 router.post("/dietitian/api/web/commission-overview", authMiddleware, commissionOverview);
 router.post("/dietitian/api/web/super-admin-sales-analytics", authMiddleware, superAdminSalesAnalytics);
 router.post("/dietitian/api/web/super-admin-orders", authMiddleware, superAdminOrders);
+router.post("/dietitian/api/web/facility-admin-payments", authMiddleware, facilityAdminPayments);
 // Test codes are free memberships: locked behind their own Google Authenticator unlock.
 router.post("/dietitian/api/web/super-admin-test-codes", authMiddleware, requireTestCodesUnlock, superAdminTestCodes);
 router.post("/dietitian/api/web/cancel-order-subscription", authMiddleware, cancelOrderSubscription);
