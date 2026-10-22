@@ -28,6 +28,7 @@
 
 const pool = require("../../../../config/db");
 const { _helpers: H } = require("./admin-invite-trainer");
+const salesCrmMirror = require("../../../../services/salesCrmMirror");
 
 const ALLOWED_ROLES = ["super_admin", "admin"];
 const MAX_NAME = 150;
@@ -77,7 +78,7 @@ const updateFacility = async (req, res) => {
 
       const [rows] = await conn.execute(
         `
-          SELECT id, name, facility_admin_user_id, parent_admin_user_id
+          SELECT id, name, partner_code, facility_admin_user_id, parent_admin_user_id
           FROM facilities
           WHERE id = ?
           LIMIT 1
@@ -141,6 +142,19 @@ const updateFacility = async (req, res) => {
       }
 
       await conn.commit();
+
+      // Best-effort copy of the new name to sales_crm.facility_admins (update
+      // only: a facility the backfill never copied is not invented here).
+      if (name.value !== undefined && name.value !== facility.name && facility.partner_code) {
+        await salesCrmMirror.upsertFacilityAdmin(
+          {
+            partner_code: facility.partner_code,
+            user_id: String(facility.facility_admin_user_id || "").toLowerCase() || null,
+            facility_name: name.value,
+          },
+          { insertIfMissing: false }
+        );
+      }
 
       if (changes.length) {
         await H.writeAuthLogSafe(req, {

@@ -76,6 +76,10 @@ const {
   "../../../../utils/securityValidation"
 );
 
+const salesCrmMirror = require(
+  "../../../../services/salesCrmMirror"
+);
+
 /*
 |--------------------------------------------------------------------------
 | Constants
@@ -2085,6 +2089,27 @@ const acceptInvite =
         ]
       );
 
+      // The sticker bound to this invite (if the field flow was used), for
+      // the sales_crm copy written after commit.
+      const [
+        stickerRows,
+      ] = await conn.execute(
+        `
+          SELECT id
+          FROM qr_codes
+          WHERE invitation_id = ?
+          LIMIT 1
+        `,
+        [
+          invite.id,
+        ]
+      );
+
+      const stickerId =
+        stickerRows[0]
+          ?.id ||
+        null;
+
       /*
       |--------------------------------------------------------------------------
       | Mark invitation accepted
@@ -2224,6 +2249,59 @@ const acceptInvite =
 
       conn =
         null;
+
+      /*
+      |--------------------------------------------------------------------------
+      | Mirror the new gym owner into sales_crm (after commit: best-effort,
+      | never fails the acceptance — see services/salesCrmMirror.js)
+      |--------------------------------------------------------------------------
+      */
+
+      if (
+        role ===
+        "facility_admin"
+      ) {
+        await salesCrmMirror.upsertFacilityAdmin(
+          {
+            partner_code:
+              partnerCode,
+
+            user_id:
+              email,
+
+            first_name:
+              invite.invited_first_name ||
+              null,
+
+            last_name:
+              invite.invited_last_name ||
+              null,
+
+            phone:
+              invite.invited_phone ||
+              null,
+
+            facility_name:
+              invite.facility_name ||
+              null,
+
+            parent_user_id:
+              parentUserId,
+
+            status:
+              "active",
+
+            joined_at:
+              new Date()
+                .toISOString()
+                .slice(0, 19)
+                .replace("T", " "),
+
+            qr_code_id:
+              stickerId,
+          }
+        );
+      }
 
       /*
       |--------------------------------------------------------------------------
