@@ -1,11 +1,13 @@
 "use strict";
 
 /**
- * Mirror of Stripe data into the sales team's database (migrations run
- * against sales_crm):
+ * Mirror of Stripe and partner data into the sales team's database
+ * (migrations run against sales_crm):
  *   sales_crm.stripe_payments         (008)  one row per invoice, with the
  *                                     buyer's shipping address and phone (010)
  *   sales_crm.stripe_payout_accounts  (009)  one row per Connect payout account
+ *   sales_crm.facility_admins         (011)  one row per gym owner, keyed on
+ *                                     the FAC partner code
  *
  * Three ways to reach it, chosen by configuration (the first one set wins):
  *
@@ -45,6 +47,8 @@
  *                        checkout backfill
  *   upsertPayoutAccount  stripeConnectAccounts.upsertFromAccount, which runs
  *                        whenever partner_payout_accounts is written
+ *   upsertFacilityAdmin  accept-invite.js when a facility_admin invite is
+ *                        accepted, update-facility.js when the name is edited
  */
 
 const fs = require("fs");
@@ -189,6 +193,55 @@ const PAYOUT_UPDATE_SQL =
        .map((c) => (PAYOUT_KEEP_IF_NULL.has(c) ? `\`${c}\` = COALESCE(?, \`${c}\`)` : `\`${c}\` = ?`))
        .join(",\n     ")}
    WHERE \`stripe_account_id\` = ?`;
+
+// ── Facility admins (gym owners), one row per partner code ──────────────────
+
+const FACILITY_ADMIN_TABLE = SALES_CRM_DB ? `\`${SALES_CRM_DB}\`.\`facility_admins\`` : null;
+
+const FACILITY_ADMIN_COLUMNS = [
+  "partner_code",
+  "user_id",
+  "first_name",
+  "last_name",
+  "phone",
+  "facility_name",
+  "parent_user_id",
+  "status",
+  "joined_at",
+];
+
+// The owner's details come from the invitation and never arrive again, and a
+// facility-name edit posts only the fields it changed; anything the later call
+// leaves null keeps the value already stored.
+const FACILITY_ADMIN_KEEP_IF_NULL = new Set([
+  "user_id",
+  "first_name",
+  "last_name",
+  "phone",
+  "facility_name",
+  "parent_user_id",
+  "status",
+  "joined_at",
+]);
+
+const FACILITY_ADMIN_UPSERT_SQL =
+  FACILITY_ADMIN_TABLE &&
+  `INSERT INTO ${FACILITY_ADMIN_TABLE} (${FACILITY_ADMIN_COLUMNS.map((c) => `\`${c}\``).join(", ")})
+   VALUES (${FACILITY_ADMIN_COLUMNS.map(() => "?").join(", ")})
+   ON DUPLICATE KEY UPDATE
+     ${FACILITY_ADMIN_COLUMNS.filter((c) => c !== "partner_code")
+       .map((c) => (FACILITY_ADMIN_KEEP_IF_NULL.has(c) ? `\`${c}\` = COALESCE(VALUES(\`${c}\`), \`${c}\`)` : `\`${c}\` = VALUES(\`${c}\`)`))
+       .join(",\n     ")}`;
+
+// Same column rules, for a row that must already exist (no insert): a
+// facility-name edit must not invent an owner the backfill never copied.
+const FACILITY_ADMIN_UPDATE_SQL =
+  FACILITY_ADMIN_TABLE &&
+  `UPDATE ${FACILITY_ADMIN_TABLE} SET
+     ${FACILITY_ADMIN_COLUMNS.filter((c) => c !== "partner_code")
+       .map((c) => (FACILITY_ADMIN_KEEP_IF_NULL.has(c) ? `\`${c}\` = COALESCE(?, \`${c}\`)` : `\`${c}\` = ?`))
+       .join(",\n     ")}
+   WHERE \`partner_code\` = ?`;
 
 // ── Dedicated pool for a sales_crm that the main database does not share ────
 
@@ -377,6 +430,48 @@ async function upsertPayoutAccount(row, { insertIfMissing = true } = {}) {
   }
 }
 
+/**
+ * Write one facility admin row (keyed on partner_code). `row` uses the
+ * FACILITY_ADMIN_COLUMNS names; a missing status becomes 'active' when the
+ * row may be inserted (the column is NOT NULL).
+ * insertIfMissing = false only updates a row that is already there, so a
+ * facility-name edit cannot invent an owner the backfill never copied.
+ * Returns { ok, skipped?, reason? } and never throws.
+ */
+async function upsertFacilityAdmin(row, { insertIfMissing = true } = {}) {
+  const valueOf = (c) => {
+    if (c === "status" && insertIfMissing) return row.status || "active";
+    return row[c] === undefined ? null : row[c];
+  };
+  if (API_ON) {
+    const facilityAdmin = Object.fromEntries(FACILITY_ADMIN_COLUMNS.map((c) => [c, valueOf(c)]));
+    return postToApi(
+      "/v1/internal/facility-admins",
+      { facility_admin: facilityAdmin, insert_if_missing: insertIfMissing },
+      { partner_code: row?.partner_code }
+    );
+  }
+  if (!FACILITY_ADMIN_TABLE) return { ok: false, skipped: true, reason: "SALES_CRM_DB_NAME not set" };
+  try {
+    const values = FACILITY_ADMIN_COLUMNS.map(valueOf);
+    if (insertIfMissing) {
+      await executor().execute(FACILITY_ADMIN_UPSERT_SQL, values);
+    } else {
+      // UPDATE takes the key last instead of first.
+      await executor().execute(FACILITY_ADMIN_UPDATE_SQL, [...values.slice(1), values[0]]);
+    }
+    return { ok: true };
+  } catch (err) {
+    console.warn("SALES_CRM_MIRROR_FAILED:", {
+      partner_code: row?.partner_code,
+      mode: mode(),
+      code: err?.code,
+      message: err?.message,
+    });
+    return { ok: false, reason: err?.message || "mirror failed" };
+  }
+}
+
 // Once per cold start, so CloudWatch shows which way rows go (or that they
 // go nowhere) without waiting for a payment.
 if (SALES_CRM_API_URL && !API_URL_OK) {
@@ -386,4 +481,14 @@ if (SALES_CRM_API_URL && !API_URL_OK) {
 }
 console.log("sales_crm mirror:", { mode: mode(), ...(API_ON ? { url: SALES_CRM_API_URL } : {}) });
 
-module.exports = { upsertPayment, upsertPayoutAccount, isEnabled, mode, COLUMNS, SHIPPING_COLUMNS, PAYOUT_COLUMNS };
+module.exports = {
+  upsertPayment,
+  upsertPayoutAccount,
+  upsertFacilityAdmin,
+  isEnabled,
+  mode,
+  COLUMNS,
+  SHIPPING_COLUMNS,
+  PAYOUT_COLUMNS,
+  FACILITY_ADMIN_COLUMNS,
+};

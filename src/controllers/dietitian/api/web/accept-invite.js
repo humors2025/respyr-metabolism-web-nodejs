@@ -76,6 +76,10 @@ const {
   "../../../../utils/securityValidation"
 );
 
+const salesCrmMirror = require(
+  "../../../../services/salesCrmMirror"
+);
+
 /*
 |--------------------------------------------------------------------------
 | Constants
@@ -2224,6 +2228,56 @@ const acceptInvite =
 
       conn =
         null;
+
+      /*
+      |--------------------------------------------------------------------------
+      | Mirror the new gym owner into sales_crm (after commit: best-effort,
+      | never fails the acceptance — see services/salesCrmMirror.js)
+      |--------------------------------------------------------------------------
+      */
+
+      if (
+        role ===
+        "facility_admin"
+      ) {
+        await salesCrmMirror.upsertFacilityAdmin(
+          {
+            partner_code:
+              partnerCode,
+
+            user_id:
+              email,
+
+            first_name:
+              invite.invited_first_name ||
+              null,
+
+            last_name:
+              invite.invited_last_name ||
+              null,
+
+            phone:
+              invite.invited_phone ||
+              null,
+
+            facility_name:
+              invite.facility_name ||
+              null,
+
+            parent_user_id:
+              parentUserId,
+
+            status:
+              "active",
+
+            joined_at:
+              new Date()
+                .toISOString()
+                .slice(0, 19)
+                .replace("T", " "),
+          }
+        );
+      }
 
       /*
       |--------------------------------------------------------------------------
