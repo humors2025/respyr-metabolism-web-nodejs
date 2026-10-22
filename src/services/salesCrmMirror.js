@@ -208,6 +208,7 @@ const FACILITY_ADMIN_COLUMNS = [
   "parent_user_id",
   "status",
   "joined_at",
+  "qr_code_id",
 ];
 
 // The owner's details come from the invitation and never arrive again, and a
@@ -222,15 +223,25 @@ const FACILITY_ADMIN_KEEP_IF_NULL = new Set([
   "parent_user_id",
   "status",
   "joined_at",
+  "qr_code_id",
 ]);
+
+// qr_code_id follows the keep-if-null rule AND can be cleared by sending ''
+// (a sticker re-pointed at another gym stops showing on the old one).
+const faSet = (value) => (c) => {
+  if (c === "qr_code_id") return `\`${c}\` = NULLIF(COALESCE(${value(c)}, \`${c}\`), '')`;
+  return FACILITY_ADMIN_KEEP_IF_NULL.has(c)
+    ? `\`${c}\` = COALESCE(${value(c)}, \`${c}\`)`
+    : `\`${c}\` = ${value(c)}`;
+};
 
 const FACILITY_ADMIN_UPSERT_SQL =
   FACILITY_ADMIN_TABLE &&
   `INSERT INTO ${FACILITY_ADMIN_TABLE} (${FACILITY_ADMIN_COLUMNS.map((c) => `\`${c}\``).join(", ")})
-   VALUES (${FACILITY_ADMIN_COLUMNS.map(() => "?").join(", ")})
+   VALUES (${FACILITY_ADMIN_COLUMNS.map((c) => (c === "qr_code_id" ? "NULLIF(?, '')" : "?")).join(", ")})
    ON DUPLICATE KEY UPDATE
      ${FACILITY_ADMIN_COLUMNS.filter((c) => c !== "partner_code")
-       .map((c) => (FACILITY_ADMIN_KEEP_IF_NULL.has(c) ? `\`${c}\` = COALESCE(VALUES(\`${c}\`), \`${c}\`)` : `\`${c}\` = VALUES(\`${c}\`)`))
+       .map(faSet((c) => `VALUES(\`${c}\`)`))
        .join(",\n     ")}`;
 
 // Same column rules, for a row that must already exist (no insert): a
@@ -239,7 +250,7 @@ const FACILITY_ADMIN_UPDATE_SQL =
   FACILITY_ADMIN_TABLE &&
   `UPDATE ${FACILITY_ADMIN_TABLE} SET
      ${FACILITY_ADMIN_COLUMNS.filter((c) => c !== "partner_code")
-       .map((c) => (FACILITY_ADMIN_KEEP_IF_NULL.has(c) ? `\`${c}\` = COALESCE(?, \`${c}\`)` : `\`${c}\` = ?`))
+       .map(faSet(() => "?"))
        .join(",\n     ")}
    WHERE \`partner_code\` = ?`;
 

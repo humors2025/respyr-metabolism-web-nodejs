@@ -2089,6 +2089,27 @@ const acceptInvite =
         ]
       );
 
+      // The sticker bound to this invite (if the field flow was used), for
+      // the sales_crm copy written after commit.
+      const [
+        stickerRows,
+      ] = await conn.execute(
+        `
+          SELECT id
+          FROM qr_codes
+          WHERE invitation_id = ?
+          LIMIT 1
+        `,
+        [
+          invite.id,
+        ]
+      );
+
+      const stickerId =
+        stickerRows[0]
+          ?.id ||
+        null;
+
       /*
       |--------------------------------------------------------------------------
       | Mark invitation accepted
@@ -2275,6 +2296,9 @@ const acceptInvite =
                 .toISOString()
                 .slice(0, 19)
                 .replace("T", " "),
+
+            qr_code_id:
+              stickerId,
           }
         );
       }

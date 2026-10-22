@@ -28,6 +28,7 @@ const { requireStripe } = require("../../../../config/stripe");
 const { _helpers: H } = require("./admin-invite-trainer");
 const pricing = require("../../../../services/pricing");
 const qr = require("../../../../services/qrCodes");
+const salesCrmMirror = require("../../../../services/salesCrmMirror");
 const purchaseCodes = require("../../../../services/purchaseCodes");
 const { resolvePartnerCode, normalizeCode, HOUSE_TRAINER_CODE } = require("../../../../utils/partnerCodeResolver");
 const crypto = require("crypto");
@@ -421,7 +422,27 @@ const qrLink = guard(async (req, res) => {
       }
     }
   }
+  const before = await qr.get(id);
   const row = await qr.link({ id, target, actorUserId: a.actorEmail });
+
+  // Keep the sales team's copy pointing at the right sticker: the new gym
+  // gets this sticker id, and a gym it is re-pointed away from loses it
+  // ('' clears the column). Best-effort, update only.
+  const oldCode = String(before?.partner_code || "").toUpperCase();
+  const newCode = target ? String(target.partner_code).toUpperCase() : "";
+  if (target?.role === "facility_admin") {
+    await salesCrmMirror.upsertFacilityAdmin(
+      { partner_code: newCode, qr_code_id: id },
+      { insertIfMissing: false }
+    );
+  }
+  if (oldCode.startsWith("FAC") && oldCode !== newCode) {
+    await salesCrmMirror.upsertFacilityAdmin(
+      { partner_code: oldCode, qr_code_id: "" },
+      { insertIfMissing: false }
+    );
+  }
+
   await H.writeAuthLogSafe(req, { eventType: "qr_linked", userId: a.actorEmail, role: String(a.actor.role), partnerCode: null, identifier: id, success: true, failureReason: target ? `-> ${target.partner_code}` : "unlinked" });
   return res.status(200).json({ ok: true, qr: row });
 });
