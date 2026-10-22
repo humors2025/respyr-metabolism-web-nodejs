@@ -7,8 +7,10 @@
  *                actor's pending facility_admin invites.
  * super_admin -> every facility, plus every pending facility_admin invite.
  *
- * Each facility row carries the owner, trainer count, active subscriptions and
- * commission owed/paid to that facility's payees. No member data.
+ * Each facility row carries the owner, trainer count, active subscriptions,
+ * commission owed/paid to that facility's payees, and the id of the QR sticker
+ * currently pointed at its partner code (qr_code_id, null when none). No
+ * member data.
  *
  * Pagination is opt-in: send `page` and/or `limit` (1..100, default 10) to get
  * one page of facilities plus a `pagination` block. Without them every
@@ -103,7 +105,8 @@ const listFacilities = async (req, res) => {
           (SELECT COALESCE(SUM(ce.amount_minor),0) FROM commission_entries ce WHERE ce.facility_id = f.id AND ce.status = 'paid') AS paid_minor,
           (SELECT COUNT(*) FROM facility_edit_logs l WHERE l.facility_id = f.id) AS edits_count,
           (SELECT l.edited_by FROM facility_edit_logs l WHERE l.facility_id = f.id ORDER BY l.id DESC LIMIT 1) AS last_edited_by,
-          (SELECT l.edited_at FROM facility_edit_logs l WHERE l.facility_id = f.id ORDER BY l.id DESC LIMIT 1) AS last_edited_at
+          (SELECT l.edited_at FROM facility_edit_logs l WHERE l.facility_id = f.id ORDER BY l.id DESC LIMIT 1) AS last_edited_at,
+          (SELECT q.id FROM qr_codes q WHERE q.partner_code = f.partner_code AND q.status = 'assigned' ORDER BY q.linked_at DESC, q.id LIMIT 1) AS qr_code_id
         FROM facilities f
         LEFT JOIN table_dietician td ON LOWER(td.email) = LOWER(f.facility_admin_user_id)
         LEFT JOIN partner_payout_accounts ppa ON LOWER(ppa.user_id) = LOWER(f.facility_admin_user_id)
@@ -182,6 +185,7 @@ const listFacilities = async (req, res) => {
         id: Number(r.id),
         name: r.name,
         partner_code: r.partner_code,
+        qr_code_id: r.qr_code_id || null,
         status: r.status,
         created_at: toMysqlDateTime(r.created_at),
         owner_user_id: String(r.facility_admin_user_id).toLowerCase(),
