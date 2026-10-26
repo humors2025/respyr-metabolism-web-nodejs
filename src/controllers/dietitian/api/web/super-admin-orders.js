@@ -23,7 +23,7 @@
  *   view=upcoming_renewals
  *                  referral_subscriptions still set to renew (active or
  *                  trialing, not cancelled) whose current_period_end falls in
- *                  the next `days` days (default 7), soonest first. Each row
+ *                  the next `days` days (default 10), soonest first. Each row
  *                  carries the renewals paid so far and the last payment.
  *                  Super-admin test codes (test_… rows) are left out.
  *
@@ -38,10 +38,11 @@
  * Body: { view: "shipping" | "payments" | "upcoming_renewals", search?, page?, limit?,
  *         payments only: status? ("all" | open | paid | failed | refunded | partially_refunded),
  *                        type? ("all" | first_payment | renewal), paid_only? (boolean),
- *         upcoming_renewals only: days? (1-31, default 7) }
+ *         upcoming_renewals only: days? (1-31, default 10) }
  */
 
 const pool = require("../../../../config/db");
+const { requireStripe } = require("../../../../config/stripe");
 const { _helpers: H } = require("./admin-invite-trainer");
 const { trainerHierarchy } = require("./super-admin-sales-analytics");
 
@@ -52,7 +53,7 @@ const PAYMENT_STATUSES = ["open", "paid", "failed", "refunded", "partially_refun
 const PAID_STATUSES = ["paid", "partially_refunded", "refunded"];
 // Payment type filter -> Stripe invoice billing_reason.
 const PAYMENT_TYPES = { first_payment: "subscription_create", renewal: "subscription_cycle" };
-const UPCOMING_DAYS = 7;
+const UPCOMING_DAYS = 10;
 const UPCOMING_MAX_DAYS = 31;
 
 // Trainer admins (app_user_roles role "admin") who may also read orders.
@@ -395,11 +396,49 @@ async function upcomingRenewals(body) {
   const codeOf = (r) => String(r.attributed_partner_code || "").toUpperCase() || null;
   const facilities = await facilityByCode(rows, codeOf);
 
+  // What Stripe will actually bill next: the price minus whatever discounts
+  // are still on the subscription/schedule. The DB cannot know this (the
+  // pre-5-Oct schedule rewrite dropped referral coupons on some subs), so
+  // each row's next invoice is previewed. Best-effort: a Stripe hiccup
+  // leaves next_charge null and the page falls back to the plan price.
+  const nextCharge = new Map();
+  try {
+    const stripe = requireStripe();
+    const CHUNK = 8;
+    for (let i = 0; i < rows.length; i += CHUNK) {
+      await Promise.all(
+        rows.slice(i, i + CHUNK).map(async (r) => {
+          try {
+            const inv = await stripe.invoices.createPreview({ subscription: r.stripe_subscription_id });
+            const discountMinor = (inv.total_discount_amounts || []).reduce(
+              (sum, d) => sum + Number(d.amount || 0),
+              0
+            );
+            nextCharge.set(r.stripe_subscription_id, {
+              amount_minor: Number(inv.amount_due ?? inv.total ?? 0),
+              discount_minor: discountMinor,
+              currency: String(inv.currency || r.currency || "usd").toUpperCase(),
+            });
+          } catch (err) {
+            console.warn("UPCOMING_RENEWAL_PREVIEW_FAILED:", {
+              sub: r.stripe_subscription_id,
+              code: err?.code,
+              message: err?.message,
+            });
+          }
+        })
+      );
+    }
+  } catch {
+    // No Stripe key configured: every next_charge stays null.
+  }
+
   const now = Date.now();
   return {
     filters: { days, search, search_min_length: SEARCH_MIN_LENGTH },
     upcoming: rows.map((r) => {
       const h = history.get(r.stripe_subscription_id) || { renewals: 0, last: null };
+      const nc = nextCharge.get(r.stripe_subscription_id) || null;
       return {
         id: Number(r.id),
         renews_at: toIso(r.current_period_end),
@@ -418,6 +457,15 @@ async function upcomingRenewals(body) {
             }
           : null,
         plan_price: { amount: minorToMajor(r.unit_amount_minor), currency: r.currency },
+        // The amount Stripe will charge at renews_at, discounts included
+        // (previewed above); null when the preview was unavailable.
+        next_charge: nc
+          ? {
+              amount: minorToMajor(nc.amount_minor),
+              discount: minorToMajor(nc.discount_minor),
+              currency: nc.currency,
+            }
+          : null,
         subscription_status: deriveSubscriptionStatus(r, now),
         stripe_status: r.subscription_status || null,
         current_period_start: toIso(r.current_period_start),
