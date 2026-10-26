@@ -361,7 +361,8 @@ async function upcomingRenewals(body) {
   const [rows] = await pool.query(
     `
       SELECT
-        rs.id, rs.stripe_subscription_id, rs.purchaser_email, rs.purchaser_name, rs.attributed_partner_code,
+        rs.id, rs.stripe_subscription_id, rs.purchaser_email, rs.purchaser_name, rs.profile_id,
+        rs.attributed_partner_code,
         rs.status AS subscription_status, rs.current_period_start, rs.current_period_end, rs.canceled_at,
         rs.currency, rs.unit_amount_minor, rs.created_at AS purchased_at
       FROM referral_subscriptions rs
@@ -442,7 +443,12 @@ async function upcomingRenewals(body) {
       return {
         id: Number(r.id),
         renews_at: toIso(r.current_period_end),
-        customer: { name: r.purchaser_name || null, email: r.purchaser_email || null },
+        customer: {
+          name: r.purchaser_name || null,
+          email: r.purchaser_email || null,
+          // The linked app profile (null until the buyer redeems their code).
+          profile_id: r.profile_id || null,
+        },
         partner_code: r.attributed_partner_code || null,
         facility: (codeOf(r) && facilities.get(codeOf(r))) || null,
         purchased_at: toIso(r.purchased_at),
