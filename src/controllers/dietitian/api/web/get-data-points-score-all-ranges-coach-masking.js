@@ -805,6 +805,29 @@ const getDataPointsScoreAllRangesCoachMasking = async (req, res) => {
     );
 
     if (!testRows.length) {
+      // A client with no tests at all is not an error for the dashboard:
+      // return the profile shell (details + habits) so the client page can
+      // still render Habits Analysis / Weight Tracking before the first test.
+      if (totalTestTaken === 0) {
+        writeAuthLogSafe(req, {
+          eventType: "coach_data_points_viewed",
+          userId: actorEmail,
+          role: actorRole,
+          partnerCode: actorCode,
+          identifier: auditIdentifier,
+          success: true,
+          failureReason: "Viewed masked coach profile (no tests yet)",
+        });
+
+        return sendResponse(res, 200, true, "Profile fetched successfully (no tests yet)", {
+          total_test_taken: 0,
+          has_test_data: false,
+          profile_details: profileDetails,
+          user_habits: userHabits,
+          selected_test: null,
+        });
+      }
+
       const noDataMessage = dateProvided
         ? "No data available for selected date"
         : "No data available";
