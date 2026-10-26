@@ -42,6 +42,7 @@
  */
 
 const pool = require("../../../../config/db");
+const { requireStripe } = require("../../../../config/stripe");
 const { _helpers: H } = require("./admin-invite-trainer");
 const { trainerHierarchy } = require("./super-admin-sales-analytics");
 
@@ -395,11 +396,49 @@ async function upcomingRenewals(body) {
   const codeOf = (r) => String(r.attributed_partner_code || "").toUpperCase() || null;
   const facilities = await facilityByCode(rows, codeOf);
 
+  // What Stripe will actually bill next: the price minus whatever discounts
+  // are still on the subscription/schedule. The DB cannot know this (the
+  // pre-5-Oct schedule rewrite dropped referral coupons on some subs), so
+  // each row's next invoice is previewed. Best-effort: a Stripe hiccup
+  // leaves next_charge null and the page falls back to the plan price.
+  const nextCharge = new Map();
+  try {
+    const stripe = requireStripe();
+    const CHUNK = 8;
+    for (let i = 0; i < rows.length; i += CHUNK) {
+      await Promise.all(
+        rows.slice(i, i + CHUNK).map(async (r) => {
+          try {
+            const inv = await stripe.invoices.createPreview({ subscription: r.stripe_subscription_id });
+            const discountMinor = (inv.total_discount_amounts || []).reduce(
+              (sum, d) => sum + Number(d.amount || 0),
+              0
+            );
+            nextCharge.set(r.stripe_subscription_id, {
+              amount_minor: Number(inv.amount_due ?? inv.total ?? 0),
+              discount_minor: discountMinor,
+              currency: String(inv.currency || r.currency || "usd").toUpperCase(),
+            });
+          } catch (err) {
+            console.warn("UPCOMING_RENEWAL_PREVIEW_FAILED:", {
+              sub: r.stripe_subscription_id,
+              code: err?.code,
+              message: err?.message,
+            });
+          }
+        })
+      );
+    }
+  } catch {
+    // No Stripe key configured: every next_charge stays null.
+  }
+
   const now = Date.now();
   return {
     filters: { days, search, search_min_length: SEARCH_MIN_LENGTH },
     upcoming: rows.map((r) => {
       const h = history.get(r.stripe_subscription_id) || { renewals: 0, last: null };
+      const nc = nextCharge.get(r.stripe_subscription_id) || null;
       return {
         id: Number(r.id),
         renews_at: toIso(r.current_period_end),
@@ -418,6 +457,15 @@ async function upcomingRenewals(body) {
             }
           : null,
         plan_price: { amount: minorToMajor(r.unit_amount_minor), currency: r.currency },
+        // The amount Stripe will charge at renews_at, discounts included
+        // (previewed above); null when the preview was unavailable.
+        next_charge: nc
+          ? {
+              amount: minorToMajor(nc.amount_minor),
+              discount: minorToMajor(nc.discount_minor),
+              currency: nc.currency,
+            }
+          : null,
         subscription_status: deriveSubscriptionStatus(r, now),
         stripe_status: r.subscription_status || null,
         current_period_start: toIso(r.current_period_start),
