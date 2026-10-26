@@ -333,6 +333,7 @@ const { cancelOrderSubscription } = require("../controllers/dietitian/api/web/ca
 const { simulateRenewal } = require("../controllers/dietitian/api/web/simulate-renewal");
 const { restoreSubscriptionDiscount } = require("../controllers/dietitian/api/web/restore-subscription-discount");
 const { superAdminFacilityPeople } = require("../controllers/dietitian/api/web/super-admin-facility-people");
+const { superAdminViewAsList, superAdminViewAsStart } = require("../controllers/dietitian/api/web/super-admin-view-as");
 
 
 const {
@@ -900,6 +901,20 @@ router.post(
   "/dietitian/api/web/super-admin-all-clients-overview",
   authMiddleware,
   superAdminAllClientsOverview
+);
+
+// Super-admin "View as": list viewable users / mint a read-only token that
+// carries another user's identity. Both super_admin only (controller enforces).
+router.post(
+  "/dietitian/api/web/super-admin-view-as-list",
+  authMiddleware,
+  superAdminViewAsList
+);
+
+router.post(
+  "/dietitian/api/web/super-admin-view-as",
+  authMiddleware,
+  superAdminViewAsStart
 );
 
 

@@ -108,7 +108,11 @@ async function writeAccessLog(req, res) {
       authLogHash(getUserAgent(req)),
       user?.sid ? authLogHash(String(user.sid)) : null,
       res.statusCode < 400 ? 1 : 0,
-      res.statusCode < 400 ? null : `HTTP ${res.statusCode}`,
+      // Reads made through a super-admin "View as" session run under the
+      // TARGET's identity (user_id/role above) — name the real actor here.
+      res.statusCode < 400
+        ? (user?.impersonated_by ? `view-as by ${String(user.impersonated_by).slice(0, 180)}` : null)
+        : `HTTP ${res.statusCode}${user?.impersonated_by ? ` (view-as by ${String(user.impersonated_by).slice(0, 150)})` : ""}`,
     ]
   );
 }

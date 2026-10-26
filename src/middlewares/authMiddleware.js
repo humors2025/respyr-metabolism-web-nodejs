@@ -243,7 +243,57 @@ module.exports = async (req, res, next) => {
 
   /*
   |--------------------------------------------------------------------------
-  | Step 4: Authentication successful
+  | Step 4: View-only (super-admin "View as") sessions may not mutate
+  |--------------------------------------------------------------------------
+  |
+  | Tokens minted by super-admin-view-as carry view_only: true. They read
+  | everything the impersonated user reads, but any endpoint that writes is
+  | refused. Matching is by path keyword — every mutating route in
+  | apiRoutes.js contains one of these fragments, while the read routes
+  | (get_*, list-*, *-status, weight-tracking, habits/tracking-data, …)
+  | contain none. /auth/logout stays allowed so the view session can be
+  | revoked. False positives only ever block a read inside a view-as
+  | session, never a real user.
+  |--------------------------------------------------------------------------
+  */
+
+  if (decoded.view_only === true) {
+    const path = String(req.originalUrl || req.path || '').split('?')[0];
+
+    const WRITE_PATTERN = new RegExp(
+      [
+        'update', 'delete', 'remove', 'revoke', 'resend', 'cancel',
+        'approve', 'extend', 'assign', 'setup', 'generate', 'create',
+        'store', 'reset', 'save', 'upload', 'redeem', 'simulate',
+        'restore', 'change', 'password', 'mfa', 'checkout', 'custom-meal',
+        'complete1', 'invite-trainer', 'invite-admin', 'invite-facility',
+        'send_trainer_client_invite', 'send_diatitian_otp',
+        'lock-request', 'lock-verify',
+        'run-payouts', 'run-breath-credits',
+        'set-pricing', 'set-commission-rate', 'set-trainer-commission-split',
+        'habits/add', 'habits/track-batch', 'selected-habits/track',
+        'selected-habits/save', 'level-type',
+        // Stripe Connect links act on the target's Stripe account (onboarding
+        // writes state; the dashboard link logs into their Express account).
+        'stripe-connect-onboarding-link', 'stripe-connect-dashboard-link',
+        'qr-link',
+      ].join('|'),
+      'i'
+    );
+
+    if (WRITE_PATTERN.test(path) && !path.endsWith('/auth/logout')) {
+      return res.status(403).json({
+        status: false,
+        ok: false,
+        view_only: true,
+        message: 'This is a view-only session — changes are disabled',
+      });
+    }
+  }
+
+  /*
+  |--------------------------------------------------------------------------
+  | Step 5: Authentication successful
   |--------------------------------------------------------------------------
   */
 
