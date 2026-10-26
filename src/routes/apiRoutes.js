@@ -310,8 +310,9 @@ const {
   setCommissionRate,
 } = require("../controllers/dietitian/api/web/commission-rate");
 const settingsLock = require("../controllers/dietitian/api/web/settings-lock");
-const { requireSettingsUnlock, requireTestCodesUnlock } = require("../services/settingsLock");
+const { requireSettingsUnlock, requireTestCodesUnlock, requireViewAsUnlock } = require("../services/settingsLock");
 const testCodesLock = require("../controllers/dietitian/api/web/test-codes-lock");
+const viewAsLock = require("../controllers/dietitian/api/web/view-as-lock");
 
 const { earningsSummary } = require("../controllers/dietitian/api/web/earnings-summary");
 const referralOps = require("../controllers/dietitian/api/web/referral-ops");
@@ -904,18 +905,30 @@ router.post(
 );
 
 // Super-admin "View as": list viewable users / mint a read-only token that
-// carries another user's identity. Both super_admin only (controller enforces).
+// carries another user's identity. Both super_admin only (controller enforces)
+// and behind their own Google Authenticator gate (view-as-lock.js):
+// locked -> 403 VIEW_AS_LOCKED.
 router.post(
   "/dietitian/api/web/super-admin-view-as-list",
   authMiddleware,
+  requireViewAsUnlock,
   superAdminViewAsList
 );
 
 router.post(
   "/dietitian/api/web/super-admin-view-as",
   authMiddleware,
+  requireViewAsUnlock,
   superAdminViewAsStart
 );
+
+// View as Google Authenticator gate: its own authenticator, APIs and unlock (view-as-lock.js).
+router.post("/dietitian/api/web/view-as-lock-status", authMiddleware, viewAsLock.viewAsLockStatus);
+router.post("/dietitian/api/web/view-as-lock-request", authMiddleware, viewAsLock.viewAsLockRequest);
+router.post("/dietitian/api/web/view-as-lock-verify", authMiddleware, settingsLock.settingsCodeRateLimiter, viewAsLock.viewAsLockVerify);
+router.post("/dietitian/api/web/view-as-mfa-setup", authMiddleware, viewAsLock.viewAsMfaSetup);
+router.post("/dietitian/api/web/view-as-mfa-confirm", authMiddleware, settingsLock.settingsCodeRateLimiter, viewAsLock.viewAsMfaConfirm);
+router.post("/dietitian/api/web/view-as-mfa-verify", authMiddleware, settingsLock.settingsCodeRateLimiter, viewAsLock.viewAsMfaVerify);
 
 
 router.post(
