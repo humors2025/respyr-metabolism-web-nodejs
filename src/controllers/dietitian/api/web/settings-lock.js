@@ -77,7 +77,7 @@ const settingsCodeRateLimiter = rateLimit({
  * lockedCode is the 403 code its guarded routes answer with.
  */
 function lockHandlers(area, lockedCode) {
-  const errorTag = area === "settings" ? "SETTINGS_LOCK_ERROR" : "TEST_CODES_LOCK_ERROR";
+  const errorTag = `${String(area).toUpperCase()}_LOCK_ERROR`;
   const g = (fn) => guard(fn, errorTag);
   const alreadyEnrolled = (res) =>
     res.status(409).json({ ok: false, code: "MFA_ENROLLED", message: "Google Authenticator is already set up. Use the code from the app." });

@@ -97,6 +97,15 @@ const AREAS = {
     issuer: process.env.TEST_CODES_MFA_ISSUER || "",
     defaultIssuer: "Rysflo Test codes",
   },
+  view_as: {
+    label: "View as",
+    where: "Super Admin › View as (read-only impersonation)",
+    otpPrefix: "va", otpPurpose: "view_as_otp",
+    unlockPrefix: "vu", unlockPurpose: "view_as_unlock",
+    mfaPrefix: "va:",
+    issuer: process.env.VIEW_AS_MFA_ISSUER || "",
+    defaultIssuer: "Rysflo View as",
+  },
 };
 const areaOf = (area) => {
   const a = AREAS[area];
@@ -609,6 +618,8 @@ function requireUnlock(area, code) {
 const requireSettingsUnlock = requireUnlock("settings", "SETTINGS_LOCKED");
 /** super-admin-test-codes (list and generate). */
 const requireTestCodesUnlock = requireUnlock("test_codes", "TEST_CODES_LOCKED");
+/** super-admin-view-as-list and super-admin-view-as (impersonation). */
+const requireViewAsUnlock = requireUnlock("view_as", "VIEW_AS_LOCKED");
 
 module.exports = {
   maskEmail,
@@ -626,6 +637,7 @@ module.exports = {
   sidOf,
   requireSettingsUnlock,
   requireTestCodesUnlock,
+  requireViewAsUnlock,
   // exposed for tests
   _totp: { base32Encode, base32Decode, hotp, matchTotp, totpDriftSteps, encryptSecret, decryptSecret },
 };
