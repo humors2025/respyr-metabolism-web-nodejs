@@ -23,7 +23,7 @@
  *   view=upcoming_renewals
  *                  referral_subscriptions still set to renew (active or
  *                  trialing, not cancelled) whose current_period_end falls in
- *                  the next `days` days (default 7), soonest first. Each row
+ *                  the next `days` days (default 10), soonest first. Each row
  *                  carries the renewals paid so far and the last payment.
  *                  Super-admin test codes (test_… rows) are left out.
  *
@@ -38,7 +38,7 @@
  * Body: { view: "shipping" | "payments" | "upcoming_renewals", search?, page?, limit?,
  *         payments only: status? ("all" | open | paid | failed | refunded | partially_refunded),
  *                        type? ("all" | first_payment | renewal), paid_only? (boolean),
- *         upcoming_renewals only: days? (1-31, default 7) }
+ *         upcoming_renewals only: days? (1-31, default 10) }
  */
 
 const pool = require("../../../../config/db");
@@ -52,7 +52,7 @@ const PAYMENT_STATUSES = ["open", "paid", "failed", "refunded", "partially_refun
 const PAID_STATUSES = ["paid", "partially_refunded", "refunded"];
 // Payment type filter -> Stripe invoice billing_reason.
 const PAYMENT_TYPES = { first_payment: "subscription_create", renewal: "subscription_cycle" };
-const UPCOMING_DAYS = 7;
+const UPCOMING_DAYS = 10;
 const UPCOMING_MAX_DAYS = 31;
 
 // Trainer admins (app_user_roles role "admin") who may also read orders.
