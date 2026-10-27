@@ -392,8 +392,9 @@ async function upcomingRenewals(body) {
       [subIds, PAID_STATUSES]
     );
     for (const p of paid) {
-      const h = history.get(p.stripe_subscription_id) || { renewals: 0, last: null };
+      const h = history.get(p.stripe_subscription_id) || { renewals: 0, last: null, first: null };
       if (p.billing_reason === "subscription_cycle") h.renewals += 1;
+      if (p.billing_reason === "subscription_create" && !h.first) h.first = p;
       h.last = p;
       history.set(p.stripe_subscription_id, h);
     }
@@ -443,8 +444,17 @@ async function upcomingRenewals(body) {
   return {
     filters: { days, search, search_min_length: SEARCH_MIN_LENGTH },
     upcoming: rows.map((r) => {
-      const h = history.get(r.stripe_subscription_id) || { renewals: 0, last: null };
+      const h = history.get(r.stripe_subscription_id) || { renewals: 0, last: null, first: null };
       const nc = nextCharge.get(r.stripe_subscription_id) || null;
+      // The price the member is entitled to renew at: a partner-code purchase
+      // keeps its referred (discounted) price — what they paid on day one —
+      // while a no-code purchase renews at list price.
+      const discounted = Boolean(r.attributed_partner_code && h.first);
+      const expected = discounted
+        ? { amount_minor: Number(h.first.amount_paid_minor), currency: h.first.currency || r.currency }
+        : r.unit_amount_minor != null
+          ? { amount_minor: Number(r.unit_amount_minor), currency: r.currency }
+          : null;
       return {
         id: Number(r.id),
         renews_at: toIso(r.current_period_end),
@@ -468,6 +478,11 @@ async function upcomingRenewals(body) {
             }
           : null,
         plan_price: { amount: minorToMajor(r.unit_amount_minor), currency: r.currency },
+        // The entitled renewal price (see above); discounted says whether it
+        // is the partner-code referral price or plain list price.
+        expected_charge: expected
+          ? { amount: minorToMajor(expected.amount_minor), currency: expected.currency, discounted }
+          : null,
         // The amount Stripe will charge at renews_at, discounts included
         // (previewed above); null when the preview was unavailable.
         next_charge: nc
