@@ -256,7 +256,7 @@ async function payments(body) {
         pt.billing_reason, pt.period_start, pt.period_end, pt.amount_paid_minor, pt.amount_refunded_minor,
         pt.currency, pt.fee_minor, pt.net_minor, pt.status, pt.failure_message, pt.payment_method_type,
         pt.card_last4, pt.paid_at, pt.created_at,
-        rs.purchaser_email, rs.purchaser_name, rs.attributed_partner_code,
+        rs.purchaser_email, rs.purchaser_name, rs.profile_id, rs.attributed_partner_code,
         rs.status AS subscription_status, rs.current_period_start, rs.current_period_end, rs.canceled_at,
         -- Which renewal of its subscription this invoice is (rows are written
         -- in billing order, so earlier renewals have lower ids).
@@ -290,7 +290,12 @@ async function payments(body) {
     payments: rows.map((r) => ({
       id: Number(r.id),
       date: toIso(r.paid_at || r.created_at),
-      customer: { name: r.purchaser_name || null, email: r.purchaser_email || null },
+      customer: {
+        name: r.purchaser_name || null,
+        email: r.purchaser_email || null,
+        // The linked app profile (null until the buyer redeems their code).
+        profile_id: r.profile_id || null,
+      },
       partner_code: r.attributed_partner_code || null,
       facility: (codeOf(r) && facilities.get(codeOf(r))) || null,
       type: r.billing_reason === "subscription_create" ? "first_payment" : r.billing_reason === "subscription_cycle" ? "renewal" : r.billing_reason || null,
