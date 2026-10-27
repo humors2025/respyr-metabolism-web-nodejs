@@ -400,6 +400,31 @@ async function upcomingRenewals(body) {
     }
   }
 
+  // Breath tests taken per calendar month (current and previous, UTC) by the
+  // linked app profile. A purchase whose code is not redeemed yet has no
+  // profile, so no tests.
+  const monthKeyOf = (d) => d.toISOString().slice(0, 7);
+  const nowDate = new Date();
+  const curMonth = monthKeyOf(nowDate);
+  const prevMonth = monthKeyOf(new Date(Date.UTC(nowDate.getUTCFullYear(), nowDate.getUTCMonth() - 1, 1)));
+  const testsByProfile = new Map();
+  const profileIds = [...new Set(rows.map((r) => r.profile_id).filter(Boolean))];
+  if (profileIds.length) {
+    const [tests] = await pool.query(
+      `
+        SELECT profile_id,
+               SUM(DATE_FORMAT(date_time, '%Y-%m') = ?) AS cur_count,
+               SUM(DATE_FORMAT(date_time, '%Y-%m') = ?) AS prev_count,
+               COUNT(*) AS total_count
+        FROM table_test_data
+        WHERE profile_id IN (?)
+        GROUP BY profile_id
+      `,
+      [curMonth, prevMonth, profileIds]
+    );
+    for (const t of tests) testsByProfile.set(t.profile_id, t);
+  }
+
   const codeOf = (r) => String(r.attributed_partner_code || "").toUpperCase() || null;
   const facilities = await facilityByCode(rows, codeOf);
 
@@ -478,6 +503,13 @@ async function upcomingRenewals(body) {
             }
           : null,
         plan_price: { amount: minorToMajor(r.unit_amount_minor), currency: r.currency },
+        // Breath tests this month and last month (plus lifetime total), from
+        // the linked app profile; zeros when the code is not redeemed yet.
+        tests_monthly: [
+          { month: curMonth, count: Number(testsByProfile.get(r.profile_id)?.cur_count || 0) },
+          { month: prevMonth, count: Number(testsByProfile.get(r.profile_id)?.prev_count || 0) },
+        ],
+        total_test_taken: Number(testsByProfile.get(r.profile_id)?.total_count || 0),
         // The entitled renewal price (see above); discounted says whether it
         // is the partner-code referral price or plain list price.
         expected_charge: expected
