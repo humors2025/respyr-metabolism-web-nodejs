@@ -1,27 +1,28 @@
 "use strict";
 
 /**
- * Breath-test credit: every breath test a member records earns $0.20 off the
- * next month's invoice, capped at $6.00 per billing month. Only subscriptions
- * bought through a partner code earn the credit (rule of 28 Oct 2026; before
- * that it was $0.20 per reading-day for every subscription).
+ * Breath-test credit: every day a member records a reading earns $0.20 off
+ * the next month's invoice, capped at $6.00. A full month always earns the
+ * full $6.00 — so February (28 days) reaches the cap at 28 reading-days, and a
+ * 31-day month is capped at 30 reading-days' worth. Every subscription earns
+ * it, with or without a partner code.
  *
- * Mechanism: shortly before a subscription renews, count the member's breath
- * tests in the current billing period and post a negative Customer Balance
- * Transaction on the Stripe customer. Stripe applies the balance to the next
- * invoice automatically, so invoice.amount_paid — which the commission ledger
- * uses — is already net of the credit.
+ * Mechanism: shortly before a subscription renews, count the member's
+ * reading-days in the current billing period and post a negative Customer
+ * Balance Transaction on the Stripe customer. Stripe applies the balance to
+ * the next invoice automatically, so invoice.amount_paid — which the
+ * commission ledger uses — is already net of the credit.
  *
  * Idempotent: one breath_credits row per (subscription, period_start); the
- * Stripe call carries an idempotency key derived from the same pair. The
- * row's reading_days column holds the test count.
+ * Stripe call carries an idempotency key derived from the same pair.
  */
 
 const pool = require("../config/db");
 const {
   requireStripe,
-  BREATH_CREDIT_PER_TEST_MINOR,
+  BREATH_CREDIT_PER_DAY_MINOR,
   BREATH_CREDIT_CAP_MINOR,
+  BREATH_CREDIT_FULL_DAYS,
 } = require("../config/stripe");
 
 const RENEWAL_WINDOW_HOURS = 36;
@@ -35,9 +36,14 @@ function daysBetween(a, b) {
   return Math.max(1, Math.round((b.getTime() - a.getTime()) / 86400000));
 }
 
-/** Credit in minor units for `testCount` breath tests. Exported for tests. */
-function creditForTests(testCount) {
-  return Math.min(BREATH_CREDIT_CAP_MINOR, Math.max(0, testCount) * BREATH_CREDIT_PER_TEST_MINOR);
+/**
+ * Credit in minor units for `readingDays` in a period of `daysInPeriod` days.
+ * Exported for tests.
+ */
+function creditForReadingDays(readingDays, daysInPeriod) {
+  const fullMonthDays = Math.min(BREATH_CREDIT_FULL_DAYS, daysInPeriod);
+  if (readingDays >= fullMonthDays) return BREATH_CREDIT_CAP_MINOR;
+  return Math.min(BREATH_CREDIT_CAP_MINOR, Math.max(0, readingDays) * BREATH_CREDIT_PER_DAY_MINOR);
 }
 
 /** Link purchase code redemptions and unique email matches -> app profile. */
@@ -47,10 +53,10 @@ async function linkProfilesByEmail() {
   return r.by_purchase_code + r.by_email;
 }
 
-async function countTests(profileId, periodStart, periodEndExclusive) {
+async function countReadingDays(profileId, periodStart, periodEndExclusive) {
   const [rows] = await pool.execute(
     `
-      SELECT COUNT(*) AS tests
+      SELECT COUNT(DISTINCT DATE(date_time)) AS days
       FROM table_test_data
       WHERE profile_id = ?
         AND date_time >= ?
@@ -58,7 +64,7 @@ async function countTests(profileId, periodStart, periodEndExclusive) {
     `,
     [profileId, periodStart, periodEndExclusive]
   );
-  return Number(rows[0]?.tests || 0);
+  return Number(rows[0]?.days || 0);
 }
 
 /**
@@ -71,9 +77,8 @@ async function runBreathCredits({ now = new Date(), dryRun = false } = {}) {
 
   const windowEnd = new Date(now.getTime() + RENEWAL_WINDOW_HOURS * 3600000);
 
-  // Active partner-code subscriptions renewing inside the window (or already
-  // past the end because a run was missed) with no credit for this period yet.
-  // No-code purchases do not earn the credit.
+  // Active subscriptions renewing inside the window (or already past the end
+  // because a run was missed) that have no credit for this period yet.
   const [subs] = await pool.execute(
     `
       SELECT rs.id, rs.stripe_subscription_id, rs.stripe_customer_id, rs.profile_id,
@@ -84,8 +89,6 @@ async function runBreathCredits({ now = new Date(), dryRun = false } = {}) {
        AND bc.period_start = DATE(rs.current_period_start)
       WHERE rs.status IN ('active','past_due')
         AND LEFT(rs.stripe_subscription_id, 5) <> 'test_'
-        AND rs.attributed_partner_code IS NOT NULL
-        AND rs.attributed_partner_code <> ''
         AND rs.current_period_start IS NOT NULL
         AND rs.current_period_end   IS NOT NULL
         AND rs.current_period_end <= ?
@@ -108,19 +111,19 @@ async function runBreathCredits({ now = new Date(), dryRun = false } = {}) {
     const countUntil = new Date(Math.min(periodEnd.getTime(), now.getTime()));
     const daysInPeriod = daysBetween(periodStart, periodEnd);
 
-    const testCount = await countTests(
+    const readingDays = await countReadingDays(
       sub.profile_id,
       sub.current_period_start,
       countUntil.toISOString().slice(0, 19).replace("T", " ")
     );
-    const creditMinor = creditForTests(testCount);
+    const creditMinor = creditForReadingDays(readingDays, daysInPeriod);
 
     const item = {
       subscription: sub.stripe_subscription_id,
       profile_id: sub.profile_id,
       period: `${ymd(periodStart)}..${ymd(periodEnd)}`,
       days_in_period: daysInPeriod,
-      tests: testCount,
+      reading_days: readingDays,
       credit_minor: creditMinor,
     };
 
@@ -132,11 +135,11 @@ async function runBreathCredits({ now = new Date(), dryRun = false } = {}) {
           {
             amount: -creditMinor, // negative = credit to the customer
             currency: String(sub.currency || "usd").toLowerCase(),
-            description: `Rysflo breath credit: ${testCount} breath test${testCount === 1 ? "" : "s"} (${ymd(periodStart)} – ${ymd(periodEnd)})`,
+            description: `Rysflo breath credit: ${readingDays} reading day${readingDays === 1 ? "" : "s"} (${ymd(periodStart)} – ${ymd(periodEnd)})`,
             metadata: {
               stripe_subscription_id: sub.stripe_subscription_id,
               period_start: ymd(periodStart),
-              tests: String(testCount),
+              reading_days: String(readingDays),
             },
           },
           { idempotencyKey: `breath-credit-${sub.stripe_subscription_id}-${ymd(periodStart)}` }
@@ -157,7 +160,7 @@ async function runBreathCredits({ now = new Date(), dryRun = false } = {}) {
             sub.profile_id,
             ymd(periodStart),
             ymd(periodEnd),
-            testCount,
+            readingDays,
             daysInPeriod,
             creditMinor,
             txnId,
@@ -180,4 +183,4 @@ async function runBreathCredits({ now = new Date(), dryRun = false } = {}) {
   return summary;
 }
 
-module.exports = { runBreathCredits, creditForTests, linkProfilesByEmail };
+module.exports = { runBreathCredits, creditForReadingDays, linkProfilesByEmail };
