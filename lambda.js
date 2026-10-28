@@ -77,6 +77,20 @@ async function buildHandler() {
 
 module.exports.handler = async (event, context) => {
   context.callbackWaitsForEmptyEventLoop = false;
+
+  // EventBridge scheduled jobs invoke this same Lambda with a plain
+  // { "job": "breath-credits" | "payouts" } payload instead of an API
+  // Gateway HTTP event. Secrets must be hydrated before the tool is
+  // required, for the same module-load-time reason as the app itself.
+  const isHttpEvent = !!(event && (event.requestContext || event.httpMethod || event.rawPath || event.path));
+  if (!isHttpEvent && event && typeof event.job === "string") {
+    await hydrateSecrets();
+    const { handler: runJob } = require("./src/tools/run-commission-jobs");
+    const result = await runJob(event);
+    console.log("Scheduled job finished:", { job: event.job, ...result });
+    return result;
+  }
+
   if (!handlerPromise) {
     handlerPromise = buildHandler().catch((err) => {
       // Reset so the NEXT invocation retries hydration instead of the
