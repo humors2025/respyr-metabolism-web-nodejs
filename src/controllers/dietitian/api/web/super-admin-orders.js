@@ -43,6 +43,7 @@
 
 const pool = require("../../../../config/db");
 const { requireStripe } = require("../../../../config/stripe");
+const { creditForTests } = require("../../../../services/breathCredits");
 const { _helpers: H } = require("./admin-invite-trainer");
 const { trainerHierarchy } = require("./super-admin-sales-analytics");
 
@@ -425,6 +426,41 @@ async function upcomingRenewals(body) {
     for (const t of tests) testsByProfile.set(t.profile_id, t);
   }
 
+  // Projected breath credit on the next invoice: $0.20 per breath test taken
+  // so far in the current billing period, capped — partner-code purchases
+  // only, matching services/breathCredits.js (which posts the actual balance
+  // credit shortly before renewal). Null when the subscription earns none
+  // (no partner code, or the purchase code is not redeemed yet).
+  const breathCredits = new Map();
+  await Promise.all(
+    rows
+      .filter((r) => r.profile_id && String(r.attributed_partner_code || "").trim())
+      .map(async (r) => {
+        try {
+          const [[t]] = await pool.query(
+            `
+              SELECT COUNT(*) AS tests
+              FROM table_test_data
+              WHERE profile_id = ?
+                AND date_time >= ?
+                AND date_time <  LEAST(UTC_TIMESTAMP(), ?)
+            `,
+            [r.profile_id, r.current_period_start, r.current_period_end]
+          );
+          const testCount = Number(t?.tests || 0);
+          breathCredits.set(r.stripe_subscription_id, {
+            tests: testCount,
+            credit_minor: creditForTests(testCount),
+          });
+        } catch (err) {
+          console.warn("UPCOMING_RENEWAL_BREATH_CREDIT_FAILED:", {
+            sub: r.stripe_subscription_id,
+            message: err?.message,
+          });
+        }
+      })
+  );
+
   const codeOf = (r) => String(r.attributed_partner_code || "").toUpperCase() || null;
   const facilities = await facilityByCode(rows, codeOf);
 
@@ -471,6 +507,7 @@ async function upcomingRenewals(body) {
     upcoming: rows.map((r) => {
       const h = history.get(r.stripe_subscription_id) || { renewals: 0, last: null, first: null };
       const nc = nextCharge.get(r.stripe_subscription_id) || null;
+      const bc = breathCredits.get(r.stripe_subscription_id) || null;
       // The price the member is entitled to renew at: a partner-code purchase
       // keeps its referred (discounted) price — what they paid on day one —
       // while a no-code purchase renews at list price.
@@ -511,6 +548,12 @@ async function upcomingRenewals(body) {
           { month: prevMonth, count: Number(testsByProfile.get(r.profile_id)?.prev_count || 0) },
         ],
         total_test_taken: Number(testsByProfile.get(r.profile_id)?.total_count || 0),
+        // Projected breath credit on the coming renewal: tests so far in the
+        // current billing period × the per-test rate, capped. Null when the
+        // subscription earns none (no partner code / code not redeemed).
+        breath_credit: bc
+          ? { amount: minorToMajor(bc.credit_minor), currency: r.currency, tests: bc.tests }
+          : null,
         // The entitled renewal price (see above); discounted says whether it
         // is the partner-code referral price or plain list price.
         expected_charge: expected
