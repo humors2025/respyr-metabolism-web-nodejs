@@ -37,10 +37,11 @@ const ORDER_CANCEL_URL =
 
 const PLAN_CODE = "rysflo_monthly";
 
-// Breath-test credit rule (product decision, 12 Sep 2026; per-test and
-// partner-code-only since 28 Oct 2026).
-const BREATH_CREDIT_PER_TEST_MINOR = 20;  // $0.20 per breath test
+// Breath-test credit rule (product decision, 12 Sep 2026; briefly per-test
+// and partner-code-only on 28 Oct 2026, reverted the next day).
+const BREATH_CREDIT_PER_DAY_MINOR = 20;   // $0.20 per reading-day
 const BREATH_CREDIT_CAP_MINOR = 600;      // $6.00 per billing month
+const BREATH_CREDIT_FULL_DAYS = 30;       // a "full" month; Feb reaches the cap at 28
 
 const isLive = /^(sk|rk)_live_/.test(STRIPE_SECRET_KEY);
 
@@ -85,6 +86,7 @@ module.exports = {
   ORDER_SUCCESS_URL,
   ORDER_CANCEL_URL,
   PLAN_CODE,
-  BREATH_CREDIT_PER_TEST_MINOR,
+  BREATH_CREDIT_PER_DAY_MINOR,
   BREATH_CREDIT_CAP_MINOR,
+  BREATH_CREDIT_FULL_DAYS,
 };

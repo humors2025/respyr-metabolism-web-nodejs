@@ -43,7 +43,7 @@
 
 const pool = require("../../../../config/db");
 const { requireStripe } = require("../../../../config/stripe");
-const { creditForTests } = require("../../../../services/breathCredits");
+const { creditForReadingDays } = require("../../../../services/breathCredits");
 const { _helpers: H } = require("./admin-invite-trainer");
 const { trainerHierarchy } = require("./super-admin-sales-analytics");
 
@@ -426,20 +426,20 @@ async function upcomingRenewals(body) {
     for (const t of tests) testsByProfile.set(t.profile_id, t);
   }
 
-  // Projected breath credit on the next invoice: $0.20 per breath test taken
-  // so far in the current billing period, capped — partner-code purchases
-  // only, matching services/breathCredits.js (which posts the actual balance
-  // credit shortly before renewal). Null when the subscription earns none
-  // (no partner code, or the purchase code is not redeemed yet).
+  // Projected breath credit on the next invoice: $0.20 per reading-day so
+  // far in the current billing period, capped — every subscription with a
+  // linked app profile earns it, matching services/breathCredits.js (which
+  // posts the actual balance credit shortly before renewal). Null when the
+  // purchase code is not redeemed yet (no profile, so no readings).
   const breathCredits = new Map();
   await Promise.all(
     rows
-      .filter((r) => r.profile_id && String(r.attributed_partner_code || "").trim())
+      .filter((r) => r.profile_id)
       .map(async (r) => {
         try {
           const [[t]] = await pool.query(
             `
-              SELECT COUNT(*) AS tests
+              SELECT COUNT(DISTINCT DATE(date_time)) AS days
               FROM table_test_data
               WHERE profile_id = ?
                 AND date_time >= ?
@@ -447,10 +447,13 @@ async function upcomingRenewals(body) {
             `,
             [r.profile_id, r.current_period_start, r.current_period_end]
           );
-          const testCount = Number(t?.tests || 0);
+          const readingDays = Number(t?.days || 0);
+          const startMs = Date.parse(toIso(r.current_period_start));
+          const endMs = Date.parse(toIso(r.current_period_end));
+          const daysInPeriod = Math.max(1, Math.round((endMs - startMs) / 86400000));
           breathCredits.set(r.stripe_subscription_id, {
-            tests: testCount,
-            credit_minor: creditForTests(testCount),
+            days: readingDays,
+            credit_minor: creditForReadingDays(readingDays, daysInPeriod),
           });
         } catch (err) {
           console.warn("UPCOMING_RENEWAL_BREATH_CREDIT_FAILED:", {
@@ -548,11 +551,11 @@ async function upcomingRenewals(body) {
           { month: prevMonth, count: Number(testsByProfile.get(r.profile_id)?.prev_count || 0) },
         ],
         total_test_taken: Number(testsByProfile.get(r.profile_id)?.total_count || 0),
-        // Projected breath credit on the coming renewal: tests so far in the
-        // current billing period × the per-test rate, capped. Null when the
-        // subscription earns none (no partner code / code not redeemed).
+        // Projected breath credit on the coming renewal: reading-days so far
+        // in the current billing period × the per-day rate, capped. Null when
+        // the purchase code is not redeemed yet (no profile, no readings).
         breath_credit: bc
-          ? { amount: minorToMajor(bc.credit_minor), currency: r.currency, tests: bc.tests }
+          ? { amount: minorToMajor(bc.credit_minor), currency: r.currency, days: bc.days }
           : null,
         // The entitled renewal price (see above); discounted says whether it
         // is the partner-code referral price or plain list price.
