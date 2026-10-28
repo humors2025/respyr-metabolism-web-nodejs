@@ -13,7 +13,9 @@
  *                         per PaymentIntent / invoice, not per retry.
  *   sendRenewalConfirmation — invoice.paid for a renewal (month 2+): "Your
  *                         membership has been renewed", with the amount, plan,
- *                         renewal date and next billing date. Never throws.
+ *                         renewal date and next billing date — plus the plan
+ *                         price and the breath credit the invoice consumed,
+ *                         when one was applied. Never throws.
  *   sendPaymentAlert    — internal copy of every attempt, success or failure,
  *                         to the team (PAYMENT_ALERT_EMAILS, default
  *                         connect@humorstech.com): outcome, amount, buyer, referral
@@ -144,12 +146,15 @@ function renewalPaidHtml(v) {
     `
       <p style="color:#535359">Hi ${v.customer_name}, thanks for continuing with Rysflo. Your renewal payment went through and your membership remains active.</p>
       <table style="width:100%;border-collapse:collapse;background:#F5F7FA;border-radius:10px;padding:12px 16px;margin:16px 0" cellpadding="0" cellspacing="0">
+        ${v.breath_credit ? row("Plan price", v.plan_amount) : ""}
+        ${v.breath_credit ? row("Breath credit applied", `− ${v.breath_credit}`) : ""}
         ${row("Amount paid", v.amount_paid)}
         ${row("Membership plan", v.plan_name)}
         ${row("Account email", v.customer_email)}
         ${row("Renewal date", v.renewal_date)}
         ${row("Next billing date", v.next_billing_date)}
       </table>
+      ${v.breath_credit ? `<p style="color:#535359">Your breath tests earned you ${v.breath_credit} off this bill — keep testing to keep saving.</p>` : ""}
       <p style="color:#535359">Every breath test you take knocks 20¢ off next month's bill — up to $6.</p>
       <p style="color:#535359">No action is needed: keep using your Rysflo device and app as usual.</p>
     `
@@ -345,6 +350,18 @@ async function sendRenewalConfirmation(invoice) {
     // The subscription line covers the period just paid for; its end is the
     // next billing date (invoice.period_end is the previous period).
     const line = (invoice.lines?.data || []).find((l) => l?.period?.end) || null;
+
+    // Customer balance this invoice consumed — the breath credit. The balance
+    // moves toward zero by the amount applied; fall back to the gap between
+    // the invoice total and what the card actually paid.
+    const startBalance = Number(invoice.starting_balance);
+    const endBalance = Number(invoice.ending_balance);
+    let creditMinor =
+      Number.isFinite(startBalance) && Number.isFinite(endBalance)
+        ? Math.max(0, endBalance - startBalance)
+        : 0;
+    if (!creditMinor) creditMinor = Math.max(0, Number(invoice.total || 0) - Number(invoice.amount_paid || 0));
+
     const variables = {
       customer_name: name || "there",
       customer_email: to,
@@ -352,6 +369,15 @@ async function sendRenewalConfirmation(invoice) {
       plan_name: "Rysflo Monthly Membership",
       renewal_date: dateOf(invoice.status_transitions?.paid_at ?? invoice.created) || "—",
       next_billing_date: dateOf(line?.period?.end) || "—",
+      // Only set when a credit was applied: a variable the Resend template
+      // has not created makes it refuse the send (the inline copy then goes
+      // out instead), so credit-less renewals must not carry these.
+      ...(creditMinor > 0
+        ? {
+            plan_amount: money(invoice.total, invoice.currency),
+            breath_credit: money(creditMinor, invoice.currency),
+          }
+        : {}),
     };
     const escaped = Object.fromEntries(Object.entries(variables).map(([k, v]) => [k, escapeHtml(v)]));
     const message = {
@@ -437,4 +463,4 @@ function invoiceIsOurs(invoice) {
   return md.plan_code === PLAN_CODE;
 }
 
-module.exports = { sendPaymentReceipt, sendPaymentFailed, sendRenewalConfirmation, sendPaymentAlert, retryUrlFor, invoiceIsOurs };
+module.exports = { sendPaymentReceipt, sendPaymentFailed, sendRenewalConfirmation, sendPaymentAlert, retryUrlFor, invoiceIsOurs, _renewalPaidHtml: renewalPaidHtml };
