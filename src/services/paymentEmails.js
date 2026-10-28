@@ -109,7 +109,7 @@ function receiptHtml(v) {
         ${row("Next billing date", v.NEXT_BILLING_DATE)}
         ${row("Ships to", v.SHIP_TO)}
       </table>
-      <p style="color:#535359">Every day you take a reading, 20¢ comes off next month's bill — up to $6.</p>
+      <p style="color:#535359">Every breath test you take knocks 20¢ off next month's bill — up to $6.</p>
       <p style="color:#535359"><strong>Next step:</strong> ${v.APP_CODE_NOTE}</p>
     `
   );
@@ -150,7 +150,7 @@ function renewalPaidHtml(v) {
         ${row("Renewal date", v.renewal_date)}
         ${row("Next billing date", v.next_billing_date)}
       </table>
-      <p style="color:#535359">Every day you take a reading, 20¢ comes off next month's bill — up to $6.</p>
+      <p style="color:#535359">Every breath test you take knocks 20¢ off next month's bill — up to $6.</p>
       <p style="color:#535359">No action is needed: keep using your Rysflo device and app as usual.</p>
     `
   );
