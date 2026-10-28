@@ -23,6 +23,7 @@ const {
   BREATH_CREDIT_PER_DAY_MINOR,
   BREATH_CREDIT_CAP_MINOR,
   BREATH_CREDIT_FULL_DAYS,
+  BREATH_CREDIT_EXCLUDE_PROFILES,
 } = require("../config/stripe");
 
 const RENEWAL_WINDOW_HOURS = 36;
@@ -79,6 +80,8 @@ async function runBreathCredits({ now = new Date(), dryRun = false } = {}) {
 
   // Active subscriptions renewing inside the window (or already past the end
   // because a run was missed) that have no credit for this period yet.
+  // Excluded profiles (internal test accounts) never earn the credit.
+  const excluded = BREATH_CREDIT_EXCLUDE_PROFILES;
   const [subs] = await pool.execute(
     `
       SELECT rs.id, rs.stripe_subscription_id, rs.stripe_customer_id, rs.profile_id,
@@ -93,8 +96,9 @@ async function runBreathCredits({ now = new Date(), dryRun = false } = {}) {
         AND rs.current_period_end   IS NOT NULL
         AND rs.current_period_end <= ?
         AND bc.id IS NULL
+        ${excluded.length ? `AND (rs.profile_id IS NULL OR rs.profile_id NOT IN (${excluded.map(() => "?").join(",")}))` : ""}
     `,
-    [windowEnd.toISOString().slice(0, 19).replace("T", " ")]
+    [windowEnd.toISOString().slice(0, 19).replace("T", " "), ...excluded]
   );
 
   const summary = { linked_profiles: linked, considered: subs.length, credited: 0, zero: 0, unlinked: 0, errors: 0, items: [] };

@@ -42,6 +42,12 @@ const PLAN_CODE = "rysflo_monthly";
 const BREATH_CREDIT_PER_DAY_MINOR = 20;   // $0.20 per reading-day
 const BREATH_CREDIT_CAP_MINOR = 600;      // $6.00 per billing month
 const BREATH_CREDIT_FULL_DAYS = 30;       // a "full" month; Feb reaches the cap at 28
+// Profiles that never earn the credit (internal test accounts, e.g. the $1
+// Client Chandan subscription). Comma-separated; override via env.
+const BREATH_CREDIT_EXCLUDE_PROFILES = String(process.env.BREATH_CREDIT_EXCLUDE_PROFILES ?? "profile431")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
 
 const isLive = /^(sk|rk)_live_/.test(STRIPE_SECRET_KEY);
 
@@ -89,4 +95,5 @@ module.exports = {
   BREATH_CREDIT_PER_DAY_MINOR,
   BREATH_CREDIT_CAP_MINOR,
   BREATH_CREDIT_FULL_DAYS,
+  BREATH_CREDIT_EXCLUDE_PROFILES,
 };
