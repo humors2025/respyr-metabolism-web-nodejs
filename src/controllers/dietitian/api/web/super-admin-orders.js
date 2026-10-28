@@ -44,6 +44,7 @@
 const pool = require("../../../../config/db");
 const { requireStripe } = require("../../../../config/stripe");
 const { creditForReadingDays } = require("../../../../services/breathCredits");
+const { BREATH_CREDIT_EXCLUDE_PROFILES } = require("../../../../config/stripe");
 const { _helpers: H } = require("./admin-invite-trainer");
 const { trainerHierarchy } = require("./super-admin-sales-analytics");
 
@@ -430,11 +431,12 @@ async function upcomingRenewals(body) {
   // far in the current billing period, capped — every subscription with a
   // linked app profile earns it, matching services/breathCredits.js (which
   // posts the actual balance credit shortly before renewal). Null when the
-  // purchase code is not redeemed yet (no profile, so no readings).
+  // purchase code is not redeemed yet (no profile, so no readings) and for
+  // the excluded internal test profiles, which never earn the credit.
   const breathCredits = new Map();
   await Promise.all(
     rows
-      .filter((r) => r.profile_id)
+      .filter((r) => r.profile_id && !BREATH_CREDIT_EXCLUDE_PROFILES.includes(String(r.profile_id)))
       .map(async (r) => {
         try {
           const [[t]] = await pool.query(
