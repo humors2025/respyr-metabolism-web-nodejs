@@ -33,7 +33,9 @@
  * a Stripe "active" plan whose period end has passed is reported as "expired".
  * Shipping rows also carry the facility behind the partner code (the gym and
  * its facility admin, same lookup as Sales Analytics' top_trainers), or null
- * for a website purchase / a trainer outside any facility.
+ * for a website purchase / a trainer outside any facility. They also carry
+ * paid_period (the latest paid invoice's period) and renewal_pending (Stripe
+ * started a newer period whose invoice is not paid yet).
  *
  * Body: { view: "shipping" | "payments" | "upcoming_renewals", search?, page?, limit?,
  *         payments only: status? ("all" | open | paid | failed | refunded | partially_refunded),
@@ -131,6 +133,44 @@ async function facilityByCode(rows, codeOf) {
   return out;
 }
 
+// Stripe moves current_period_* to the next month as soon as it creates the
+// renewal invoice, before that invoice is paid. The latest paid invoice per
+// subscription says how far the plan is actually paid.
+async function lastPaidPeriods(subIds) {
+  const out = new Map();
+  const ids = [...new Set(subIds.filter(Boolean))];
+  if (!ids.length) return out;
+  try {
+    const [rows] = await pool.query(
+      `
+        SELECT stripe_subscription_id, MAX(period_start) AS period_start, MAX(period_end) AS period_end
+        FROM payment_transactions
+        WHERE stripe_subscription_id IN (${ids.map(() => "?").join(", ")})
+          AND status IN (${PAID_STATUSES.map(() => "?").join(", ")})
+        GROUP BY stripe_subscription_id
+      `,
+      [...ids, ...PAID_STATUSES]
+    );
+    for (const r of rows) out.set(r.stripe_subscription_id, { start: toIso(r.period_start), end: toIso(r.period_end) });
+  } catch (err) {
+    console.error("SUPER_ADMIN_ORDERS_PAID_PERIOD_ERROR:", { code: err?.code, message: err?.message });
+  }
+  return out;
+}
+
+// paid_period: the period covered by the latest paid invoice (null when none
+// is recorded). renewal_pending: Stripe already started a newer period whose
+// invoice is not paid yet (still processing, or failed and being retried).
+// A day of slack absorbs small clock differences between the two dates.
+function renewalState(row, paid) {
+  const currentEnd = Date.parse(toIso(row.current_period_end) || "");
+  const paidEnd = Date.parse(paid?.end || "");
+  const pending = Number.isFinite(currentEnd) && Number.isFinite(paidEnd) && paidEnd < currentEnd - DAY_MS;
+  return { paid_period: paid?.end ? paid : null, renewal_pending: pending };
+}
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+
 async function shipping(body) {
   const { page, limit, offset } = parsePaging(body);
   const search = parseSearch(body);
@@ -170,6 +210,7 @@ async function shipping(body) {
 
   const codeOf = (r) => String(r.attributed_partner_code || "").toUpperCase() || null;
   const facilities = await facilityByCode(rows, codeOf);
+  const paidPeriods = await lastPaidPeriods(rows.map((r) => r.stripe_subscription_id));
 
   const now = Date.now();
   return {
@@ -196,6 +237,7 @@ async function shipping(body) {
       current_period_end: toIso(r.current_period_end),
       canceled_at: toIso(r.canceled_at),
       stripe_subscription_id: r.stripe_subscription_id,
+      ...renewalState(r, paidPeriods.get(r.stripe_subscription_id)),
     })),
     pagination: { page, limit, total: Number(total), total_pages: Math.max(1, Math.ceil(Number(total) / limit)) },
   };
