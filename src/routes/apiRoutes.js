@@ -319,6 +319,8 @@ const referralOps = require("../controllers/dietitian/api/web/referral-ops");
 const { listFacilities } = require("../controllers/dietitian/api/web/list-facilities");
 const { updateFacility } = require("../controllers/dietitian/api/web/update-facility");
 const { facilityEditLogs } = require("../controllers/dietitian/api/web/facility-edit-logs");
+const { supportContact } = require("../controllers/dietitian/api/web/support-contact");
+const { supportContactRateLimiter, supportContactIpRateLimiter } = require("../middlewares/supportContactRateLimiter");
 
 const {
   runBreathCreditsEndpoint,
@@ -1123,6 +1125,8 @@ router.post("/dietitian/api/web/facility-edit-logs", authMiddleware, facilityEdi
 // Referral programme v0.3 — public order-page helpers (no JWT) …
 router.post("/dietitian/api/web/order-page-context", referralOps.orderPageContext);
 router.post("/dietitian/api/web/order-session-status", referralOps.orderSessionStatus);
+// Public: rysflo.com/help "Still need help?" form → team inbox (no JWT).
+router.post("/dietitian/api/web/support-contact", supportContactIpRateLimiter, supportContactRateLimiter, supportContact);
 // … and authenticated operations.
 router.post("/dietitian/api/web/referred-members", authMiddleware, referralOps.referredMembers);
 router.post("/dietitian/api/web/resend-purchase-code", authMiddleware, referralOps.resendPurchaseCode);
