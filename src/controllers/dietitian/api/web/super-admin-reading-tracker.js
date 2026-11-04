@@ -32,10 +32,12 @@
  *          sort?: "most_missed" | "most_taken" | "name", page?, limit? }
  *
  * →      { status, month, today, days_in_month,
- *          summary: { paid_profiles, not_linked, taken_days, missed_days, no_reading },
+ *          summary: { paid_profiles, not_linked, taken_days, readings, missed_days, no_reading },
  *          rows: [ { profile_id, linked, name, email, partner_code, plan_code,
  *                    subscription_status, purchased_on, taken_days: ["YYYY-MM-DD"],
- *                    missed_days: [...], pending_days: [...], last_reading } ],
+ *                    reading_times: { "YYYY-MM-DD": ["HH:MM:SS"] } (every test on a taken
+ *                    day, as stored), reading_count, missed_days: [...],
+ *                    pending_days: [...], last_reading: "YYYY-MM-DD HH:MM:SS" } ],
  *          pagination: { page, limit, total, total_pages } }
  *
  * summary covers the whole month, ignoring search and paging. Rows carry buyers'
@@ -96,8 +98,8 @@ function countedWindow(sub, today) {
 
 /**
  * Turn subscriptions plus reading days into one row per profile, for a month.
- * readingDays: Map(profile_id -> Set("YYYY-MM-DD")). lastReading: Map(profile_id
- * -> "YYYY-MM-DD"). `today` is an IST day. Exported for tests.
+ * readingDays: Map(profile_id -> Map("YYYY-MM-DD" -> ["HH:MM:SS"])). lastReading: Map(profile_id
+ * -> "YYYY-MM-DD HH:MM:SS"). `today` is an IST day. Exported for tests.
  */
 function buildRows(subs, readingDays, lastReading, month, today) {
   const start = `${month}-01`;
@@ -125,10 +127,11 @@ function buildRows(subs, readingDays, lastReading, month, today) {
   }
 
   return [...groups.values()].map(({ profileId, latest, purchasedOn, days }) => {
-    const readings = (profileId && readingDays.get(profileId)) || new Set();
+    const readings = (profileId && readingDays.get(profileId)) || new Map();
     const counted = [...days].sort();
     const linked = !!profileId;
     const noReading = linked ? counted.filter((d) => !readings.has(d)) : [];
+    const takenDays = linked ? counted.filter((d) => readings.has(d)) : [];
     return {
       profile_id: profileId,
       linked,
@@ -142,7 +145,9 @@ function buildRows(subs, readingDays, lastReading, month, today) {
         current_period_end: latest.current_period_end,
       }),
       purchased_on: purchasedOn,
-      taken_days: linked ? counted.filter((d) => readings.has(d)) : [],
+      taken_days: takenDays,
+      reading_times: Object.fromEntries(takenDays.map((d) => [d, readings.get(d)])),
+      reading_count: takenDays.reduce((n, d) => n + readings.get(d).length, 0),
       missed_days: noReading.filter((d) => d < pendingFrom),
       pending_days: noReading.filter((d) => d >= pendingFrom),
       last_reading: (profileId && lastReading.get(profileId)) || null,
@@ -171,6 +176,7 @@ function summarize(rows) {
     paid_profiles: rows.length,
     not_linked: rows.length - linked.length,
     taken_days: linked.reduce((n, r) => n + r.taken_days.length, 0),
+    readings: linked.reduce((n, r) => n + r.reading_count, 0),
     missed_days: linked.reduce((n, r) => n + r.missed_days.length, 0),
     no_reading: linked.filter((r) => r.taken_days.length === 0).length,
   };
@@ -202,17 +208,17 @@ async function loadReadings(profileIds, start, end) {
   const marks = profileIds.map(() => "?").join(",");
   const [days] = await pool.execute(
     `
-      SELECT profile_id, DATE_FORMAT(date_time, '%Y-%m-%d') AS day
+      SELECT profile_id, DATE_FORMAT(date_time, '%Y-%m-%d') AS day, DATE_FORMAT(date_time, '%H:%i:%s') AS time
       FROM table_test_data
       WHERE profile_id IN (${marks})
         AND date_time >= ? AND date_time < DATE_ADD(?, INTERVAL 1 DAY)
-      GROUP BY profile_id, day
+      ORDER BY date_time, test_id
     `,
     [...profileIds, start, end]
   );
   const [latest] = await pool.execute(
     `
-      SELECT profile_id, DATE_FORMAT(MAX(date_time), '%Y-%m-%d') AS day
+      SELECT profile_id, DATE_FORMAT(MAX(date_time), '%Y-%m-%d %H:%i:%s') AS latest
       FROM table_test_data
       WHERE profile_id IN (${marks})
       GROUP BY profile_id
@@ -222,10 +228,12 @@ async function loadReadings(profileIds, start, end) {
 
   const readingDays = new Map();
   for (const row of days) {
-    if (!readingDays.has(row.profile_id)) readingDays.set(row.profile_id, new Set());
-    readingDays.get(row.profile_id).add(row.day);
+    if (!readingDays.has(row.profile_id)) readingDays.set(row.profile_id, new Map());
+    const profileDays = readingDays.get(row.profile_id);
+    if (!profileDays.has(row.day)) profileDays.set(row.day, []);
+    profileDays.get(row.day).push(row.time);
   }
-  return { readingDays, lastReading: new Map(latest.map((row) => [row.profile_id, row.day])) };
+  return { readingDays, lastReading: new Map(latest.map((row) => [row.profile_id, row.latest])) };
 }
 
 /** Fill partner_code on rows so the page can open the client's profile. */
