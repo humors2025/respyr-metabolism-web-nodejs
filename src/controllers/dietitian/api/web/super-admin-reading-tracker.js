@@ -7,7 +7,9 @@
  * paid profile took a breath reading and the days they missed. Read-only; every
  * day is worked out from existing tables, nothing is stored.
  *
- * Who is listed: every website purchase (referral_subscriptions) whose paid time
+ * Who is listed: subscriptions with a successful payment above $0 in
+ * payment_transactions (the Orders › Payments rows; fully refunded ones do not
+ * count), read from referral_subscriptions, whose paid time
  * overlaps the month. test_… rows, never-paid subscriptions (incomplete*) and
  * BREATH_CREDIT_EXCLUDE_PROFILES are left out. A buyer with no linked app profile
  * is listed with linked=false and no days, since they cannot have readings yet.
@@ -192,6 +194,12 @@ async function loadSubscriptions(end) {
       WHERE LEFT(rs.stripe_subscription_id, 5) <> 'test_'
         AND rs.status NOT IN ('incomplete', 'incomplete_expired')
         AND rs.created_at <= ?
+        AND EXISTS (
+          SELECT 1 FROM payment_transactions pt
+          WHERE pt.stripe_subscription_id = rs.stripe_subscription_id
+            AND pt.status IN ('paid', 'partially_refunded')
+            AND pt.amount_paid_minor > 0
+        )
         ${excluded.length ? `AND (rs.profile_id IS NULL OR rs.profile_id NOT IN (${excluded.map(() => "?").join(",")}))` : ""}
     `,
     // created_at is UTC. The month's last IST day ends at 18:30 UTC, so this keeps every
