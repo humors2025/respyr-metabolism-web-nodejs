@@ -34,8 +34,9 @@
  * Body:  { month?: "YYYY-MM" (default this month), search?,
  *          sort?: "most_missed" | "most_taken" | "name",
  *          show?: "all" | "taken_today" | "pending_today" | "first_today" (first reading
- *          ever was today) | "first_month" (in this month) | "never" (no reading ever),
- *          page?, limit? }
+ *          ever was today) | "first_month" (in this month) | "never" (no reading ever) |
+ *          "taken_month" | "missed_month" | "no_reading" (linked, none this month) |
+ *          "not_linked", page?, limit? }
  * The today filters and counts only have data while month is the current month.
  *
  * →      { status, month, today, days_in_month,
@@ -67,7 +68,18 @@ const DEFAULT_LIMIT = 20;
 const MAX_LIMIT = 100;
 const MAX_SEARCH_LENGTH = 100;
 const SORTS = ["most_missed", "most_taken", "name"];
-const SHOW_FILTERS = ["all", "taken_today", "pending_today", "first_today", "first_month", "never"];
+const SHOW_FILTERS = [
+  "all",
+  "taken_today",
+  "pending_today",
+  "first_today",
+  "first_month",
+  "never",
+  "taken_month",
+  "missed_month",
+  "no_reading",
+  "not_linked",
+];
 const RUNNING_STATUSES = new Set(["active", "trialing", "past_due"]);
 
 const MONTH_RE = /^\d{4}-(0[1-9]|1[0-2])$/;
@@ -187,6 +199,14 @@ function matchesShow(row, show, month, today) {
       return !!row.first_reading && row.first_reading.startsWith(month);
     case "never":
       return row.linked && !row.first_reading;
+    case "taken_month":
+      return row.taken_days.length > 0;
+    case "missed_month":
+      return row.missed_days.length > 0;
+    case "no_reading":
+      return row.linked && row.taken_days.length === 0;
+    case "not_linked":
+      return !row.linked;
     default:
       return true;
   }
