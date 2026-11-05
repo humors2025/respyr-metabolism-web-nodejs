@@ -22,24 +22,33 @@
  *
  * Reading days come from table_test_data, the same "tested on this date" check as
  * All Clients. Not reward_ledger: on prod some days with a test have no 'earn' row,
- * and they would show as missed. A reading's day is the date stored on the test,
- * unconverted: which clock date_time uses is unproven, but almost no tests fall
- * around its midnight, so its dates rarely split a client's day.
+ * and they would show as missed. A reading's day and time are the ones stored on
+ * the test, unconverted. Customers are all in the US and their tests cluster in
+ * morning hours with almost none around midnight, which fits the phone's own clock.
  *
- * "Today" and purchase dates are IST days. IST runs ahead of US clients, so the
- * latest two days without a reading are pending_days, not missed: a client's own
- * day may still be going on.
+ * "Today" and purchase dates are US Pacific days, so a day only becomes missed once
+ * it has ended across the mainland US. Today without a reading is pending_days. A
+ * client further east can already be on the next date, so a reading dated up to
+ * today in US Eastern still counts, and that next date is otherwise left blank.
  *
  * Body:  { month?: "YYYY-MM" (default this month), search?,
- *          sort?: "most_missed" | "most_taken" | "name", page?, limit? }
+ *          sort?: "most_missed" | "most_taken" | "name",
+ *          show?: "all" | "taken_today" | "pending_today" | "first_today" (first reading
+ *          ever was today) | "first_month" (in this month) | "never" (no reading ever),
+ *          page?, limit? }
+ * The today filters and counts only have data while month is the current month.
  *
  * →      { status, month, today, days_in_month,
- *          summary: { paid_profiles, not_linked, taken_days, readings, missed_days, no_reading },
+ *          summary: { paid_profiles, not_linked, taken_days, readings, missed_days, no_reading,
+ *                         took_today, readings_today, first_today, first_month, never },
+ *          (first_* and never count each profile once; never leaves out unlinked buyers)
  *          rows: [ { profile_id, linked, name, email, partner_code, plan_code,
  *                    subscription_status, purchased_on, taken_days: ["YYYY-MM-DD"],
  *                    reading_times: { "YYYY-MM-DD": ["HH:MM:SS"] } (every test on a taken
  *                    day, as stored), reading_count, missed_days: [...],
- *                    pending_days: [...], last_reading: "YYYY-MM-DD HH:MM:SS" } ],
+ *                    pending_days: [...], today_count, last_reading: "YYYY-MM-DD HH:MM:SS",
+ *                    first_reading: "YYYY-MM-DD HH:MM:SS" (earliest test ever, even before
+ *                    purchase) } ],
  *          pagination: { page, limit, total, total_pages } }
  *
  * summary covers the whole month, ignoring search and paging. Rows carry buyers'
@@ -51,24 +60,29 @@ const { BREATH_CREDIT_EXCLUDE_PROFILES } = require("../../../../config/stripe");
 const { _helpers: H } = require("./admin-invite-trainer");
 const { _helpers: O } = require("./super-admin-orders");
 
-const IST_OFFSET_MS = 330 * 60000;
+const US_PACIFIC = "America/Los_Angeles";
+const US_EASTERN = "America/New_York";
 const DAY_MS = 86400000;
 const DEFAULT_LIMIT = 20;
 const MAX_LIMIT = 100;
 const MAX_SEARCH_LENGTH = 100;
 const SORTS = ["most_missed", "most_taken", "name"];
+const SHOW_FILTERS = ["all", "taken_today", "pending_today", "first_today", "first_month", "never"];
 const RUNNING_STATUSES = new Set(["active", "trialing", "past_due"]);
 
 const MONTH_RE = /^\d{4}-(0[1-9]|1[0-2])$/;
 
-/** IST calendar day ("YYYY-MM-DD") of a stored UTC DATETIME or a Date. */
-function istDay(value) {
+/** US calendar day ("YYYY-MM-DD") of a stored UTC DATETIME or a Date. */
+function usDay(value, timeZone = US_PACIFIC) {
   const iso = O.toIso(value);
   if (!iso) return null;
-  return new Date(Date.parse(iso) + IST_OFFSET_MS).toISOString().slice(0, 10);
+  const parts = new Intl.DateTimeFormat("en-US", { timeZone, year: "numeric", month: "2-digit", day: "2-digit" })
+    .formatToParts(new Date(iso));
+  const part = (type) => parts.find((p) => p.type === type).value;
+  return `${part("year")}-${part("month")}-${part("day")}`;
 }
 
-/** Last IST day of a "YYYY-MM" month. */
+/** Last day of a "YYYY-MM" month. */
 function monthEnd(month) {
   const [y, m] = month.split("-").map(Number);
   return new Date(Date.UTC(y, m, 0)).toISOString().slice(0, 10);
@@ -83,34 +97,34 @@ function eachDay(from, to) {
   return days;
 }
 
-/** The IST days this subscription's readings count on, as { from, to }. */
-function countedWindow(sub, today) {
-  const from = istDay(sub.created_at);
+/** The US days this subscription's readings count on, as { from, to }, up to latestDay. */
+function countedWindow(sub, latestDay) {
+  const from = usDay(sub.created_at);
   if (!from) return null;
 
   const status = String(sub.status || "").toLowerCase();
   let to;
-  if (status === "canceled" && sub.canceled_at) to = istDay(sub.canceled_at);
-  else if (sub.current_period_end) to = istDay(sub.current_period_end);
-  else to = RUNNING_STATUSES.has(status) ? today : from;
+  if (status === "canceled" && sub.canceled_at) to = usDay(sub.canceled_at);
+  else if (sub.current_period_end) to = usDay(sub.current_period_end);
+  else to = RUNNING_STATUSES.has(status) ? latestDay : from;
 
-  if (to > today) to = today;
+  if (to > latestDay) to = latestDay;
   return to < from ? null : { from, to };
 }
 
 /**
  * Turn subscriptions plus reading days into one row per profile, for a month.
- * readingDays: Map(profile_id -> Map("YYYY-MM-DD" -> ["HH:MM:SS"])). lastReading: Map(profile_id
- * -> "YYYY-MM-DD HH:MM:SS"). `today` is an IST day. Exported for tests.
+ * readingDays: Map(profile_id -> Map("YYYY-MM-DD" -> ["HH:MM:SS"])). history: Map(profile_id
+ * -> { first, last }, "YYYY-MM-DD HH:MM:SS"). `today` is the US Pacific day, `latestDay` the US Eastern
+ * day (the newest date a reading can carry). Exported for tests.
  */
-function buildRows(subs, readingDays, lastReading, month, today) {
+function buildRows(subs, readingDays, history, month, today, latestDay = today) {
   const start = `${month}-01`;
   const end = monthEnd(month);
-  const pendingFrom = new Date(Date.parse(`${today}T00:00:00Z`) - DAY_MS).toISOString().slice(0, 10);
   const groups = new Map();
 
   for (const sub of subs) {
-    const window = countedWindow(sub, today);
+    const window = countedWindow(sub, latestDay);
     if (!window || window.from > end || window.to < start) continue;
 
     const profileId = sub.profile_id || null;
@@ -132,6 +146,7 @@ function buildRows(subs, readingDays, lastReading, month, today) {
     const readings = (profileId && readingDays.get(profileId)) || new Map();
     const counted = [...days].sort();
     const linked = !!profileId;
+    const seen = (profileId && history.get(profileId)) || {};
     const noReading = linked ? counted.filter((d) => !readings.has(d)) : [];
     const takenDays = linked ? counted.filter((d) => readings.has(d)) : [];
     return {
@@ -150,11 +165,31 @@ function buildRows(subs, readingDays, lastReading, month, today) {
       taken_days: takenDays,
       reading_times: Object.fromEntries(takenDays.map((d) => [d, readings.get(d)])),
       reading_count: takenDays.reduce((n, d) => n + readings.get(d).length, 0),
-      missed_days: noReading.filter((d) => d < pendingFrom),
-      pending_days: noReading.filter((d) => d >= pendingFrom),
-      last_reading: (profileId && lastReading.get(profileId)) || null,
+      missed_days: noReading.filter((d) => d < today),
+      pending_days: noReading.filter((d) => d === today),
+      today_count: readings.has(today) && takenDays.includes(today) ? readings.get(today).length : 0,
+      last_reading: seen.last || null,
+      first_reading: seen.first || null,
     };
   });
+}
+
+/** Does a row belong under a `show` filter? Exported for tests. */
+function matchesShow(row, show, month, today) {
+  switch (show) {
+    case "taken_today":
+      return row.today_count > 0;
+    case "pending_today":
+      return row.pending_days.length > 0;
+    case "first_today":
+      return !!row.first_reading && row.first_reading.startsWith(today);
+    case "first_month":
+      return !!row.first_reading && row.first_reading.startsWith(month);
+    case "never":
+      return row.linked && !row.first_reading;
+    default:
+      return true;
+  }
 }
 
 /** Sort rows in place. Buyers with no linked profile always go last. */
@@ -172,7 +207,7 @@ function sortRows(rows, sort) {
   });
 }
 
-function summarize(rows) {
+function summarize(rows, month, today) {
   const linked = rows.filter((r) => r.linked);
   return {
     paid_profiles: rows.length,
@@ -181,6 +216,11 @@ function summarize(rows) {
     readings: linked.reduce((n, r) => n + r.reading_count, 0),
     missed_days: linked.reduce((n, r) => n + r.missed_days.length, 0),
     no_reading: linked.filter((r) => r.taken_days.length === 0).length,
+    took_today: linked.filter((r) => r.today_count > 0).length,
+    readings_today: linked.reduce((n, r) => n + r.today_count, 0),
+    first_today: rows.filter((r) => matchesShow(r, "first_today", month, today)).length,
+    first_month: rows.filter((r) => matchesShow(r, "first_month", month, today)).length,
+    never: rows.filter((r) => matchesShow(r, "never", month, today)).length,
   };
 }
 
@@ -202,16 +242,16 @@ async function loadSubscriptions(end) {
         )
         ${excluded.length ? `AND (rs.profile_id IS NULL OR rs.profile_id NOT IN (${excluded.map(() => "?").join(",")}))` : ""}
     `,
-    // created_at is UTC. The month's last IST day ends at 18:30 UTC, so this keeps every
-    // purchase in the month; buildRows drops the few evening ones that fall in the next.
-    [`${end} 23:59:59`, ...excluded]
+    // created_at is UTC. The month's last US day ends the next morning UTC, so this keeps
+    // every purchase in the month; buildRows drops the ones that fall in the next.
+    [`${new Date(Date.parse(`${end}T00:00:00Z`) + DAY_MS).toISOString().slice(0, 10)} 23:59:59`, ...excluded]
   );
   return subs;
 }
 
 /** Days in [start, end] and the latest reading ever, per profile. */
 async function loadReadings(profileIds, start, end) {
-  if (profileIds.length === 0) return { readingDays: new Map(), lastReading: new Map() };
+  if (profileIds.length === 0) return { readingDays: new Map(), history: new Map() };
 
   const marks = profileIds.map(() => "?").join(",");
   const [days] = await pool.execute(
@@ -226,7 +266,9 @@ async function loadReadings(profileIds, start, end) {
   );
   const [latest] = await pool.execute(
     `
-      SELECT profile_id, DATE_FORMAT(MAX(date_time), '%Y-%m-%d %H:%i:%s') AS latest
+      SELECT profile_id,
+             DATE_FORMAT(MIN(date_time), '%Y-%m-%d %H:%i:%s') AS earliest,
+             DATE_FORMAT(MAX(date_time), '%Y-%m-%d %H:%i:%s') AS latest
       FROM table_test_data
       WHERE profile_id IN (${marks})
       GROUP BY profile_id
@@ -241,7 +283,7 @@ async function loadReadings(profileIds, start, end) {
     if (!profileDays.has(row.day)) profileDays.set(row.day, []);
     profileDays.get(row.day).push(row.time);
   }
-  return { readingDays, lastReading: new Map(latest.map((row) => [row.profile_id, row.latest])) };
+  return { readingDays, history: new Map(latest.map((row) => [row.profile_id, { first: row.earliest, last: row.latest }])) };
 }
 
 /** Fill partner_code on rows so the page can open the client's profile. */
@@ -276,7 +318,8 @@ const superAdminReadingTracker = async (req, res) => {
     resolved = await H.resolveActorFromToken(req, ["super_admin"]);
     if (resolved.error) return res.status(resolved.error.status).json({ status: false, ...resolved.error.body });
 
-    const today = istDay(new Date());
+    const today = usDay(new Date());
+    const latestDay = usDay(new Date(), US_EASTERN);
     const month = body.month == null || body.month === "" ? today.slice(0, 7) : String(body.month);
     if (!MONTH_RE.test(month)) {
       return res.status(422).json({ status: false, ok: false, message: "month must be YYYY-MM" });
@@ -284,6 +327,10 @@ const superAdminReadingTracker = async (req, res) => {
     const sort = body.sort == null || body.sort === "" ? SORTS[0] : String(body.sort);
     if (!SORTS.includes(sort)) {
       return res.status(422).json({ status: false, ok: false, message: `sort must be one of ${SORTS.join(", ")}` });
+    }
+    const show = body.show == null || body.show === "" ? SHOW_FILTERS[0] : String(body.show);
+    if (!SHOW_FILTERS.includes(show)) {
+      return res.status(422).json({ status: false, ok: false, message: `show must be one of ${SHOW_FILTERS.join(", ")}` });
     }
     const search = String(body.search || "").trim().slice(0, MAX_SEARCH_LENGTH).toLowerCase();
     const page = Math.max(1, parseInt(body.page, 10) || 1);
@@ -293,13 +340,14 @@ const superAdminReadingTracker = async (req, res) => {
     const end = monthEnd(month);
     const subs = await loadSubscriptions(end);
     const profileIds = [...new Set(subs.map((s) => s.profile_id).filter(Boolean))];
-    const { readingDays, lastReading } = await loadReadings(profileIds, start, end);
+    const { readingDays, history } = await loadReadings(profileIds, start, end);
 
-    const rows = buildRows(subs, readingDays, lastReading, month, today);
-    const summary = summarize(rows);
-    const matching = search
-      ? rows.filter((r) => [r.name, r.email, r.profile_id].some((v) => v && v.toLowerCase().includes(search)))
-      : rows;
+    const rows = buildRows(subs, readingDays, history, month, today, latestDay);
+    const summary = summarize(rows, month, today);
+    const matching = rows.filter((r) => {
+      if (!matchesShow(r, show, month, today)) return false;
+      return !search || [r.name, r.email, r.profile_id].some((v) => v && v.toLowerCase().includes(search));
+    });
     sortRows(matching, sort);
 
     const total = matching.length;
@@ -345,5 +393,5 @@ const superAdminReadingTracker = async (req, res) => {
 
 module.exports = {
   superAdminReadingTracker,
-  _helpers: { istDay, monthEnd, countedWindow, buildRows, sortRows, summarize },
+  _helpers: { usDay, US_EASTERN, monthEnd, countedWindow, buildRows, matchesShow, sortRows, summarize },
 };
