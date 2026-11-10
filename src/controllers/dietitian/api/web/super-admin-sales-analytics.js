@@ -524,6 +524,153 @@ async function scopeFor(body) {
   return trainerAdminNetwork(email);
 }
 
+// ─── Renewals & retention (part of view=overview) ────────────────────────────
+
+// Stripe statuses after which a membership is over for good.
+const ENDED_STATUSES = new Set(["canceled", "cancelled", "incomplete_expired", "expired", "unpaid"]);
+const PAID_INVOICE = "('paid','partially_refunded','refunded')";
+
+const pct = (part, whole) => (whole ? Math.round((part / whole) * 1000) / 10 : null);
+
+// Minimal purchase-shaped object so scope.has() works on plain SQL rows.
+const scopeItem = (r) => ({
+  code: String(r.attributed_partner_code || "").toUpperCase() || null,
+  linkedCode: null,
+  raw: { attributed_user_id: r.attributed_user_id, facility_id: r.facility_id },
+});
+
+// Buckets a membership by its subscription status (same labels as the table).
+function memberState(status, canceledAt) {
+  const s = String(status || "");
+  if (ENDED_STATUSES.has(s)) return "ended";
+  if (canceledAt) return "cancellation_scheduled";
+  if (s === "active" || s === "trialing") return "active";
+  return "at_risk"; // past_due and anything Stripe is still retrying
+}
+
+/**
+ * Renewal and retention numbers for the window, all with percentages.
+ *
+ *   renewals   paid renewal invoices (payment_transactions, billing_reason
+ *              subscription_cycle) collected in the window, and the renewal
+ *              rate: of the paid billing periods that ENDED in the window (up to
+ *              now), how many were followed by a paid renewal, are still
+ *              pending (plan live, renewal not paid yet) or lapsed (plan ended).
+ *   cohort     purchases made in the window and what state they are in today.
+ *   members    every paid membership ever sold (in scope): still active vs ended.
+ *
+ * payment_transactions is optional (production may not have migration 006):
+ * without it renewals is null and the page says renewal data is unavailable.
+ */
+async function renewalsAndRetention(p, scope, currency, counted, firstPaymentNet) {
+  const inScope = (r) => !scope || scope.has(scopeItem(r));
+
+  let renewals = null;
+  try {
+    const [paidRows] = await pool.query(
+      `
+        SELECT pt.amount_paid_minor, pt.amount_refunded_minor, pt.currency,
+               rs.attributed_partner_code, rs.attributed_user_id, rs.facility_id
+        FROM payment_transactions pt
+        JOIN referral_subscriptions rs ON rs.stripe_subscription_id = pt.stripe_subscription_id
+        WHERE pt.billing_reason = 'subscription_cycle'
+          AND pt.status IN ${PAID_INVOICE}
+          AND COALESCE(pt.paid_at, pt.created_at) >= ? AND COALESCE(pt.paid_at, pt.created_at) < ?
+          AND LEFT(rs.stripe_subscription_id, 5) <> 'test_'
+      `,
+      [p.startUtc, p.endUtc]
+    );
+    const [dueRows] = await pool.query(
+      `
+        SELECT pt.id, rs.status, rs.canceled_at,
+               rs.attributed_partner_code, rs.attributed_user_id, rs.facility_id,
+               EXISTS (
+                 SELECT 1 FROM payment_transactions n
+                 WHERE n.stripe_subscription_id = pt.stripe_subscription_id
+                   AND n.id <> pt.id
+                   AND n.billing_reason = 'subscription_cycle'
+                   AND n.status IN ${PAID_INVOICE}
+                   AND n.period_start >= DATE_SUB(pt.period_end, INTERVAL 1 DAY)
+               ) AS renewed
+        FROM payment_transactions pt
+        JOIN referral_subscriptions rs ON rs.stripe_subscription_id = pt.stripe_subscription_id
+        WHERE pt.billing_reason IN ('subscription_create', 'subscription_cycle')
+          AND pt.status IN ('paid', 'partially_refunded')
+          AND pt.period_end >= ? AND pt.period_end < ? AND pt.period_end <= UTC_TIMESTAMP()
+          AND LEFT(rs.stripe_subscription_id, 5) <> 'test_'
+      `,
+      [p.startUtc, p.endUtc]
+    );
+
+    const paid = paidRows.filter((r) => inScope(r) && String(r.currency || "").toUpperCase() === currency);
+    const net = paid.reduce((s, r) => s + Number(r.amount_paid_minor || 0) - Number(r.amount_refunded_minor || 0), 0);
+
+    const due = { total: 0, renewed: 0, pending: 0, lapsed: 0 };
+    for (const r of dueRows) {
+      if (!inScope(r)) continue;
+      due.total += 1;
+      if (Number(r.renewed)) due.renewed += 1;
+      else if (memberState(r.status, null) === "ended") due.lapsed += 1;
+      else due.pending += 1;
+    }
+
+    renewals = {
+      payments: paid.length,
+      net_sales: minorToMajor(net),
+      // Renewal money as a share of everything collected (first payments + renewals).
+      share_of_sales: pct(net, net + firstPaymentNet),
+      due: due.total,
+      renewed: due.renewed,
+      pending: due.pending,
+      lapsed: due.lapsed,
+      renewal_rate: pct(due.renewed, due.total),
+      pending_rate: pct(due.pending, due.total),
+      lapse_rate: pct(due.lapsed, due.total),
+    };
+  } catch (err) {
+    if (err?.code !== "ER_NO_SUCH_TABLE" && err?.errno !== 1146) throw err;
+  }
+
+  // Purchases made in this window, by where they stand today.
+  const cohort = { purchases: counted.length, active: 0, cancellation_scheduled: 0, at_risk: 0, ended: 0 };
+  for (const i of counted) cohort[memberState(i.raw.status, i.raw.canceled_at)] += 1;
+
+  // Every paid membership ever sold in scope.
+  const [memberRows] = await pool.query(
+    `
+      SELECT status, canceled_at, attributed_partner_code, attributed_user_id, facility_id
+      FROM referral_subscriptions
+      WHERE LEFT(stripe_subscription_id, 5) <> 'test_'
+        AND status NOT IN ('incomplete', 'incomplete_expired')
+    `
+  );
+  const members = { total: 0, active: 0, cancellation_scheduled: 0, at_risk: 0, ended: 0 };
+  for (const r of memberRows) {
+    if (!inScope(r)) continue;
+    members.total += 1;
+    members[memberState(r.status, r.canceled_at)] += 1;
+  }
+
+  const rates = (o, whole) => ({
+    active_rate: pct(o.active, whole),
+    cancellation_scheduled_rate: pct(o.cancellation_scheduled, whole),
+    at_risk_rate: pct(o.at_risk, whole),
+    ended_rate: pct(o.ended, whole),
+  });
+
+  return {
+    renewals,
+    cohort: { ...cohort, ...rates(cohort, cohort.purchases) },
+    members: {
+      ...members,
+      ...rates(members, members.total),
+      // Retained = still has access (active + cancelling at period end + payment retrying).
+      retention_rate: pct(members.total - members.ended, members.total),
+      churn_rate: pct(members.ended, members.total),
+    },
+  };
+}
+
 // ─── view=overview ───────────────────────────────────────────────────────────
 
 async function overview(p, body) {
@@ -581,6 +728,8 @@ async function overview(p, body) {
       )
     : await pool.query(`SELECT COUNT(*) AS n FROM referral_subscriptions WHERE status = 'active' AND LEFT(stripe_subscription_id, 5) <> 'test_'`);
 
+  const retention = await renewalsAndRetention(p, scope, currency, counted, total.net);
+
   const channel = (c) => ({
     purchases: c.purchases,
     gross_sales: minorToMajor(c.gross),
@@ -597,7 +746,7 @@ async function overview(p, body) {
       discounts: minorToMajor(total.discount),
       net_sales: minorToMajor(total.net),
       new_purchase_net_sales: minorToMajor(total.net),
-      renewal_net_sales: 0,
+      renewal_net_sales: retention.renewals ? retention.renewals.net_sales : 0,
       total_purchases: total.purchases,
       website_purchases: bySource.website.purchases,
       trainer_code_purchases: bySource.trainer_code.purchases,
@@ -628,6 +777,224 @@ async function overview(p, body) {
       net_sales: minorToMajor(t.net),
     })),
     top_trainers_total: ranked.length,
+    retention,
+  };
+}
+
+// ─── view=engagement ─────────────────────────────────────────────────────────
+
+const ENGAGEMENT_GROUPS = new Set(["all", "purchased", "renewed"]);
+const COHORT_TIERS = [90, 70, 50, 25, 10];
+const cohortOf = (rate) => {
+  for (const t of COHORT_TIERS) if (rate >= t) return `${t}%+`;
+  return "<10%";
+};
+const DAY_MS = 86400000;
+const utcDay = (ms) => Math.floor(ms / DAY_MS);
+
+/**
+ * Client Engagement (same idea as TA Analytics) for paying customers only:
+ * profiles that bought in the window, renewed in the window, or both.
+ *
+ *   member_since   the profile's first paid membership (earliest purchase)
+ *   days           days from member_since to today, inclusive
+ *   reading_days   distinct days with a breath test (table_test_data) since member_since
+ *   rate           reading_days / days, capped at 100 (TA Analytics' "Rate")
+ *
+ * Body: overview's period fields + trainer_admin?, group?: all | purchased | renewed.
+ * Rows carry customer names and emails (super_admin only, logged like the other views).
+ */
+async function engagement(p, body) {
+  const group = String(body.group || "all");
+  if (!ENGAGEMENT_GROUPS.has(group)) throw httpError(422, "group must be all, purchased or renewed");
+  const scope = await scopeFor(body);
+  const inScope = (r) => !scope || scope.has(scopeItem(r));
+
+  // profile_id -> { purchased, renewed, sub row (latest seen) }
+  const people = new Map();
+  const note = (pid, row, kind) => {
+    if (!pid) return;
+    const cur = people.get(pid) || { purchased: false, renewed: false, row };
+    cur[kind] = true;
+    if (toMs(row.created_at) > toMs(cur.row.created_at)) cur.row = row;
+    people.set(pid, cur);
+  };
+
+  if (group !== "renewed") {
+    const bought = (await loadPurchases(p)).filter((i) => i.counts && (!scope || scope.has(i)));
+    for (const i of bought) note(i.raw.profile_id, i.raw, "purchased");
+  }
+
+  let renewalsAvailable = true;
+  if (group !== "purchased") {
+    try {
+      const [rows] = await pool.query(
+        `
+          SELECT rs.profile_id, rs.purchaser_name, rs.purchaser_email, rs.attributed_partner_code,
+                 rs.attributed_user_id, rs.facility_id, rs.status, rs.canceled_at, rs.created_at
+          FROM payment_transactions pt
+          JOIN referral_subscriptions rs ON rs.stripe_subscription_id = pt.stripe_subscription_id
+          WHERE pt.billing_reason = 'subscription_cycle'
+            AND pt.status IN ${PAID_INVOICE}
+            AND COALESCE(pt.paid_at, pt.created_at) >= ? AND COALESCE(pt.paid_at, pt.created_at) < ?
+            AND LEFT(rs.stripe_subscription_id, 5) <> 'test_'
+            AND rs.profile_id IS NOT NULL
+        `,
+        [p.startUtc, p.endUtc]
+      );
+      for (const r of rows) if (inScope(r)) note(r.profile_id, r, "renewed");
+    } catch (err) {
+      if (err?.code !== "ER_NO_SUCH_TABLE" && err?.errno !== 1146) throw err;
+      renewalsAvailable = false;
+    }
+  }
+
+  const ids = [...people.keys()];
+  const nowMs = Date.now();
+  const today = utcDay(nowMs + p.offset * 60000);
+  const empty = {
+    filters: { period: p.period, date_from: p.dateFrom, date_to: p.dateTo, group },
+    renewals_available: renewalsAvailable,
+    summary: {
+      clients: 0, purchased: 0, renewed: 0, both: 0, avg_rate: 0, high_rate: 0, low_rate: 0,
+      never_tested: 0, never_tested_rate: null, readings_this_week: 0, readings_last_week: 0,
+      readings_week_change: null, goals: { fat_loss: 0, muscle_gain: 0, weight_loss: 0, other: 0 },
+      cohorts: COHORT_TIERS.map((t) => ({ tier: `${t}%+`, count: 0, rate: null })).concat({ tier: "<10%", count: 0, rate: null }),
+    },
+    clients: [],
+  };
+  if (!ids.length) return empty;
+
+  // First paid membership per profile, client name, goal, tests.
+  const [since] = await pool.query(
+    `
+      SELECT profile_id, MIN(created_at) AS first_purchase
+      FROM referral_subscriptions
+      WHERE profile_id IN (?) AND LEFT(stripe_subscription_id, 5) <> 'test_'
+        AND status NOT IN ('incomplete', 'incomplete_expired')
+      GROUP BY profile_id
+    `,
+    [ids]
+  );
+  const [names] = await pool.query(
+    `
+      SELECT tc.profile_id, tc.profile_name, tc.email
+      FROM table_clients tc
+      JOIN (SELECT profile_id, MAX(id) AS id FROM table_clients WHERE profile_id IN (?) GROUP BY profile_id) x ON x.id = tc.id
+    `,
+    [ids]
+  );
+  const [goals] = await pool.query(
+    `
+      SELECT uh.profile_id, uh.goal
+      FROM user_habits uh
+      JOIN (SELECT profile_id, MAX(id) AS id FROM user_habits WHERE profile_id IN (?) GROUP BY profile_id) x ON x.id = uh.id
+    `,
+    [ids]
+  );
+  const [tests] = await pool.query(
+    `
+      SELECT profile_id, DATE_FORMAT(date_time, '%Y-%m-%d') AS day, COUNT(*) AS n,
+             MAX(date_time) AS last_at,
+             SUBSTRING_INDEX(GROUP_CONCAT(fat_loss_metabolism_score ORDER BY date_time DESC, test_id DESC), ',', 1) AS day_score
+      FROM table_test_data
+      WHERE profile_id IN (?)
+      GROUP BY profile_id, DATE_FORMAT(date_time, '%Y-%m-%d')
+    `,
+    [ids]
+  );
+
+  const sinceBy = new Map(since.map((r) => [r.profile_id, toMs(r.first_purchase)]));
+  const nameBy = new Map(names.map((r) => [r.profile_id, r]));
+  const goalBy = new Map(goals.map((r) => [r.profile_id, String(r.goal || "").trim()]));
+  const testsBy = new Map();
+  for (const t of tests) {
+    const list = testsBy.get(t.profile_id) || [];
+    list.push({ day: utcDay(Date.parse(`${t.day}T00:00:00Z`)), n: Number(t.n) || 0, lastMs: toMs(t.last_at), score: t.day_score });
+    testsBy.set(t.profile_id, list);
+  }
+
+  const codes = [...new Set([...people.values()].map((v) => String(v.row.attributed_partner_code || "").toUpperCase()).filter(Boolean))];
+  const directory = await trainerDirectory(codes);
+
+  const weekStart = today - 6;
+  const prevWeekStart = today - 13;
+  let thisWeek = 0;
+  let lastWeek = 0;
+
+  const clients = ids.map((pid) => {
+    const v = people.get(pid);
+    const startMs = sinceBy.get(pid) ?? toMs(v.row.created_at);
+    const startDay = utcDay(startMs + p.offset * 60000);
+    const days = Math.max(1, today - startDay + 1);
+    const list = (testsBy.get(pid) || []).filter((t) => t.day >= startDay);
+    const readingDays = list.length;
+    const readings = list.reduce((s, t) => s + t.n, 0);
+    for (const t of list) {
+      if (t.day >= weekStart && t.day <= today) thisWeek += t.n;
+      else if (t.day >= prevWeekStart && t.day < weekStart) lastWeek += t.n;
+    }
+    const latest = list.reduce((a, t) => (!a || t.lastMs > a.lastMs ? t : a), null);
+    const rate = Math.min(100, Math.round((readingDays / days) * 100));
+    const code = String(v.row.attributed_partner_code || "").toUpperCase() || null;
+    const n = nameBy.get(pid);
+    const score = latest?.score != null && latest.score !== "" ? Number(latest.score) : null;
+    return {
+      profile_id: pid,
+      name: n?.profile_name || v.row.profile_name || v.row.purchaser_name || null,
+      email: n?.email || v.row.purchaser_email || null,
+      purchased: v.purchased,
+      renewed: v.renewed,
+      trainer_code: code,
+      trainer_name: code ? directory.get(code)?.name || null : null,
+      subscription_status: memberState(v.row.status, v.row.canceled_at),
+      fitness_goal: goalBy.get(pid) || null,
+      member_since: startMs == null ? null : toIso(new Date(startMs)),
+      days,
+      reading_days: readingDays,
+      readings,
+      last_reading: latest?.lastMs != null ? toIso(new Date(latest.lastMs)) : null,
+      metabolism_score: Number.isFinite(score) ? score : null,
+      rate,
+      cohort: cohortOf(rate),
+    };
+  });
+  clients.sort((a, b) => b.rate - a.rate || b.reading_days - a.reading_days);
+
+  const total = clients.length;
+  const goalCounts = { fat_loss: 0, muscle_gain: 0, weight_loss: 0, other: 0 };
+  for (const c of clients) {
+    const g = String(c.fitness_goal || "").toLowerCase();
+    if (g.includes("fat")) goalCounts.fat_loss += 1;
+    else if (g.includes("weight")) goalCounts.weight_loss += 1;
+    else if (g.includes("muscle") || g.includes("gain")) goalCounts.muscle_gain += 1;
+    else goalCounts.other += 1;
+  }
+  const neverTested = clients.filter((c) => c.reading_days === 0).length;
+  const tiers = [...COHORT_TIERS.map((t) => `${t}%+`), "<10%"];
+
+  return {
+    ...empty,
+    summary: {
+      clients: total,
+      purchased: clients.filter((c) => c.purchased).length,
+      renewed: clients.filter((c) => c.renewed).length,
+      both: clients.filter((c) => c.purchased && c.renewed).length,
+      avg_rate: Math.round(clients.reduce((s, c) => s + c.rate, 0) / total),
+      high_rate: Math.max(...clients.map((c) => c.rate)),
+      low_rate: Math.min(...clients.map((c) => c.rate)),
+      never_tested: neverTested,
+      never_tested_rate: pct(neverTested, total),
+      readings_this_week: thisWeek,
+      readings_last_week: lastWeek,
+      readings_week_change: lastWeek ? Math.round(((thisWeek - lastWeek) / lastWeek) * 1000) / 10 : null,
+      goals: goalCounts,
+      cohorts: tiers.map((tier) => {
+        const count = clients.filter((c) => c.cohort === tier).length;
+        return { tier, count, rate: pct(count, total) };
+      }),
+    },
+    clients,
   };
 }
 
@@ -760,8 +1127,9 @@ const superAdminSalesAnalytics = async (req, res) => {
     let payload;
     if (view === "overview") payload = await overview(parsePeriod(body), body);
     else if (view === "purchases") payload = await purchases(parsePeriod(body), body);
+    else if (view === "engagement") payload = await engagement(parsePeriod(body), body);
     else if (view === "trainer_admins") payload = { trainer_admins: await trainerAdmins() };
-    else return res.status(422).json({ status: false, ok: false, message: "view must be overview, purchases or trainer_admins" });
+    else return res.status(422).json({ status: false, ok: false, message: "view must be overview, purchases, engagement or trainer_admins" });
 
     await H.writeAuthLogSafe(req, {
       eventType: "super_admin_sales_analytics_viewed",
