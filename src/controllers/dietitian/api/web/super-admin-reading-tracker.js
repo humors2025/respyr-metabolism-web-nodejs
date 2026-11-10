@@ -244,6 +244,38 @@ function summarize(rows, month, today) {
   };
 }
 
+/**
+ * Chart data for the month, over every row (like summary: no search, show or paging).
+ *
+ *   daily   one entry per day of the month: linked clients who took a reading that
+ *           day, who missed it but have tested at some point, who missed it and have
+ *           never tested, and who have no reading yet today (pending).
+ *   groups  each client once: took at least one reading this month, tested before
+ *           but none this month, never tested, or no app profile linked yet.
+ */
+function chartData(rows, month) {
+  const days = eachDay(`${month}-01`, monthEnd(month));
+  const index = new Map(days.map((d, i) => [d, i]));
+  const daily = days.map((day) => ({ day, took: 0, missed: 0, never: 0, pending: 0 }));
+  const groups = { took: 0, missed: 0, never: 0, not_linked: 0 };
+
+  for (const r of rows) {
+    if (!r.linked) {
+      groups.not_linked += 1;
+      continue;
+    }
+    const never = !r.first_reading;
+    if (r.taken_days.length > 0) groups.took += 1;
+    else if (never) groups.never += 1;
+    else groups.missed += 1;
+
+    for (const d of r.taken_days) if (index.has(d)) daily[index.get(d)].took += 1;
+    for (const d of r.missed_days) if (index.has(d)) daily[index.get(d)][never ? "never" : "missed"] += 1;
+    for (const d of r.pending_days) if (index.has(d)) daily[index.get(d)].pending += 1;
+  }
+  return { daily, groups };
+}
+
 async function loadSubscriptions(end) {
   const excluded = BREATH_CREDIT_EXCLUDE_PROFILES;
   const [subs] = await pool.execute(
@@ -364,6 +396,7 @@ const superAdminReadingTracker = async (req, res) => {
 
     const rows = buildRows(subs, readingDays, history, month, today, latestDay);
     const summary = summarize(rows, month, today);
+    const charts = chartData(rows, month);
     const matching = rows.filter((r) => {
       if (!matchesShow(r, show, month, today)) return false;
       return !search || [r.name, r.email, r.profile_id].some((v) => v && v.toLowerCase().includes(search));
@@ -391,6 +424,7 @@ const superAdminReadingTracker = async (req, res) => {
       today,
       days_in_month: Number(end.slice(8)),
       summary,
+      charts,
       rows: pageRows,
       pagination: { page, limit, total, total_pages: Math.max(1, Math.ceil(total / limit)) },
     });
@@ -413,5 +447,5 @@ const superAdminReadingTracker = async (req, res) => {
 
 module.exports = {
   superAdminReadingTracker,
-  _helpers: { usDay, US_EASTERN, monthEnd, countedWindow, buildRows, matchesShow, sortRows, summarize },
+  _helpers: { usDay, US_EASTERN, monthEnd, countedWindow, buildRows, matchesShow, sortRows, summarize, chartData },
 };
