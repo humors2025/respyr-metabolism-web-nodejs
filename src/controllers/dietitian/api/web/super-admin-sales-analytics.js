@@ -584,7 +584,7 @@ async function renewalsAndRetention(p, scope, currency, counted, firstPaymentNet
     );
     const [dueRows] = await pool.query(
       `
-        SELECT pt.id, rs.status, rs.canceled_at,
+        SELECT pt.id, rs.status, rs.canceled_at, (pt.period_end > UTC_TIMESTAMP()) AS not_ended,
                rs.attributed_partner_code, rs.attributed_user_id, rs.facility_id,
                EXISTS (
                  SELECT 1 FROM payment_transactions n
@@ -598,22 +598,34 @@ async function renewalsAndRetention(p, scope, currency, counted, firstPaymentNet
         JOIN referral_subscriptions rs ON rs.stripe_subscription_id = pt.stripe_subscription_id
         WHERE pt.billing_reason IN ('subscription_create', 'subscription_cycle')
           AND pt.status IN ('paid', 'partially_refunded')
-          AND pt.period_end >= ? AND pt.period_end < ? AND pt.period_end <= UTC_TIMESTAMP()
+          AND pt.period_end >= ? AND pt.period_end < ?
           AND LEFT(rs.stripe_subscription_id, 5) <> 'test_'
       `,
       [p.startUtc, p.endUtc]
     );
+    // dueRows also carries periods that end later in the window; only the ones
+    // already cancelled count (they will not renew), the rest are not due yet.
 
     const paid = paidRows.filter((r) => inScope(r) && String(r.currency || "").toUpperCase() === currency);
     const net = paid.reduce((s, r) => s + Number(r.amount_paid_minor || 0) - Number(r.amount_refunded_minor || 0), 0);
 
-    const due = { total: 0, renewed: 0, pending: 0, lapsed: 0 };
+    // renewed    a paid renewal followed
+    // cancelled  month not over yet, but they already cancelled: will not renew
+    // lapsed     month over, plan ended without renewing
+    // pending    month over, plan still live, renewal not paid yet
+    const due = { total: 0, renewed: 0, pending: 0, lapsed: 0, cancelled: 0 };
     for (const r of dueRows) {
       if (!inScope(r)) continue;
-      due.total += 1;
-      if (Number(r.renewed)) due.renewed += 1;
-      else if (memberState(r.status, null) === "ended") due.lapsed += 1;
+      const renewed = Number(r.renewed);
+      const ended = memberState(r.status, null) === "ended";
+      if (Number(r.not_ended)) {
+        if (renewed) due.renewed += 1;
+        else if (r.canceled_at || ended) due.cancelled += 1;
+        else continue; // not due yet
+      } else if (renewed) due.renewed += 1;
+      else if (ended) due.lapsed += 1;
       else due.pending += 1;
+      due.total += 1;
     }
 
     renewals = {
@@ -625,6 +637,8 @@ async function renewalsAndRetention(p, scope, currency, counted, firstPaymentNet
       renewed: due.renewed,
       pending: due.pending,
       lapsed: due.lapsed,
+      cancelled: due.cancelled,
+      cancelled_rate: pct(due.cancelled, due.total),
       renewal_rate: pct(due.renewed, due.total),
       pending_rate: pct(due.pending, due.total),
       lapse_rate: pct(due.lapsed, due.total),
