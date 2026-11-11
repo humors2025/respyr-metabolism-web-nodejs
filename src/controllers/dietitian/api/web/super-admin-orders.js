@@ -26,6 +26,13 @@
  *                  the next `days` days (default 10), soonest first. Each row
  *                  carries the renewals paid so far and the last payment.
  *                  Super-admin test codes (test_… rows) are left out.
+ *   view=cancellations
+ *                  referral_subscriptions the member cancelled (canceled_at
+ *                  set, or status canceled), newest cancellation first.
+ *                  state=scheduled keeps those still inside their paid
+ *                  period, state=ended those whose plan is over. Each row
+ *                  carries what they paid, the phone from Checkout and
+ *                  Stripe's cancellation_details (reason / feedback / comment).
  *
  * Both join referral_subscriptions (by stripe_subscription_id) for the buyer's
  * email / name and the partner code used. Shipping rows also carry the plan's
@@ -37,10 +44,11 @@
  * paid_period (the latest paid invoice's period) and renewal_pending (Stripe
  * started a newer period whose invoice is not paid yet).
  *
- * Body: { view: "shipping" | "payments" | "upcoming_renewals", search?, page?, limit?,
+ * Body: { view: "shipping" | "payments" | "upcoming_renewals" | "cancellations", search?, page?, limit?,
  *         payments only: status? ("all" | open | paid | failed | refunded | partially_refunded),
  *                        type? ("all" | first_payment | renewal), paid_only? (boolean),
- *         upcoming_renewals only: days? (1-31, default 10) }
+ *         upcoming_renewals only: days? (1-31, default 10),
+ *         cancellations only: state? ("all" | scheduled | ended) }
  */
 
 const pool = require("../../../../config/db");
@@ -626,6 +634,194 @@ async function upcomingRenewals(body) {
   };
 }
 
+// Members who cancelled: the webhook stamps referral_subscriptions.canceled_at
+// on a cancel at period end (Stripe status stays "active" until the paid
+// period runs out) and flips status to "canceled" when the plan ends.
+//   scheduled  still has access: running, period end in the future
+//   ended      the plan is over
+const CANCEL_STATES = ["scheduled", "ended"];
+const SCHEDULED_SQL =
+  "(rs.status IN ('active', 'trialing', 'past_due') AND rs.current_period_end > UTC_TIMESTAMP())";
+
+async function cancellations(body) {
+  const { page, limit, offset } = parsePaging(body);
+  const search = parseSearch(body);
+  const state = String(body.state || body.status || "all").toLowerCase();
+  if (state !== "all" && !CANCEL_STATES.includes(state)) {
+    throw httpError(422, `state must be all or one of ${CANCEL_STATES.join(", ")}`);
+  }
+
+  // Test-code rows (test_…) have no Stripe subscription behind them.
+  const scope = [
+    "(rs.canceled_at IS NOT NULL OR rs.status = 'canceled')",
+    "LEFT(rs.stripe_subscription_id, 5) <> 'test_'",
+  ];
+  const where = [...scope];
+  const params = [];
+  if (state === "scheduled") where.push(SCHEDULED_SQL);
+  else if (state === "ended") where.push(`NOT ${SCHEDULED_SQL}`);
+  if (search) {
+    where.push(`(
+      rs.purchaser_email LIKE ? OR rs.purchaser_name LIKE ? OR rs.attributed_partner_code LIKE ?
+      OR rs.stripe_subscription_id LIKE ? OR rs.profile_id LIKE ?
+    )`);
+    params.push(...Array(5).fill(like(search)));
+  }
+  const whereSql = `WHERE ${where.join(" AND ")}`;
+
+  const [[{ total }]] = await pool.query(`SELECT COUNT(*) AS total FROM referral_subscriptions rs ${whereSql}`, params);
+  const [rows] = await pool.query(
+    `
+      SELECT
+        rs.id, rs.stripe_subscription_id, rs.purchaser_email, rs.purchaser_name, rs.profile_id,
+        rs.attributed_partner_code,
+        rs.status AS subscription_status, rs.current_period_start, rs.current_period_end, rs.canceled_at,
+        rs.currency, rs.created_at AS purchased_at,
+        ${SCHEDULED_SQL} AS still_active
+      FROM referral_subscriptions rs
+      ${whereSql}
+      ORDER BY COALESCE(rs.canceled_at, rs.created_at) DESC, rs.id DESC
+      LIMIT ? OFFSET ?
+    `,
+    [...params, limit, offset]
+  );
+
+  // Counts across every cancellation (ignoring the search and state filter).
+  const [[counts]] = await pool.query(
+    `SELECT COUNT(*) AS total, COALESCE(SUM(${SCHEDULED_SQL}), 0) AS scheduled,
+            COALESCE(SUM(rs.canceled_at >= UTC_TIMESTAMP() - INTERVAL 30 DAY), 0) AS last_30_days
+     FROM referral_subscriptions rs WHERE ${scope.join(" AND ")}`
+  );
+
+  const subIds = rows.map((r) => r.stripe_subscription_id).filter(Boolean);
+
+  // What each member paid before cancelling.
+  const paidBySub = new Map();
+  if (subIds.length) {
+    const [paid] = await pool.query(
+      `
+        SELECT stripe_subscription_id, billing_reason, amount_paid_minor, amount_refunded_minor, currency, paid_at, created_at
+        FROM payment_transactions
+        WHERE stripe_subscription_id IN (?) AND status IN (?)
+        ORDER BY COALESCE(paid_at, created_at) ASC, id ASC
+      `,
+      [subIds, PAID_STATUSES]
+    );
+    for (const p of paid) {
+      const h = paidBySub.get(p.stripe_subscription_id) || { count: 0, renewals: 0, paid: 0, refunded: 0, currency: p.currency, last: null };
+      h.count += 1;
+      if (p.billing_reason === "subscription_cycle") h.renewals += 1;
+      h.paid += Number(p.amount_paid_minor || 0);
+      h.refunded += Number(p.amount_refunded_minor || 0);
+      h.last = p;
+      paidBySub.set(p.stripe_subscription_id, h);
+    }
+  }
+
+  // Phone from Checkout, for a follow-up call.
+  const phoneBySub = new Map();
+  if (subIds.length) {
+    try {
+      const [ship] = await pool.query(
+        "SELECT stripe_subscription_id, phone, state FROM subscription_shipping_addresses WHERE stripe_subscription_id IN (?)",
+        [subIds]
+      );
+      for (const s of ship) phoneBySub.set(s.stripe_subscription_id, { phone: s.phone || null, state: s.state || null });
+    } catch (err) {
+      console.error("SUPER_ADMIN_ORDERS_CANCEL_SHIPPING_ERROR:", { code: err?.code, message: err?.message });
+    }
+  }
+
+  // Why it was cancelled lives only in Stripe (cancellation_details: reason,
+  // plus the feedback / comment the member gave in the customer portal).
+  // Best-effort: a Stripe hiccup leaves it null.
+  const stripeInfo = new Map();
+  try {
+    const stripe = requireStripe();
+    const CHUNK = 8;
+    for (let i = 0; i < subIds.length; i += CHUNK) {
+      await Promise.all(
+        subIds.slice(i, i + CHUNK).map(async (id) => {
+          try {
+            const sub = await stripe.subscriptions.retrieve(id);
+            const d = sub.cancellation_details || {};
+            stripeInfo.set(id, {
+              reason: d.reason || null,
+              feedback: d.feedback || null,
+              comment: d.comment || null,
+              cancel_at: sub.cancel_at ? new Date(sub.cancel_at * 1000).toISOString().replace(".000Z", "Z") : null,
+              ended_at: sub.ended_at ? new Date(sub.ended_at * 1000).toISOString().replace(".000Z", "Z") : null,
+            });
+          } catch (err) {
+            console.warn("CANCELLATION_STRIPE_LOOKUP_FAILED:", { sub: id, code: err?.code, message: err?.message });
+          }
+        })
+      );
+    }
+  } catch {
+    // No Stripe key configured: reasons stay null.
+  }
+
+  const codeOf = (r) => String(r.attributed_partner_code || "").toUpperCase() || null;
+  const facilities = await facilityByCode(rows, codeOf);
+
+  const now = Date.now();
+  return {
+    filters: { state, search, search_min_length: SEARCH_MIN_LENGTH },
+    cancellations: rows.map((r) => {
+      const h = paidBySub.get(r.stripe_subscription_id) || null;
+      const s = stripeInfo.get(r.stripe_subscription_id) || null;
+      const stillActive = Boolean(Number(r.still_active));
+      return {
+        id: Number(r.id),
+        canceled_at: toIso(r.canceled_at),
+        customer: {
+          name: r.purchaser_name || null,
+          email: r.purchaser_email || null,
+          phone: phoneBySub.get(r.stripe_subscription_id)?.phone || null,
+          // The linked app profile (null until the buyer redeems their code).
+          profile_id: r.profile_id || null,
+        },
+        partner_code: r.attributed_partner_code || null,
+        facility: (codeOf(r) && facilities.get(codeOf(r))) || null,
+        purchased_at: toIso(r.purchased_at),
+        // scheduled = cancelled but still has access until access_ends;
+        // ended = the plan is over.
+        cancel_state: stillActive ? "scheduled" : "ended",
+        access_ends: s?.ended_at || toIso(r.current_period_end),
+        payments: h
+          ? {
+              count: h.count,
+              renewals: h.renewals,
+              total_paid: minorToMajor(h.paid),
+              total_refunded: minorToMajor(h.refunded),
+              currency: h.currency || r.currency,
+              last_payment: {
+                amount_paid: minorToMajor(h.last.amount_paid_minor),
+                date: toIso(h.last.paid_at || h.last.created_at),
+              },
+            }
+          : null,
+        // From Stripe; null when the lookup failed.
+        cancellation: s ? { reason: s.reason, feedback: s.feedback, comment: s.comment } : null,
+        subscription_status: deriveSubscriptionStatus(r, now),
+        stripe_status: r.subscription_status || null,
+        current_period_start: toIso(r.current_period_start),
+        current_period_end: toIso(r.current_period_end),
+        stripe_subscription_id: r.stripe_subscription_id,
+      };
+    }),
+    summary: {
+      total: Number(counts.total || 0),
+      scheduled: Number(counts.scheduled || 0),
+      ended: Number(counts.total || 0) - Number(counts.scheduled || 0),
+      last_30_days: Number(counts.last_30_days || 0),
+    },
+    state_options: CANCEL_STATES,
+    pagination: { page, limit, total: Number(total), total_pages: Math.max(1, Math.ceil(Number(total) / limit)) },
+  };
+}
+
 // ─── Controller ──────────────────────────────────────────────────────────────
 
 const superAdminOrders = async (req, res) => {
@@ -649,7 +845,8 @@ const superAdminOrders = async (req, res) => {
     if (view === "shipping") payload = await shipping(body);
     else if (view === "payments") payload = await payments(body);
     else if (view === "upcoming_renewals") payload = await upcomingRenewals(body);
-    else return res.status(422).json({ status: false, ok: false, message: "view must be shipping, payments or upcoming_renewals" });
+    else if (view === "cancellations") payload = await cancellations(body);
+    else return res.status(422).json({ status: false, ok: false, message: "view must be shipping, payments, upcoming_renewals or cancellations" });
 
     // Shipping rows carry buyers' home addresses and phones: log every read.
     await H.writeAuthLogSafe(req, {
