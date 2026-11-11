@@ -35,7 +35,7 @@
  * purchases to limit every number to that TA's network (see
  * trainerAdminNetwork). view=trainer_admins lists the TAs to choose from.
  *
- * Body: { view: "overview" | "purchases" | "trainer_admins", trainer_admin?, period: week|month|year,
+ * Body: { view: "overview" | "purchases" | "monthly" | "trainer_admins", trainer_admin?, period: week|month|year,
  *         date_from, date_to (YYYY-MM-DD, inclusive, viewer's calendar),
  *         tz_offset_minutes,
  *         purchases only: source, partner_code, subscription_status, payment_status, search, page, limit }
@@ -837,6 +837,112 @@ async function overview(p, body) {
   };
 }
 
+// ─── view=monthly ────────────────────────────────────────────────────────────
+
+/**
+ * Overall sales: every month since the first sale (ignores the date filter),
+ * in the viewer's calendar. Per month: new purchases (first payments, same
+ * rules as overview) and renewals (paid subscription_cycle invoices), count
+ * and net amount, plus all-time totals. Respects trainer_admin.
+ *
+ * Body: { view: "monthly", tz_offset_minutes?, trainer_admin? }
+ */
+async function monthly(body) {
+  const offset = body.tz_offset_minutes == null || body.tz_offset_minutes === "" ? 0 : Number(body.tz_offset_minutes);
+  if (!Number.isInteger(offset) || offset < -840 || offset > 840) {
+    throw httpError(422, "tz_offset_minutes must be an integer between -840 and 840");
+  }
+  const scope = await scopeFor(body);
+  const all = await loadPurchases({ startUtc: "2000-01-01 00:00:00", endUtc: "2100-01-01 00:00:00" });
+  const items = scope ? all.filter((i) => scope.has(i)) : all;
+  const { currency } = primaryCurrency(items);
+  const counted = items.filter((i) => i.counts && i.currency === currency);
+
+  const monthOf = (ms) => {
+    const d = new Date(ms + offset * 60000);
+    return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}`;
+  };
+  const months = new Map();
+  const row = (key) => {
+    if (!months.has(key)) months.set(key, { new_purchases: 0, new_net: 0, renewals: 0, renewal_net: 0 });
+    return months.get(key);
+  };
+
+  for (const i of counted) {
+    const m = row(monthOf(i.createdMs));
+    m.new_purchases += 1;
+    m.new_net += i.net;
+  }
+
+  let renewalsAvailable = true;
+  try {
+    const [paidRows] = await pool.query(
+      `
+        SELECT COALESCE(pt.paid_at, pt.created_at) AS paid_at,
+               pt.amount_paid_minor, pt.amount_refunded_minor, pt.currency,
+               rs.attributed_partner_code, rs.attributed_user_id, rs.facility_id
+        FROM payment_transactions pt
+        JOIN referral_subscriptions rs ON rs.stripe_subscription_id = pt.stripe_subscription_id
+        WHERE pt.billing_reason = 'subscription_cycle'
+          AND pt.status IN ${PAID_INVOICE}
+          AND ${realSubscriptionSql("rs.stripe_subscription_id")}
+      `
+    );
+    for (const r of paidRows) {
+      if (scope && !scope.has(scopeItem(r))) continue;
+      if (String(r.currency || "").toUpperCase() !== currency) continue;
+      const ms = toMs(r.paid_at);
+      if (ms == null) continue;
+      const m = row(monthOf(ms));
+      m.renewals += 1;
+      m.renewal_net += Number(r.amount_paid_minor || 0) - Number(r.amount_refunded_minor || 0);
+    }
+  } catch (err) {
+    // Environments without payment_transactions: show new purchases only.
+    if (err?.code !== "ER_NO_SUCH_TABLE" && err?.errno !== 1146) throw err;
+    renewalsAvailable = false;
+  }
+
+  // Every month from the first sale to this month, empty months included.
+  const keys = [...months.keys()].sort();
+  const list = [];
+  if (keys.length) {
+    let [y, mo] = keys[0].split("-").map(Number);
+    const last = monthOf(Date.now());
+    for (let key = keys[0]; key <= last; ) {
+      const m = months.get(key) || { new_purchases: 0, new_net: 0, renewals: 0, renewal_net: 0 };
+      list.push({
+        month: key,
+        new_purchases: m.new_purchases,
+        new_sales: minorToMajor(m.new_net),
+        renewals: m.renewals,
+        renewal_sales: minorToMajor(m.renewal_net),
+        total_payments: m.new_purchases + m.renewals,
+        total_sales: minorToMajor(m.new_net + m.renewal_net),
+      });
+      mo += 1;
+      if (mo > 12) { mo = 1; y += 1; }
+      key = `${y}-${pad(mo)}`;
+    }
+  }
+
+  const sum = (k) => list.reduce((a, m) => a + Number(m[k] || 0), 0);
+  const money = (k) => Math.round(sum(k) * 100) / 100;
+  return {
+    currency,
+    renewals_available: renewalsAvailable,
+    totals: {
+      new_purchases: sum("new_purchases"),
+      new_sales: money("new_sales"),
+      renewals: sum("renewals"),
+      renewal_sales: money("renewal_sales"),
+      total_payments: sum("total_payments"),
+      total_sales: money("total_sales"),
+    },
+    months: list,
+  };
+}
+
 // ─── view=engagement ─────────────────────────────────────────────────────────
 
 const ENGAGEMENT_GROUPS = new Set(["all", "purchased", "renewed"]);
@@ -1184,8 +1290,9 @@ const superAdminSalesAnalytics = async (req, res) => {
     if (view === "overview") payload = await overview(parsePeriod(body), body);
     else if (view === "purchases") payload = await purchases(parsePeriod(body), body);
     else if (view === "engagement") payload = await engagement(parsePeriod(body), body);
+    else if (view === "monthly") payload = await monthly(body);
     else if (view === "trainer_admins") payload = { trainer_admins: await trainerAdmins() };
-    else return res.status(422).json({ status: false, ok: false, message: "view must be overview, purchases, engagement or trainer_admins" });
+    else return res.status(422).json({ status: false, ok: false, message: "view must be overview, purchases, engagement, monthly or trainer_admins" });
 
     await H.writeAuthLogSafe(req, {
       eventType: "super_admin_sales_analytics_viewed",
