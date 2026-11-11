@@ -558,6 +558,8 @@ function memberState(status, canceledAt) {
  *              pending (plan live, renewal not paid yet) or lapsed (plan ended).
  *   cohort     purchases made in the window and what state they are in today.
  *   members    every paid membership ever sold (in scope): still active vs ended.
+ *   cancellations  members whose canceled_at falls in the window: still has
+ *              access (scheduled) vs ended, plus the newest 50 by name.
  *
  * payment_transactions is optional (production may not have migration 006):
  * without it renewals is null and the page says renewal data is unavailable.
@@ -651,6 +653,43 @@ async function renewalsAndRetention(p, scope, currency, counted, firstPaymentNet
     members[memberState(r.status, r.canceled_at)] += 1;
   }
 
+  // Members who cancelled during the window (Stripe canceled_at = when they asked
+  // to cancel). "scheduled" still have access until their paid month ends.
+  const [cancelRows] = await pool.query(
+    `
+      SELECT rs.id, rs.purchaser_name, rs.purchaser_email, rs.profile_id,
+             rs.attributed_partner_code, rs.attributed_user_id, rs.facility_id,
+             rs.canceled_at, rs.current_period_end, rs.created_at,
+             (rs.status IN ('active', 'trialing', 'past_due') AND rs.current_period_end > UTC_TIMESTAMP()) AS still_active
+      FROM referral_subscriptions rs
+      WHERE rs.canceled_at >= ? AND rs.canceled_at < ?
+        AND LEFT(rs.stripe_subscription_id, 5) <> 'test_'
+        AND rs.status NOT IN ('incomplete', 'incomplete_expired')
+      ORDER BY rs.canceled_at DESC, rs.id DESC
+    `,
+    [p.startUtc, p.endUtc]
+  );
+  const cancelled = cancelRows.filter(inScope);
+  const cancelScheduled = cancelled.filter((r) => Number(r.still_active)).length;
+  const CANCEL_LIST_MAX = 50;
+  const cancellations = {
+    total: cancelled.length,
+    scheduled: cancelScheduled,
+    ended: cancelled.length - cancelScheduled,
+    list_limit: CANCEL_LIST_MAX,
+    list: cancelled.slice(0, CANCEL_LIST_MAX).map((r) => ({
+      id: Number(r.id),
+      name: r.purchaser_name || null,
+      email: r.purchaser_email || null,
+      profile_id: r.profile_id || null,
+      partner_code: r.attributed_partner_code || null,
+      purchased_at: toIso(r.created_at),
+      canceled_at: toIso(r.canceled_at),
+      access_ends: toIso(r.current_period_end),
+      state: Number(r.still_active) ? "scheduled" : "ended",
+    })),
+  };
+
   const rates = (o, whole) => ({
     active_rate: pct(o.active, whole),
     cancellation_scheduled_rate: pct(o.cancellation_scheduled, whole),
@@ -661,6 +700,7 @@ async function renewalsAndRetention(p, scope, currency, counted, firstPaymentNet
   return {
     renewals,
     cohort: { ...cohort, ...rates(cohort, cohort.purchases) },
+    cancellations,
     members: {
       ...members,
       ...rates(members, members.total),
