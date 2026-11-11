@@ -6,6 +6,8 @@
 //      account (before the switch to the current account on 29 Sep). That
 //      account no longer sends webhooks, so these rows stay "active" forever
 //      with a period that ended on 20–21 Oct and no payment rows.
+//   3. Internal $1 test subscription on the current account (staff account,
+//      29 Sep 2026, renewed at $1).
 //
 // The IDs only exist in the production database; elsewhere they match nothing.
 // Rows are left untouched in referral_subscriptions — they are only skipped here.
@@ -34,6 +36,7 @@ const EXCLUDED_SUBSCRIPTION_IDS = Object.freeze([
   "sub_1UI5IwHQhLpPZZsEze0xzhm2", // 2026-09-21
   "sub_1UI5QzHQhLpPZZsENuwUIzS8", // 2026-09-21
   "sub_1UI5TjHQhLpPZZsEQRlBu3hz", // 2026-09-21
+  "sub_1UL11dHp3z0wKGvIMkxfY9If", // 2026-09-29, $1 internal test (current account)
 ]);
 
 const SAFE_ID = /^sub_[A-Za-z0-9]+$/;
