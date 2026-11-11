@@ -52,6 +52,7 @@
  */
 
 const pool = require("../../../../config/db");
+const { notHiddenOnOrdersSql } = require("../../../../services/excludedSubscriptions");
 const { requireStripe } = require("../../../../config/stripe");
 const { creditForReadingDays } = require("../../../../services/breathCredits");
 const { BREATH_CREDIT_EXCLUDE_PROFILES } = require("../../../../config/stripe");
@@ -183,7 +184,8 @@ async function shipping(body) {
   const { page, limit, offset } = parsePaging(body);
   const search = parseSearch(body);
 
-  const where = [];
+  // Internal test subscriptions stay off the Orders page.
+  const where = [notHiddenOnOrdersSql("sa.stripe_subscription_id")];
   const params = [];
   if (search) {
     where.push(`(
@@ -266,8 +268,9 @@ async function payments(body) {
   }
   const billingReason = type === "all" ? null : PAYMENT_TYPES[type];
 
-  // Type and paid-only scope both the list and the summary chips.
-  const scope = [];
+  // Type and paid-only scope both the list and the summary chips; internal
+  // test subscriptions are always left out.
+  const scope = [notHiddenOnOrdersSql("pt.stripe_subscription_id")];
   const scopeParams = [];
   if (billingReason) {
     scope.push("pt.billing_reason = ?");
@@ -329,7 +332,7 @@ async function payments(body) {
   // just this page, and ignoring the status and search filters).
   const [counts] = await pool.query(
     `SELECT status, currency, COUNT(*) AS n, SUM(amount_paid_minor) AS paid, SUM(amount_refunded_minor) AS refunded
-     FROM payment_transactions pt ${scope.length ? `WHERE ${scope.join(" AND ")}` : ""} GROUP BY status, currency`,
+     FROM payment_transactions pt WHERE ${scope.join(" AND ")} GROUP BY status, currency`,
     scopeParams
   );
 
@@ -403,6 +406,7 @@ async function upcomingRenewals(body) {
     "rs.current_period_end > UTC_TIMESTAMP()",
     "rs.current_period_end <= UTC_TIMESTAMP() + INTERVAL ? DAY",
     "LEFT(rs.stripe_subscription_id, 5) <> 'test_'",
+    notHiddenOnOrdersSql("rs.stripe_subscription_id"),
   ];
   const params = [days];
   if (search) {
@@ -655,6 +659,7 @@ async function cancellations(body) {
   const scope = [
     "(rs.canceled_at IS NOT NULL OR rs.status = 'canceled')",
     "LEFT(rs.stripe_subscription_id, 5) <> 'test_'",
+    notHiddenOnOrdersSql("rs.stripe_subscription_id"),
   ];
   const where = [...scope];
   const params = [];

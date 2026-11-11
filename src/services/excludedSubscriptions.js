@@ -57,4 +57,22 @@ function realSubscriptionSql(column = "stripe_subscription_id") {
   return `(${parts.join(" AND ")})`;
 }
 
-module.exports = { EXCLUDED_SUBSCRIPTION_IDS, realSubscriptionSql };
+// Internal test subscriptions that also stay off the Orders page (real Stripe
+// money, but staff testing). The 23 old-account rows have no payments, so the
+// Orders page keeps showing them as they are.
+const ORDERS_HIDDEN_IDS = Object.freeze(["sub_1UL11dHp3z0wKGvIMkxfY9If"]);
+for (const id of ORDERS_HIDDEN_IDS) {
+  if (!SAFE_ID.test(id)) throw new Error(`excludedSubscriptions: bad id ${id}`);
+}
+
+/**
+ * SQL condition for the Orders page: drops ORDERS_HIDDEN_IDS. NULL-safe, so
+ * rows without a subscription id stay.
+ * @param {string} column  e.g. "pt.stripe_subscription_id" (no user input).
+ */
+function notHiddenOnOrdersSql(column = "stripe_subscription_id") {
+  if (!SAFE_COLUMN.test(column)) throw new Error(`excludedSubscriptions: bad column ${column}`);
+  return `COALESCE(${column}, '') NOT IN (${ORDERS_HIDDEN_IDS.map((id) => `'${id}'`).join(", ")})`;
+}
+
+module.exports = { EXCLUDED_SUBSCRIPTION_IDS, ORDERS_HIDDEN_IDS, realSubscriptionSql, notHiddenOnOrdersSql };
