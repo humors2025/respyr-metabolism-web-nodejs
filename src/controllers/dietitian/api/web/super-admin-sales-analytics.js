@@ -45,6 +45,7 @@ const pool = require("../../../../config/db");
 const { PLAN_CODE } = require("../../../../config/stripe");
 const { _helpers: H } = require("./admin-invite-trainer");
 const { FIRST_PAYMENT_COLUMNS, firstPaymentAmounts } = require("../../../../services/firstPaymentAmount");
+const { realSubscriptionSql } = require("../../../../services/excludedSubscriptions");
 
 const YMD = /^\d{4}-\d{2}-\d{2}$/;
 const PERIODS = new Set(["week", "month", "year"]);
@@ -142,7 +143,7 @@ async function loadPurchases(p) {
         ) AS profile_name
       FROM referral_subscriptions rs
       WHERE rs.created_at >= ? AND rs.created_at < ?
-        AND LEFT(rs.stripe_subscription_id, 5) <> 'test_'
+        AND ${realSubscriptionSql("rs.stripe_subscription_id")}
       ORDER BY rs.created_at DESC, rs.id DESC
     `,
     [p.startUtc, p.endUtc]
@@ -578,7 +579,7 @@ async function renewalsAndRetention(p, scope, currency, counted, firstPaymentNet
         WHERE pt.billing_reason = 'subscription_cycle'
           AND pt.status IN ${PAID_INVOICE}
           AND COALESCE(pt.paid_at, pt.created_at) >= ? AND COALESCE(pt.paid_at, pt.created_at) < ?
-          AND LEFT(rs.stripe_subscription_id, 5) <> 'test_'
+          AND ${realSubscriptionSql("rs.stripe_subscription_id")}
       `,
       [p.startUtc, p.endUtc]
     );
@@ -599,7 +600,7 @@ async function renewalsAndRetention(p, scope, currency, counted, firstPaymentNet
         WHERE pt.billing_reason IN ('subscription_create', 'subscription_cycle')
           AND pt.status IN ('paid', 'partially_refunded')
           AND pt.period_end >= ? AND pt.period_end < ?
-          AND LEFT(rs.stripe_subscription_id, 5) <> 'test_'
+          AND ${realSubscriptionSql("rs.stripe_subscription_id")}
       `,
       [p.startUtc, p.endUtc]
     );
@@ -656,7 +657,7 @@ async function renewalsAndRetention(p, scope, currency, counted, firstPaymentNet
     `
       SELECT status, canceled_at, attributed_partner_code, attributed_user_id, facility_id
       FROM referral_subscriptions
-      WHERE LEFT(stripe_subscription_id, 5) <> 'test_'
+      WHERE ${realSubscriptionSql()}
         AND status NOT IN ('incomplete', 'incomplete_expired')
     `
   );
@@ -677,7 +678,7 @@ async function renewalsAndRetention(p, scope, currency, counted, firstPaymentNet
              (rs.status IN ('active', 'trialing', 'past_due') AND rs.current_period_end > UTC_TIMESTAMP()) AS still_active
       FROM referral_subscriptions rs
       WHERE rs.canceled_at >= ? AND rs.canceled_at < ?
-        AND LEFT(rs.stripe_subscription_id, 5) <> 'test_'
+        AND ${realSubscriptionSql("rs.stripe_subscription_id")}
         AND rs.status NOT IN ('incomplete', 'incomplete_expired')
       ORDER BY rs.canceled_at DESC, rs.id DESC
     `,
@@ -776,11 +777,12 @@ async function overview(p, body) {
           SELECT COUNT(*) AS n
           FROM referral_subscriptions
           WHERE status = 'active'
+            AND ${realSubscriptionSql()}
             AND (UPPER(attributed_partner_code) IN (?) OR LOWER(attributed_user_id) IN (?) OR facility_id IN (?))
         `,
         [scope.codes.size ? [...scope.codes] : [""], [...scope.emails], scope.facilityIds.size ? [...scope.facilityIds] : [0]]
       )
-    : await pool.query(`SELECT COUNT(*) AS n FROM referral_subscriptions WHERE status = 'active' AND LEFT(stripe_subscription_id, 5) <> 'test_'`);
+    : await pool.query(`SELECT COUNT(*) AS n FROM referral_subscriptions WHERE status = 'active' AND ${realSubscriptionSql()}`);
 
   const retention = await renewalsAndRetention(p, scope, currency, counted, total.net);
 
@@ -891,7 +893,7 @@ async function engagement(p, body) {
           WHERE pt.billing_reason = 'subscription_cycle'
             AND pt.status IN ${PAID_INVOICE}
             AND COALESCE(pt.paid_at, pt.created_at) >= ? AND COALESCE(pt.paid_at, pt.created_at) < ?
-            AND LEFT(rs.stripe_subscription_id, 5) <> 'test_'
+            AND ${realSubscriptionSql("rs.stripe_subscription_id")}
             AND rs.profile_id IS NOT NULL
         `,
         [p.startUtc, p.endUtc]
@@ -924,7 +926,7 @@ async function engagement(p, body) {
     `
       SELECT profile_id, MIN(created_at) AS first_purchase
       FROM referral_subscriptions
-      WHERE profile_id IN (?) AND LEFT(stripe_subscription_id, 5) <> 'test_'
+      WHERE profile_id IN (?) AND ${realSubscriptionSql()}
         AND status NOT IN ('incomplete', 'incomplete_expired')
       GROUP BY profile_id
     `,
