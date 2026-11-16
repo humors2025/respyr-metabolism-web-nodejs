@@ -167,6 +167,7 @@ function buildRows(subs, readingDays, history, month, today, latestDay = today) 
       name: latest.purchaser_name || null,
       email: latest.purchaser_email ? String(latest.purchaser_email).toLowerCase() : null,
       partner_code: null,
+      profile_created_at: null,
       plan_code: latest.plan_code || null,
       subscription_status: O.deriveSubscriptionStatus({
         subscription_status: latest.status,
@@ -338,13 +339,14 @@ async function loadReadings(profileIds, start, end) {
   return { readingDays, history: new Map(latest.map((row) => [row.profile_id, { first: row.earliest, last: row.latest }])) };
 }
 
-/** Fill partner_code on rows so the page can open the client's profile. */
+/** Fill partner_code (to open the client's profile) and profile_created_at on rows. */
 async function attachPartnerCodes(rows) {
   const profileIds = rows.filter((r) => r.linked).map((r) => r.profile_id);
   if (profileIds.length === 0) return;
   const [found] = await pool.execute(
     `
-      SELECT tc.profile_id, tc.dietician_id, aur.partner_code
+      SELECT tc.profile_id, tc.dietician_id, aur.partner_code,
+             DATE_FORMAT(tc.dttm, '%Y-%m-%d %H:%i:%s') AS created_at
       FROM table_clients tc
       LEFT JOIN table_dietician td ON td.dietician_id = tc.dietician_id
       LEFT JOIN app_user_roles aur ON LOWER(aur.user_id) = LOWER(td.email)
@@ -353,8 +355,17 @@ async function attachPartnerCodes(rows) {
     profileIds
   );
   const codes = new Map(found.map((row) => [row.profile_id, row.partner_code || row.dietician_id || null]));
+  // Earliest table_clients row = when the profile was created (stored time, unconverted).
+  const created = new Map();
+  for (const row of found) {
+    if (!row.created_at) continue;
+    const prev = created.get(row.profile_id);
+    if (!prev || row.created_at < prev) created.set(row.profile_id, row.created_at);
+  }
   for (const row of rows) {
-    if (row.linked) row.partner_code = codes.get(row.profile_id) || null;
+    if (!row.linked) continue;
+    row.partner_code = codes.get(row.profile_id) || null;
+    row.profile_created_at = created.get(row.profile_id) || null;
   }
 }
 
