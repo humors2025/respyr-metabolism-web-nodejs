@@ -52,6 +52,11 @@
  *                    purchase) } ],
  *          pagination: { page, limit, total, total_pages } }
  *
+ *          leaders: { most_readings, most_missed, lowest, most_regular } — up to 10 rows
+ *                   each, with counted_days, regularity (%), streak; never_tested and
+ *                   not_onboarded — up to 50 rows each, with days_since_purchase
+ *                   (see leaderData)
+ *
  * summary covers the whole month, ignoring search and paging. Rows carry buyers'
  * names and emails, so every read is written to app_auth_logs.
  */
@@ -277,6 +282,91 @@ function chartData(rows, month) {
   return { daily, groups };
 }
 
+const LEADER_LIMIT = 10;
+const REGULAR_MIN_DAYS = 7;
+const WAITING_LIMIT = 50;
+
+/** Longest run of back-to-back days in a sorted "YYYY-MM-DD" list. */
+function longestStreak(days) {
+  let best = 0;
+  let run = 0;
+  let prev = null;
+  for (const d of days) {
+    const t = Date.parse(`${d}T00:00:00Z`);
+    run = prev != null && t - prev === DAY_MS ? run + 1 : 1;
+    if (run > best) best = run;
+    prev = t;
+  }
+  return best;
+}
+
+/**
+ * Top clients for the month, over every linked row (like summary: no search, show or
+ * paging). Each list holds up to LEADER_LIMIT rows plus:
+ *   counted_days  days this month the client could have tested (taken + missed)
+ *   regularity    taken ÷ counted days, as a whole %
+ *   streak        longest run of days in a row with a reading
+ *
+ *   most_readings  most readings (repeat tests count), then most days taken
+ *   most_missed    most days missed
+ *   lowest         lowest regularity among clients who tested at least once this
+ *                  month, then fewest readings (those who never tested are in most_missed)
+ *   most_regular   highest regularity (needs REGULAR_MIN_DAYS counted days, or the most
+ *                  any client has early in the month, so a 3-of-3 newcomer can't top it), then
+ *                  most days taken, then longest streak
+ *   never_tested   linked app profile but no reading ever, longest since buying first
+ *   not_onboarded  paid but no app profile linked yet, longest since buying first
+ * The last two hold up to WAITING_LIMIT rows plus days_since_purchase. Every row gets
+ * row_key (profile_id, or a stand-in for buyers without one).
+ */
+function leaderData(rows, today) {
+  const list = rows
+    .filter((r) => r.linked)
+    .map((r) => {
+      const counted = r.taken_days.length + r.missed_days.length;
+      return {
+        ...r,
+        counted_days: counted,
+        regularity: counted ? Math.round((r.taken_days.length / counted) * 100) : 0,
+        streak: longestStreak(r.taken_days),
+      };
+    });
+  const regularMin = Math.min(REGULAR_MIN_DAYS, Math.max(1, ...list.map((r) => r.counted_days)));
+  const top = (filter, compare) => list.filter(filter).sort(compare).slice(0, LEADER_LIMIT);
+  const todayMs = Date.parse(`${today}T00:00:00Z`);
+  const waiting = (filter) =>
+    rows
+      .map((r, i) => ({ ...r, row_key: r.profile_id || `unlinked:${i}` }))
+      .filter(filter)
+      .map((r) => ({
+        ...r,
+        days_since_purchase: Math.max(0, Math.round((todayMs - Date.parse(`${r.purchased_on}T00:00:00Z`)) / DAY_MS)),
+      }))
+      .sort((a, b) => b.days_since_purchase - a.days_since_purchase || String(a.name || "").localeCompare(String(b.name || "")))
+      .slice(0, WAITING_LIMIT);
+  for (const r of list) r.row_key = r.profile_id;
+  return {
+    most_readings: top(
+      (r) => r.reading_count > 0,
+      (a, b) => b.reading_count - a.reading_count || b.taken_days.length - a.taken_days.length
+    ),
+    most_missed: top(
+      (r) => r.missed_days.length > 0,
+      (a, b) => b.missed_days.length - a.missed_days.length || a.reading_count - b.reading_count
+    ),
+    lowest: top(
+      (r) => r.taken_days.length > 0 && r.counted_days > 0,
+      (a, b) => a.regularity - b.regularity || a.reading_count - b.reading_count || b.counted_days - a.counted_days
+    ),
+    most_regular: top(
+      (r) => r.counted_days >= regularMin && r.taken_days.length > 0,
+      (a, b) => b.regularity - a.regularity || b.taken_days.length - a.taken_days.length || b.streak - a.streak
+    ),
+    never_tested: waiting((r) => r.linked && !r.first_reading),
+    not_onboarded: waiting((r) => !r.linked),
+  };
+}
+
 async function loadSubscriptions(end) {
   const excluded = BREATH_CREDIT_EXCLUDE_PROFILES;
   const [subs] = await pool.execute(
@@ -408,6 +498,7 @@ const superAdminReadingTracker = async (req, res) => {
     const rows = buildRows(subs, readingDays, history, month, today, latestDay);
     const summary = summarize(rows, month, today);
     const charts = chartData(rows, month);
+    const leaders = leaderData(rows, today);
     const matching = rows.filter((r) => {
       if (!matchesShow(r, show, month, today)) return false;
       return !search || [r.name, r.email, r.profile_id].some((v) => v && v.toLowerCase().includes(search));
@@ -416,7 +507,9 @@ const superAdminReadingTracker = async (req, res) => {
 
     const total = matching.length;
     const pageRows = matching.slice((page - 1) * limit, page * limit);
-    await attachPartnerCodes(pageRows);
+    // One lookup for the page and every leader row (a row object can appear in both).
+    const leaderRows = Object.values(leaders).flat();
+    await attachPartnerCodes([...new Set([...pageRows, ...leaderRows])]);
 
     await H.writeAuthLogSafe(req, {
       eventType: "super_admin_reading_tracker_viewed",
@@ -436,6 +529,7 @@ const superAdminReadingTracker = async (req, res) => {
       days_in_month: Number(end.slice(8)),
       summary,
       charts,
+      leaders,
       rows: pageRows,
       pagination: { page, limit, total, total_pages: Math.max(1, Math.ceil(total / limit)) },
     });
@@ -458,5 +552,5 @@ const superAdminReadingTracker = async (req, res) => {
 
 module.exports = {
   superAdminReadingTracker,
-  _helpers: { usDay, US_EASTERN, monthEnd, countedWindow, buildRows, matchesShow, sortRows, summarize, chartData },
+  _helpers: { usDay, US_EASTERN, monthEnd, countedWindow, buildRows, matchesShow, sortRows, summarize, chartData, leaderData, longestStreak },
 };
