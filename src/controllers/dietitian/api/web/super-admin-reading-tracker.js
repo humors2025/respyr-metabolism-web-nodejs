@@ -54,7 +54,8 @@
  *
  *          leaders: { most_readings, most_missed, lowest, most_regular } — up to 10 rows
  *                   each, with counted_days, regularity (%), streak; never_tested and
- *                   not_onboarded — up to 50 rows each, with days_since_purchase
+ *                   not_onboarded — up to 50 rows each, with days_since_purchase;
+ *                   renewed — up to 50, with renewals, last_renewed, renewed_this_month
  *                   (see leaderData)
  *
  * summary covers the whole month, ignoring search and paging. Rows carry buyers'
@@ -316,10 +317,14 @@ function longestStreak(days) {
  *                  most days taken, then longest streak
  *   never_tested   linked app profile but no reading ever, longest since buying first
  *   not_onboarded  paid but no app profile linked yet, longest since buying first
- * The last two hold up to WAITING_LIMIT rows plus days_since_purchase. Every row gets
- * row_key (profile_id, or a stand-in for buyers without one).
+ *   renewed        linked clients whose plan has renewed (a paid subscription_cycle
+ *                  invoice) by the end of the month, latest renewal first, with
+ *                  renewals (count), last_renewed (US day) and renewed_this_month
+ * The last three hold up to WAITING_LIMIT rows; the waiting lists also carry
+ * days_since_purchase. Every row gets row_key (profile_id, or a stand-in for buyers
+ * without one). renewals: Map(profile_id -> { count, last }) from loadRenewals.
  */
-function leaderData(rows, today) {
+function leaderData(rows, today, renewals = new Map(), month = today.slice(0, 7)) {
   const list = rows
     .filter((r) => r.linked)
     .map((r) => {
@@ -364,7 +369,46 @@ function leaderData(rows, today) {
     ),
     never_tested: waiting((r) => r.linked && !r.first_reading),
     not_onboarded: waiting((r) => !r.linked),
+    renewed: list
+      .filter((r) => renewals.has(r.profile_id))
+      .map((r) => {
+        const { count, last } = renewals.get(r.profile_id);
+        return { ...r, renewals: count, last_renewed: last, renewed_this_month: !!last && last.startsWith(month) };
+      })
+      .sort((a, b) => String(b.last_renewed).localeCompare(String(a.last_renewed)) || b.regularity - a.regularity)
+      .slice(0, WAITING_LIMIT),
   };
+}
+
+/**
+ * Paid renewals (subscription_cycle invoices) per profile up to the month's end:
+ * Map(profile_id -> { count, last: US Pacific "YYYY-MM-DD" of the latest }).
+ */
+async function loadRenewals(profileIds, end) {
+  if (profileIds.length === 0) return new Map();
+  const [found] = await pool.execute(
+    `
+      SELECT rs.profile_id, COUNT(*) AS renewals, MAX(COALESCE(pt.paid_at, pt.created_at)) AS last_renewed
+      FROM payment_transactions pt
+      JOIN referral_subscriptions rs ON rs.stripe_subscription_id = pt.stripe_subscription_id
+      WHERE pt.billing_reason = 'subscription_cycle'
+        AND pt.status IN ('paid', 'partially_refunded')
+        AND pt.amount_paid_minor > 0
+        AND LEFT(rs.stripe_subscription_id, 5) <> 'test_'
+        AND COALESCE(pt.paid_at, pt.created_at) <= ?
+        AND rs.profile_id IN (${profileIds.map(() => "?").join(",")})
+      GROUP BY rs.profile_id
+    `,
+    [`${new Date(Date.parse(`${end}T00:00:00Z`) + DAY_MS).toISOString().slice(0, 10)} 23:59:59`, ...profileIds]
+  );
+  const out = new Map();
+  for (const row of found) {
+    const last = usDay(row.last_renewed);
+    // The UTC cut-off above can let in the next month's first US morning; drop it.
+    if (!last || last > end) continue;
+    out.set(row.profile_id, { count: Number(row.renewals) || 0, last });
+  }
+  return out;
 }
 
 async function loadSubscriptions(end) {
@@ -498,7 +542,9 @@ const superAdminReadingTracker = async (req, res) => {
     const rows = buildRows(subs, readingDays, history, month, today, latestDay);
     const summary = summarize(rows, month, today);
     const charts = chartData(rows, month);
-    const leaders = leaderData(rows, today);
+    const renewals = await loadRenewals(profileIds, end);
+    const leaders = leaderData(rows, today, renewals, month);
+    summary.renewed = rows.filter((r) => r.linked && renewals.has(r.profile_id)).length;
     const matching = rows.filter((r) => {
       if (!matchesShow(r, show, month, today)) return false;
       return !search || [r.name, r.email, r.profile_id].some((v) => v && v.toLowerCase().includes(search));
@@ -552,5 +598,5 @@ const superAdminReadingTracker = async (req, res) => {
 
 module.exports = {
   superAdminReadingTracker,
-  _helpers: { usDay, US_EASTERN, monthEnd, countedWindow, buildRows, matchesShow, sortRows, summarize, chartData, leaderData, longestStreak },
+  _helpers: { usDay, US_EASTERN, monthEnd, countedWindow, buildRows, matchesShow, sortRows, summarize, chartData, leaderData, longestStreak, loadRenewals },
 };
