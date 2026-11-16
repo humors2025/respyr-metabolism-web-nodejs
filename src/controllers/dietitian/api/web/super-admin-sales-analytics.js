@@ -959,9 +959,12 @@ const utcDay = (ms) => Math.floor(ms / DAY_MS);
  * profiles that bought in the window, renewed in the window, or both.
  *
  *   member_since   the profile's first paid membership (earliest purchase)
+ *   app_onboarded_at  earliest table_clients.dttm ("YYYY-MM-DD HH:MM:SS" as stored)
  *   days           days from member_since to today, inclusive
  *   reading_days   distinct days with a breath test (table_test_data) since member_since
  *   rate           reading_days / days, capped at 100 (TA Analytics' "Rate")
+ *   readings_7d / readings_prev_7d   readings in the last 7 days / the 7 before
+ * summary.week_days: the last 7 days (viewer's dates) with readings and clients who tested.
  *
  * Body: overview's period fields + trainer_admin?, group?: all | purchased | renewed.
  * Rows carry customer names and emails (super_admin only, logged like the other views).
@@ -1046,6 +1049,16 @@ async function engagement(p, body) {
     `,
     [ids]
   );
+  // App onboarded = earliest table_clients row (profile created in the app), stored time unconverted.
+  const [onboarded] = await pool.query(
+    `
+      SELECT profile_id, DATE_FORMAT(MIN(dttm), '%Y-%m-%d %H:%i:%s') AS created_at
+      FROM table_clients
+      WHERE profile_id IN (?)
+      GROUP BY profile_id
+    `,
+    [ids]
+  );
   const [goals] = await pool.query(
     `
       SELECT uh.profile_id, uh.goal
@@ -1068,6 +1081,7 @@ async function engagement(p, body) {
 
   const sinceBy = new Map(since.map((r) => [r.profile_id, toMs(r.first_purchase)]));
   const nameBy = new Map(names.map((r) => [r.profile_id, r]));
+  const onboardedBy = new Map(onboarded.map((r) => [r.profile_id, r.created_at || null]));
   const goalBy = new Map(goals.map((r) => [r.profile_id, String(r.goal || "").trim()]));
   const testsBy = new Map();
   for (const t of tests) {
@@ -1083,6 +1097,8 @@ async function engagement(p, body) {
   const prevWeekStart = today - 13;
   let thisWeek = 0;
   let lastWeek = 0;
+  // Last 7 days, oldest first: { readings, clients } per day (for the 7-day popup).
+  const weekDays = Array.from({ length: 7 }, (_, i) => ({ day: weekStart + i, readings: 0, clients: 0 }));
 
   const clients = ids.map((pid) => {
     const v = people.get(pid);
@@ -1092,9 +1108,19 @@ async function engagement(p, body) {
     const list = (testsBy.get(pid) || []).filter((t) => t.day >= startDay);
     const readingDays = list.length;
     const readings = list.reduce((s, t) => s + t.n, 0);
+    let mine7 = 0;
+    let minePrev7 = 0;
     for (const t of list) {
-      if (t.day >= weekStart && t.day <= today) thisWeek += t.n;
-      else if (t.day >= prevWeekStart && t.day < weekStart) lastWeek += t.n;
+      if (t.day >= weekStart && t.day <= today) {
+        thisWeek += t.n;
+        mine7 += t.n;
+        const d = weekDays[t.day - weekStart];
+        d.readings += t.n;
+        d.clients += 1;
+      } else if (t.day >= prevWeekStart && t.day < weekStart) {
+        lastWeek += t.n;
+        minePrev7 += t.n;
+      }
     }
     const latest = list.reduce((a, t) => (!a || t.lastMs > a.lastMs ? t : a), null);
     const rate = Math.min(100, Math.round((readingDays / days) * 100));
@@ -1112,9 +1138,12 @@ async function engagement(p, body) {
       subscription_status: memberState(v.row.status, v.row.canceled_at),
       fitness_goal: goalBy.get(pid) || null,
       member_since: startMs == null ? null : toIso(new Date(startMs)),
+      app_onboarded_at: onboardedBy.get(pid) || null,
       days,
       reading_days: readingDays,
       readings,
+      readings_7d: mine7,
+      readings_prev_7d: minePrev7,
       last_reading: latest?.lastMs != null ? toIso(new Date(latest.lastMs)) : null,
       metabolism_score: Number.isFinite(score) ? score : null,
       rate,
@@ -1150,6 +1179,11 @@ async function engagement(p, body) {
       readings_this_week: thisWeek,
       readings_last_week: lastWeek,
       readings_week_change: lastWeek ? Math.round(((thisWeek - lastWeek) / lastWeek) * 1000) / 10 : null,
+      week_days: weekDays.map((d) => ({
+        date: new Date(d.day * DAY_MS).toISOString().slice(0, 10),
+        readings: d.readings,
+        clients: d.clients,
+      })),
       goals: goalCounts,
       cohorts: tiers.map((tier) => {
         const count = clients.filter((c) => c.cohort === tier).length;
