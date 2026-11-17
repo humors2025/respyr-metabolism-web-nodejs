@@ -18,7 +18,8 @@
  *                         when one was applied. Never throws.
  *   sendPaymentAlert    — internal copy of every attempt, success or failure,
  *                         to the team (PAYMENT_ALERT_EMAILS, default
- *                         connect@humorstech.com): outcome, amount, buyer, referral
+ *                         connect@humorstech.com + ishan@respyr.in): outcome,
+ *                         amount, buyer, referral
  *                         code, decline reason and a Stripe Dashboard link.
  *                         Inline HTML only; never throws, so a Resend problem
  *                         cannot cost the buyer their receipt or code.
@@ -45,10 +46,10 @@ const SKIP_OUTBOUND_EMAIL =
 const SUPPORT_EMAIL = process.env.SUPPORT_EMAIL || "support@rysflo.com";
 
 // Team inboxes for the per-attempt payment alert. Comma / semicolon / space
-// separated. Unset → connect@humorstech.com; set to an empty string to turn it off.
+// separated. Unset → connect@humorstech.com + ishan@respyr.in; set to an empty string to turn it off.
 const PAYMENT_ALERT_EMAILS = [
   ...new Set(
-    String(process.env.PAYMENT_ALERT_EMAILS ?? "connect@humorstech.com")
+    String(process.env.PAYMENT_ALERT_EMAILS ?? "connect@humorstech.com,ishan@respyr.in")
       .split(/[,;\s]+/)
       .map((e) => e.trim().toLowerCase())
       .filter((e) => e.includes("@"))
