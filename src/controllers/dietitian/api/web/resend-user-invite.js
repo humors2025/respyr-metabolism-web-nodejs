@@ -45,6 +45,7 @@
 const crypto = require("crypto");
 const axios = require("axios");
 const pool = require("../../../../config/db");
+const { leftoverAccountBlock } = require("../../../../utils/inviteGuards");
 
 const {
   escapeHtml,
@@ -1374,6 +1375,44 @@ if (
 
             message:
               "Revoked invitation cannot be resent. Create a new invitation.",
+          });
+      }
+
+      /*
+      |--------------------------------------------------------------------------
+      | Old account still on this email
+      |--------------------------------------------------------------------------
+      |
+      | A table_dietician row under another code makes this invite impossible
+      | to accept (409 email_code_conflict), so resending it only sends a dead
+      | link. See utils/inviteGuards.js.
+      */
+
+      const leftover =
+        await leftoverAccountBlock(
+          invite.invited_email,
+          {
+            partnerCode:
+              invite.partner_code,
+          }
+        );
+
+      if (leftover) {
+        await conn
+          .rollback();
+
+        conn.release();
+
+        conn =
+          null;
+
+        return res
+          .status(leftover.status)
+          .json({
+            ok: false,
+
+            message:
+              leftover.message,
           });
       }
 
