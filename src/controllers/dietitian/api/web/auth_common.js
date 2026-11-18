@@ -20,6 +20,7 @@
 const crypto = require("crypto");
 const axios = require("axios");
 const pool = require("../../../../config/db");
+const { leftoverAccountBlock } = require("../../../../utils/inviteGuards");
 
 const {
   validateHumanName,
@@ -1250,6 +1251,24 @@ async function ensureInviteCanBeCreated(
       message:
         "This email already has a pending invitation",
     };
+  }
+
+  /*
+  |--------------------------------------------------------------------------
+  | Old account still on this email
+  |--------------------------------------------------------------------------
+  |
+  | Would make the invite impossible to accept (409 email_code_conflict).
+  | See utils/inviteGuards.js.
+  */
+
+  const leftover =
+    await leftoverAccountBlock(
+      normalized
+    );
+
+  if (leftover) {
+    return leftover;
   }
 
   return {
