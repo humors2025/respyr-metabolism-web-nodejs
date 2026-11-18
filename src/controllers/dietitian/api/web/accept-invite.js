@@ -80,6 +80,10 @@ const salesCrmMirror = require(
   "../../../../services/salesCrmMirror"
 );
 
+const pricing = require(
+  "../../../../services/pricing"
+);
+
 /*
 |--------------------------------------------------------------------------
 | Constants
@@ -2249,6 +2253,25 @@ const acceptInvite =
 
       conn =
         null;
+
+      /*
+      |--------------------------------------------------------------------------
+      | The referral discount starts now. A code only gets its Stripe
+      | promotion code once the invite is accepted (pending / expired invites
+      | sell at list price). Best-effort: checkout also creates it on demand.
+      |--------------------------------------------------------------------------
+      */
+
+      try {
+        await pricing.ensurePromotionCode(
+          partnerCode
+        );
+      } catch (promoErr) {
+        console.warn(
+          "PROMO_CREATE_ON_ACCEPT_DEFERRED:",
+          promoErr?.message
+        );
+      }
 
       /*
       |--------------------------------------------------------------------------

@@ -74,7 +74,11 @@ const orderPageContext = guard(async (req, res) => {
       if (st.partner_code) code = st.partner_code;
     }
   }
-  const resolved = code ? await resolvePartnerCode(code) : null;
+  // Only an accepted, active account's code is a discount. A code on a
+  // pending or expired invite shows list price (code_status says why).
+  const any = code ? await resolvePartnerCode(code) : null;
+  const resolved = any && !any.pending ? any : null;
+  const codeStatus = !code ? null : resolved ? "active" : any ? "not_active_yet" : "not_valid";
   let facilityName = resolved?.facility_name || null;
   if (!facilityName && resolved?.facility_id != null) {
     const [f] = await pool.execute(`SELECT name FROM facilities WHERE id = ? LIMIT 1`, [resolved.facility_id]);
@@ -85,6 +89,7 @@ const orderPageContext = guard(async (req, res) => {
     pricing: p,
     qr_id: qrId,
     referral: resolved ? { partner_code: resolved.partner_code, role: resolved.role, facility_name: facilityName } : null,
+    code_status: codeStatus,
   });
 });
 
@@ -641,8 +646,9 @@ const qrSetup = guard(async (req, res) => {
   }
   await H.markInviteSent(invitationId);
 
-  // Bind the sticker now; the discount works immediately (promotion code
-  // exists as soon as the pricing service sees the code).
+  // Bind the sticker now. No discount yet: the code's Stripe promotion code is
+  // created when the invite is accepted (accept-invite.js). Until then the
+  // sticker sells at list price and the sale is attributed to the invitee.
   await pool.execute(
     `INSERT INTO qr_code_links (qr_id, from_partner_code, to_partner_code, actor_user_id) VALUES (?, ?, ?, ?)`,
     [id, sticker.partner_code || null, partnerCode, a.actorEmail]
@@ -654,8 +660,6 @@ const qrSetup = guard(async (req, res) => {
      WHERE id = ?`,
     [partnerCode, type, type === "facility" ? facilityName : fullName, invitationId, email, a.actorEmail, id]
   );
-  try { await pricing.ensurePromotionCode(partnerCode); } catch (e) { console.warn("PROMO_CREATE_DEFERRED:", e?.message); }
-
   await H.writeAuthLogSafe(req, { eventType: "qr_setup", userId: a.actorEmail, role: String(a.actor.role), partnerCode: null, identifier: id, success: true, failureReason: `${type} ${partnerCode} -> ${email}` });
 
   const out = { ok: true, qr: await qr.get(id), invitation_id: invitationId, partner_code: partnerCode, invited_email: email };
