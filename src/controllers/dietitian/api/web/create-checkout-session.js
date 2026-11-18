@@ -16,9 +16,12 @@
  *    "email":        "buyer@x.com"   // optional; pre-fills Checkout
  *  }
  *
- * Pricing: the list price from pricing_settings; a valid partner code applies
- * that code's Stripe promotion code (list -> referred price). With no code the
- * member can still type one on the Checkout page (allow_promotion_codes).
+ * Pricing: the list price from pricing_settings. Only the code of an ACCEPTED,
+ * active account applies its Stripe promotion code (list -> referred price).
+ * A code on a pending or expired invite sells at list price (a pending one is
+ * still stamped for attribution). Stripe's own "Add promotion code" box is off:
+ * the discount is decided here and nowhere else, so a stale Stripe promotion
+ * code can never be typed in at Checkout.
  *
  * Response: { ok, checkout_url, session_id, attributed_to: { partner_code, role } | null }
  *
@@ -109,7 +112,9 @@ const createCheckoutSession = async (req, res) => {
 
     const pr = await pricing.ensureStripePricing();
     const priceId = pr.stripe_list_price_id;
-    const promotionCodeId = attributed ? await pricing.ensurePromotionCode(attributed.partner_code) : null;
+    // Discount only for an accepted, active account (not a pending invite).
+    const discounted = !!(attributed && !attributed.pending);
+    const promotionCodeId = discounted ? await pricing.ensurePromotionCode(attributed.partner_code) : null;
 
     // Everything the webhook needs to attribute this sale, on both the session
     // and the subscription (the subscription is what invoices reference).
@@ -131,10 +136,10 @@ const createCheckoutSession = async (req, res) => {
       cancel_url: rawCode ? `${ORDER_CANCEL_URL}/${encodeURIComponent(rawCode)}` : ORDER_CANCEL_URL,
       customer_email: email || undefined,
       client_reference_id: attributed ? attributed.partner_code : undefined,
-      // Pre-apply the referral discount; otherwise let the member type a code.
+      // Pre-apply the referral discount. No typed codes on Stripe's page.
       ...(promotionCodeId
         ? { discounts: [{ promotion_code: promotionCodeId }] }
-        : { allow_promotion_codes: true }),
+        : { allow_promotion_codes: false }),
       billing_address_collection: "required",
       shipping_address_collection: { allowed_countries: ["US"] },
       phone_number_collection: { enabled: true },
@@ -155,7 +160,7 @@ const createCheckoutSession = async (req, res) => {
       pricing: {
         currency: pr.currency,
         list_price_minor: Number(pr.list_price_minor),
-        price_minor: attributed ? Number(pr.referred_price_minor) : Number(pr.list_price_minor),
+        price_minor: promotionCodeId ? Number(pr.referred_price_minor) : Number(pr.list_price_minor),
       },
       ...(attributed && {
         attributed_to: { partner_code: attributed.partner_code, role: attributed.role },
