@@ -207,7 +207,7 @@ async function shipping(body) {
       SELECT
         sa.id, sa.stripe_subscription_id, sa.name, sa.phone, sa.line1, sa.line2, sa.city,
         sa.state, sa.postal_code, sa.country, sa.created_at,
-        rs.purchaser_email, rs.purchaser_name, rs.attributed_partner_code, rs.status AS subscription_status,
+        rs.purchaser_email, rs.purchaser_name, rs.attributed_partner_code, rs.qr_id, rs.status AS subscription_status,
         rs.attributed_user_id, rs.attributed_role, rs.facility_id,
         rs.current_period_start, rs.current_period_end, rs.canceled_at,
         rs.created_at AS purchased_at
@@ -240,6 +240,7 @@ async function shipping(body) {
         country: r.country || null,
       },
       partner_code: r.attributed_partner_code || null,
+      qr_id: r.qr_id || null, // set = bought by scanning this QR sticker
       facility: (codeOf(r) && facilities.get(codeOf(r))) || null,
       subscription_status: deriveSubscriptionStatus(r, now),
       stripe_status: r.subscription_status || null,
@@ -311,7 +312,7 @@ async function payments(body) {
         pt.billing_reason, pt.period_start, pt.period_end, pt.amount_paid_minor, pt.amount_refunded_minor,
         pt.currency, pt.fee_minor, pt.net_minor, pt.status, pt.failure_message, pt.payment_method_type,
         pt.card_last4, pt.paid_at, pt.created_at,
-        rs.purchaser_email, rs.purchaser_name, rs.profile_id, rs.attributed_partner_code,
+        rs.purchaser_email, rs.purchaser_name, rs.profile_id, rs.attributed_partner_code, rs.qr_id,
         rs.status AS subscription_status, rs.current_period_start, rs.current_period_end, rs.canceled_at,
         -- Which renewal of its subscription this invoice is (rows are written
         -- in billing order, so earlier renewals have lower ids).
@@ -352,6 +353,7 @@ async function payments(body) {
         profile_id: r.profile_id || null,
       },
       partner_code: r.attributed_partner_code || null,
+      qr_id: r.qr_id || null, // set = bought by scanning this QR sticker
       facility: (codeOf(r) && facilities.get(codeOf(r))) || null,
       type: r.billing_reason === "subscription_create" ? "first_payment" : r.billing_reason === "subscription_cycle" ? "renewal" : r.billing_reason || null,
       renewal_number: r.renewal_number == null ? null : Number(r.renewal_number),
@@ -423,7 +425,7 @@ async function upcomingRenewals(body) {
     `
       SELECT
         rs.id, rs.stripe_subscription_id, rs.purchaser_email, rs.purchaser_name, rs.profile_id,
-        rs.attributed_partner_code,
+        rs.attributed_partner_code, rs.qr_id,
         rs.status AS subscription_status, rs.current_period_start, rs.current_period_end, rs.canceled_at,
         rs.currency, rs.unit_amount_minor, rs.created_at AS purchased_at
       FROM referral_subscriptions rs
@@ -586,6 +588,7 @@ async function upcomingRenewals(body) {
           profile_id: r.profile_id || null,
         },
         partner_code: r.attributed_partner_code || null,
+        qr_id: r.qr_id || null, // set = bought by scanning this QR sticker
         facility: (codeOf(r) && facilities.get(codeOf(r))) || null,
         purchased_at: toIso(r.purchased_at),
         // This coming renewal is renewals_so_far + 1.
@@ -679,7 +682,7 @@ async function cancellations(body) {
     `
       SELECT
         rs.id, rs.stripe_subscription_id, rs.purchaser_email, rs.purchaser_name, rs.profile_id,
-        rs.attributed_partner_code,
+        rs.attributed_partner_code, rs.qr_id,
         rs.status AS subscription_status, rs.current_period_start, rs.current_period_end, rs.canceled_at,
         rs.currency, rs.created_at AS purchased_at,
         ${SCHEDULED_SQL} AS still_active
@@ -788,6 +791,7 @@ async function cancellations(body) {
           profile_id: r.profile_id || null,
         },
         partner_code: r.attributed_partner_code || null,
+        qr_id: r.qr_id || null, // set = bought by scanning this QR sticker
         facility: (codeOf(r) && facilities.get(codeOf(r))) || null,
         purchased_at: toIso(r.purchased_at),
         // scheduled = cancelled but still has access until access_ends;
