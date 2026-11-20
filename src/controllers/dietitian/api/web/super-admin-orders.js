@@ -42,7 +42,8 @@
  * its facility admin, same lookup as Sales Analytics' top_trainers), or null
  * for a website purchase / a trainer outside any facility. They also carry
  * paid_period (the latest paid invoice's period) and renewal_pending (Stripe
- * started a newer period whose invoice is not paid yet).
+ * started a newer period whose invoice is not paid yet), and tracking: the
+ * FedEx number and latest status saved via shipment-tracking.js, or null.
  *
  * Body: { view: "shipping" | "payments" | "upcoming_renewals" | "cancellations", search?, page?, limit?,
  *         payments only: status? ("all" | open | paid | failed | refunded | partially_refunded),
@@ -58,6 +59,7 @@ const { creditForReadingDays } = require("../../../../services/breathCredits");
 const { BREATH_CREDIT_EXCLUDE_PROFILES } = require("../../../../config/stripe");
 const { _helpers: H } = require("./admin-invite-trainer");
 const { trainerHierarchy } = require("./super-admin-sales-analytics");
+const { trackingFor } = require("../../../../services/shipmentTracking");
 
 const SEARCH_MIN_LENGTH = 3;
 const MAX_LIMIT = 100;
@@ -221,6 +223,7 @@ async function shipping(body) {
   const codeOf = (r) => String(r.attributed_partner_code || "").toUpperCase() || null;
   const facilities = await facilityByCode(rows, codeOf);
   const paidPeriods = await lastPaidPeriods(rows.map((r) => r.stripe_subscription_id));
+  const tracking = await trackingFor(rows.map((r) => r.stripe_subscription_id));
 
   const now = Date.now();
   return {
@@ -248,6 +251,8 @@ async function shipping(body) {
       current_period_end: toIso(r.current_period_end),
       canceled_at: toIso(r.canceled_at),
       stripe_subscription_id: r.stripe_subscription_id,
+      // FedEx tracking saved on the Shipping tab (shipment-tracking.js), or null.
+      tracking: tracking.get(r.stripe_subscription_id) || null,
       ...renewalState(r, paidPeriods.get(r.stripe_subscription_id)),
     })),
     pagination: { page, limit, total: Number(total), total_pages: Math.max(1, Math.ceil(Number(total) / limit)) },
@@ -891,6 +896,7 @@ module.exports = {
   superAdminOrders,
   // Shared with facility-admin-payments.js (a facility admin's own payments).
   _helpers: {
+    ORDERS_VIEWER_EMAILS,
     SEARCH_MIN_LENGTH,
     PAYMENT_STATUSES,
     PAYMENT_TYPES,

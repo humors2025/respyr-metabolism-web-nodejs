@@ -705,6 +705,23 @@ async function renewalsAndRetention(p, scope, currency, counted, firstPaymentNet
     })),
   };
 
+  // Renewals still to come in the window: plans set to renew (same rule as
+  // Orders › Upcoming renewals) whose paid period ends between now and the end
+  // of the window. A window that is already over has none.
+  const [upcomingRows] = await pool.query(
+    `
+      SELECT rs.attributed_partner_code, rs.attributed_user_id, rs.facility_id
+      FROM referral_subscriptions rs
+      WHERE rs.status IN ('active', 'trialing')
+        AND rs.canceled_at IS NULL
+        AND rs.current_period_end > GREATEST(UTC_TIMESTAMP(), ?)
+        AND rs.current_period_end <= ?
+        AND ${realSubscriptionSql("rs.stripe_subscription_id")}
+    `,
+    [p.startUtc, p.endUtc]
+  );
+  const upcoming = { total: upcomingRows.filter(inScope).length };
+
   const rates = (o, whole) => ({
     active_rate: pct(o.active, whole),
     cancellation_scheduled_rate: pct(o.cancellation_scheduled, whole),
@@ -714,6 +731,7 @@ async function renewalsAndRetention(p, scope, currency, counted, firstPaymentNet
 
   return {
     renewals,
+    upcoming,
     cohort: { ...cohort, ...rates(cohort, cohort.purchases) },
     cancellations,
     members: {
