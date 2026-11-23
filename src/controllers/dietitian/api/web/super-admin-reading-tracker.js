@@ -49,7 +49,11 @@
  *                    day, as stored), reading_count, missed_days: [...],
  *                    pending_days: [...], today_count, last_reading: "YYYY-MM-DD HH:MM:SS",
  *                    first_reading: "YYYY-MM-DD HH:MM:SS" (earliest test ever, even before
- *                    purchase) } ],
+ *                    purchase), days_since_purchase (US Pacific days from purchased_on to
+ *                    today), trainer_code (the code the purchase was attributed to),
+ *                    facility: { id, name, partner_code, status, admin_user_id, admin_name }
+ *                    | null (behind trainer_code, same lookup as Orders; page and leader
+ *                    rows only) } ],
  *          pagination: { page, limit, total, total_pages } }
  *
  *          leaders: { most_readings, most_missed, lowest, most_regular } — up to 10 rows
@@ -66,6 +70,7 @@ const pool = require("../../../../config/db");
 const { BREATH_CREDIT_EXCLUDE_PROFILES } = require("../../../../config/stripe");
 const { _helpers: H } = require("./admin-invite-trainer");
 const { _helpers: O } = require("./super-admin-orders");
+const { trainerHierarchy } = require("./super-admin-sales-analytics");
 
 const US_PACIFIC = "America/Los_Angeles";
 const US_EASTERN = "America/New_York";
@@ -167,7 +172,7 @@ function buildRows(subs, readingDays, history, month, today, latestDay = today) 
     const seen = (profileId && history.get(profileId)) || {};
     const noReading = linked ? counted.filter((d) => !readings.has(d)) : [];
     const takenDays = linked ? counted.filter((d) => readings.has(d)) : [];
-    return {
+    const row = {
       profile_id: profileId,
       linked,
       name: latest.purchaser_name || null,
@@ -189,7 +194,13 @@ function buildRows(subs, readingDays, history, month, today, latestDay = today) 
       today_count: readings.has(today) && takenDays.includes(today) ? readings.get(today).length : 0,
       last_reading: seen.last || null,
       first_reading: seen.first || null,
+      days_since_purchase: Math.max(0, Math.round((Date.parse(`${today}T00:00:00Z`) - Date.parse(`${purchasedOn}T00:00:00Z`)) / DAY_MS)),
+      trainer_code: latest.attributed_partner_code ? String(latest.attributed_partner_code).toUpperCase() : null,
+      facility: null,
     };
+    // The subscription behind the row, for the facility lookup; not sent to the client.
+    Object.defineProperty(row, "_sub", { value: latest, enumerable: false });
+    return row;
   });
 }
 
@@ -416,7 +427,8 @@ async function loadSubscriptions(end) {
   const [subs] = await pool.execute(
     `
       SELECT rs.stripe_subscription_id, rs.profile_id, rs.purchaser_name, rs.purchaser_email,
-             rs.plan_code, rs.status, rs.created_at, rs.current_period_end, rs.canceled_at
+             rs.plan_code, rs.status, rs.created_at, rs.current_period_end, rs.canceled_at,
+             rs.attributed_partner_code, rs.attributed_user_id, rs.attributed_role, rs.facility_id
       FROM referral_subscriptions rs
       WHERE LEFT(rs.stripe_subscription_id, 5) <> 'test_'
         AND rs.status NOT IN ('incomplete', 'incomplete_expired')
@@ -503,6 +515,25 @@ async function attachPartnerCodes(rows) {
   }
 }
 
+/**
+ * Fill facility on rows: the gym behind the code the purchase was attributed to,
+ * with its facility admin (same trainerHierarchy lookup as Orders' Facility column).
+ * Works for buyers with no app profile too. Only names columns, so a failed lookup
+ * leaves facility null instead of failing the page.
+ */
+async function attachFacilities(rows) {
+  const withCode = rows.filter((r) => r.trainer_code);
+  const codes = [...new Set(withCode.map((r) => r.trainer_code))];
+  if (!codes.length) return;
+  try {
+    const items = withCode.map((r) => ({ code: r.trainer_code, linkedCode: null, raw: r._sub || {} }));
+    const hierarchy = await trainerHierarchy(codes, items);
+    for (const row of withCode) row.facility = hierarchy.get(row.trainer_code)?.facility || null;
+  } catch (err) {
+    console.error("SUPER_ADMIN_READING_TRACKER_FACILITY_LOOKUP_ERROR:", { code: err?.code, message: err?.message });
+  }
+}
+
 const superAdminReadingTracker = async (req, res) => {
   res.setHeader("Cache-Control", "no-store");
   res.setHeader("Pragma", "no-cache");
@@ -555,7 +586,9 @@ const superAdminReadingTracker = async (req, res) => {
     const pageRows = matching.slice((page - 1) * limit, page * limit);
     // One lookup for the page and every leader row (a row object can appear in both).
     const leaderRows = Object.values(leaders).flat();
-    await attachPartnerCodes([...new Set([...pageRows, ...leaderRows])]);
+    const shownRows = [...new Set([...pageRows, ...leaderRows])];
+    await attachPartnerCodes(shownRows);
+    await attachFacilities(shownRows);
 
     await H.writeAuthLogSafe(req, {
       eventType: "super_admin_reading_tracker_viewed",
