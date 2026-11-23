@@ -33,6 +33,12 @@
  *                  period, state=ended those whose plan is over. Each row
  *                  carries what they paid, the phone from Checkout and
  *                  Stripe's cancellation_details (reason / feedback / comment).
+ *   view=failed_renewals
+ *                  renewal invoices (subscription_cycle) that failed, or are
+ *                  still unpaid a day after Stripe created them, newest first.
+ *                  state=failed | pending. Each row carries the reason in plain
+ *                  words (Stripe decline code looked up live), the card, the
+ *                  attempt count and Stripe's next retry date.
  *
  * Both join referral_subscriptions (by stripe_subscription_id) for the buyer's
  * email / name and the partner code used. Shipping rows also carry the plan's
@@ -45,7 +51,7 @@
  * started a newer period whose invoice is not paid yet), and tracking: the
  * FedEx number and latest status saved via shipment-tracking.js, or null.
  *
- * Body: { view: "shipping" | "payments" | "upcoming_renewals" | "cancellations", search?, page?, limit?,
+ * Body: { view: "shipping" | "payments" | "upcoming_renewals" | "cancellations" | "failed_renewals", search?, page?, limit?,
  *         payments only: status? ("all" | open | paid | failed | refunded | partially_refunded),
  *                        type? ("all" | first_payment | renewal), paid_only? (boolean),
  *         upcoming_renewals only: days? (1-31, default 10),
@@ -319,6 +325,7 @@ async function payments(body) {
         pt.card_last4, pt.paid_at, pt.created_at,
         rs.purchaser_email, rs.purchaser_name, rs.profile_id, rs.attributed_partner_code, rs.qr_id,
         rs.status AS subscription_status, rs.current_period_start, rs.current_period_end, rs.canceled_at,
+        rs.unit_amount_minor, rs.currency AS plan_currency,
         -- Which renewal of its subscription this invoice is (rows are written
         -- in billing order, so earlier renewals have lower ids).
         CASE WHEN pt.billing_reason = 'subscription_cycle' THEN (
@@ -345,6 +352,40 @@ async function payments(body) {
   const codeOf = (r) => String(r.attributed_partner_code || "").toUpperCase() || null;
   const facilities = await facilityByCode(rows, codeOf);
 
+  // A failed or still-open invoice collected nothing, so amount_paid is 0.
+  // What Stripe tried to charge (invoice.amount_due) is not stored, so it is
+  // read from Stripe for those rows only. Best-effort: on a Stripe hiccup
+  // amount_due falls back to the plan price, or stays null.
+  const amountDue = new Map();
+  const unpaid = rows.filter((r) => r.status === "failed" || r.status === "open");
+  if (unpaid.length) {
+    try {
+      const stripe = requireStripe();
+      const CHUNK = 8;
+      for (let i = 0; i < unpaid.length; i += CHUNK) {
+        await Promise.all(
+          unpaid.slice(i, i + CHUNK).map(async (r) => {
+            try {
+              const inv = await stripe.invoices.retrieve(r.stripe_invoice_id);
+              amountDue.set(r.id, {
+                amount: minorToMajor(inv.amount_due ?? inv.total ?? 0),
+                currency: String(inv.currency || r.currency || "usd").toUpperCase(),
+              });
+            } catch (err) {
+              console.warn("PAYMENTS_AMOUNT_DUE_LOOKUP_FAILED:", { invoice: r.stripe_invoice_id, code: err?.code, message: err?.message });
+            }
+          })
+        );
+      }
+    } catch {
+      // No Stripe key configured: fall back to the plan price below.
+    }
+  }
+  const planPrice = (r) =>
+    r.unit_amount_minor != null
+      ? { amount: minorToMajor(r.unit_amount_minor), currency: String(r.plan_currency || r.currency || "usd").toUpperCase() }
+      : null;
+
   const now = Date.now();
   return {
     filters: { status, type, paid_only: paidOnly, search, search_min_length: SEARCH_MIN_LENGTH },
@@ -367,6 +408,10 @@ async function payments(body) {
       currency: r.currency,
       amount_paid: minorToMajor(r.amount_paid_minor),
       amount_refunded: minorToMajor(r.amount_refunded_minor),
+      // Failed / open invoices only: what Stripe tried to charge (null for
+      // paid ones, whose amount_paid already says it).
+      amount_due:
+        r.status === "failed" || r.status === "open" ? amountDue.get(r.id) || planPrice(r) : null,
       fee: minorToMajor(r.fee_minor),
       net: minorToMajor(r.net_minor),
       status: r.status,
@@ -836,6 +881,303 @@ async function cancellations(body) {
   };
 }
 
+// Renewal invoices that did not go through:
+//   failed   Stripe reported the charge failed (invoice.payment_failed, or the
+//            invoice was marked uncollectible). A retry that later succeeds
+//            turns the row into "paid", so it leaves this list by itself.
+//   pending  still "open" a day after Stripe created it: no success and no
+//            failure yet (e.g. a card payment stuck in processing).
+const FAILED_RENEWAL_STATES = ["failed", "pending"];
+const FAILED_RENEWAL_SQL = `(
+  pt.status = 'failed'
+  OR (pt.status = 'open' AND pt.created_at < UTC_TIMESTAMP() - INTERVAL 1 DAY)
+)`;
+
+// Stripe decline / error codes in plain words for the Reason column.
+const DECLINE_LABEL = {
+  insufficient_funds: "Not enough money on the card",
+  expired_card: "Card has expired",
+  card_declined: "Card declined by the bank",
+  generic_decline: "Card declined by the bank (no reason given)",
+  do_not_honor: "Card declined by the bank (no reason given)",
+  call_issuer: "Card declined: customer must call their bank",
+  lost_card: "Card reported lost",
+  stolen_card: "Card reported stolen",
+  pickup_card: "Card blocked by the bank",
+  restricted_card: "Card blocked by the bank",
+  incorrect_cvc: "Wrong security code (CVC)",
+  invalid_cvc: "Wrong security code (CVC)",
+  incorrect_number: "Wrong card number",
+  invalid_number: "Wrong card number",
+  invalid_expiry_month: "Wrong expiry date",
+  invalid_expiry_year: "Wrong expiry date",
+  authentication_required: "Bank asked the customer to approve the payment (3-D Secure)",
+  approve_with_id: "Bank could not approve the payment, retry may work",
+  processing_error: "Card processing error, retry may work",
+  issuer_not_available: "Customer's bank could not be reached, retry may work",
+  try_again_later: "Bank asked to try again later",
+  card_velocity_exceeded: "Card limit reached",
+  withdrawal_count_limit_exceeded: "Card limit reached",
+  card_not_supported: "Card does not allow this kind of payment",
+  transaction_not_allowed: "Card does not allow this kind of payment",
+  not_permitted: "Card does not allow this kind of payment",
+  service_not_allowed: "Card does not allow this kind of payment",
+  currency_not_supported: "Card cannot pay in this currency",
+  fraudulent: "Bank flagged the payment as possible fraud",
+  merchant_blacklist: "Blocked by Stripe's fraud check",
+  invalid_account: "Card account is closed or invalid",
+  new_account_information_available: "Card details changed, customer must update their card",
+  revocation_of_authorization: "Customer cancelled the payment authorisation with their bank",
+  revocation_of_all_authorizations: "Customer cancelled the payment authorisation with their bank",
+  stop_payment_order: "Customer asked their bank to stop the payment",
+  payment_intent_authentication_failure: "Customer did not complete the bank approval (3-D Secure)",
+  card_decline_rate_limit_exceeded: "Too many declined attempts on this card",
+};
+
+const secsToIso = (s) => (s ? new Date(s * 1000).toISOString().replace(".000Z", "Z") : null);
+
+// What Stripe knows about one failed renewal invoice: the decline reason,
+// the card, how many attempts were made and when Stripe will try again.
+async function failedRenewalDetails(stripe, row) {
+  const invoice = await stripe.invoices.retrieve(row.stripe_invoice_id, { expand: ["payments"] });
+  const payments = invoice.payments?.data || [];
+  const invoicePayment = payments.find((p) => p.is_default) || payments[0] || null;
+  const piRef = invoicePayment?.payment?.payment_intent || row.stripe_payment_intent_id || null;
+  const piId = piRef && typeof piRef === "object" ? piRef.id : piRef;
+
+  let pi = null;
+  if (piId) {
+    try {
+      pi = await stripe.paymentIntents.retrieve(piId, { expand: ["latest_charge"] });
+    } catch (err) {
+      console.warn("FAILED_RENEWAL_PI_LOOKUP_FAILED:", { invoice: row.stripe_invoice_id, code: err?.code, message: err?.message });
+    }
+  }
+  const err = pi?.last_payment_error || null;
+  const charge = pi?.latest_charge && typeof pi.latest_charge === "object" ? pi.latest_charge : null;
+  const outcome = charge?.outcome || null;
+  const card =
+    err?.payment_method?.card ||
+    charge?.payment_method_details?.card ||
+    null;
+
+  const declineCode = err?.decline_code || charge?.outcome?.reason || null;
+  const code = err?.code || charge?.failure_code || null;
+  let label =
+    (declineCode && DECLINE_LABEL[declineCode]) ||
+    (code && DECLINE_LABEL[code]) ||
+    null;
+  if (!label && outcome?.type === "blocked") label = "Blocked by Stripe's fraud check";
+  if (!label && !piId && invoice.status === "open" && !invoice.default_payment_method) label = "No card on file to charge";
+  if (!label && pi?.status === "processing") label = "Payment still processing at the bank";
+  if (!label && pi?.status === "requires_action") label = "Bank asked the customer to approve the payment (3-D Secure)";
+
+  return {
+    invoice_status: invoice.status || null,
+    amount_due: { amount: minorToMajor(invoice.amount_due), currency: String(invoice.currency || "usd").toUpperCase() },
+    attempt_count: Number(invoice.attempt_count || 0),
+    next_retry_at: secsToIso(invoice.next_payment_attempt),
+    payment_status: pi?.status || null,
+    reason: {
+      label,
+      message: err?.message || charge?.failure_message || outcome?.seller_message || null,
+      code,
+      decline_code: declineCode,
+      network_advice: outcome?.advice_code || err?.advice_code || null,
+    },
+    card: card
+      ? {
+          brand: card.brand || null,
+          last4: card.last4 || null,
+          exp_month: card.exp_month || null,
+          exp_year: card.exp_year || null,
+        }
+      : null,
+  };
+}
+
+async function failedRenewals(body) {
+  const { page, limit, offset } = parsePaging(body);
+  const search = parseSearch(body);
+  const state = String(body.state || body.status || "all").toLowerCase();
+  if (state !== "all" && !FAILED_RENEWAL_STATES.includes(state)) {
+    throw httpError(422, `state must be all or one of ${FAILED_RENEWAL_STATES.join(", ")}`);
+  }
+
+  const scope = [
+    "pt.billing_reason = 'subscription_cycle'",
+    FAILED_RENEWAL_SQL,
+    notHiddenOnOrdersSql("pt.stripe_subscription_id"),
+  ];
+  const where = [...scope];
+  const params = [];
+  if (state === "failed") where.push("pt.status = 'failed'");
+  else if (state === "pending") where.push("pt.status = 'open'");
+  if (search) {
+    where.push(`(
+      rs.purchaser_email LIKE ? OR rs.purchaser_name LIKE ? OR rs.attributed_partner_code LIKE ?
+      OR pt.stripe_invoice_id LIKE ? OR pt.stripe_subscription_id LIKE ? OR rs.profile_id LIKE ?
+    )`);
+    params.push(...Array(6).fill(like(search)));
+  }
+  const whereSql = `WHERE ${where.join(" AND ")}`;
+  const from = `
+    FROM payment_transactions pt
+    LEFT JOIN referral_subscriptions rs ON rs.stripe_subscription_id = pt.stripe_subscription_id
+  `;
+
+  const [[{ total }]] = await pool.query(`SELECT COUNT(*) AS total ${from} ${whereSql}`, params);
+  const [rows] = await pool.query(
+    `
+      SELECT
+        pt.id, pt.stripe_subscription_id, pt.stripe_invoice_id, pt.stripe_payment_intent_id,
+        pt.period_start, pt.period_end, pt.currency, pt.status, pt.failure_message,
+        pt.payment_method_type, pt.card_last4, pt.created_at,
+        rs.purchaser_email, rs.purchaser_name, rs.profile_id, rs.attributed_partner_code, rs.qr_id,
+        rs.status AS subscription_status, rs.current_period_start, rs.current_period_end, rs.canceled_at,
+        rs.unit_amount_minor, rs.currency AS plan_currency, rs.created_at AS purchased_at,
+        (
+          SELECT COUNT(*) FROM payment_transactions p2
+          WHERE p2.stripe_subscription_id = pt.stripe_subscription_id
+            AND p2.billing_reason = 'subscription_cycle'
+            AND p2.id <= pt.id
+        ) AS renewal_number
+      ${from} ${whereSql}
+      ORDER BY pt.created_at DESC, pt.id DESC
+      LIMIT ? OFFSET ?
+    `,
+    [...params, limit, offset]
+  );
+
+  // Counts across every failed renewal (ignoring the search and state filter).
+  const [[counts]] = await pool.query(
+    `SELECT COUNT(*) AS total,
+            COALESCE(SUM(pt.status = 'failed'), 0) AS failed,
+            COALESCE(SUM(pt.created_at >= UTC_TIMESTAMP() - INTERVAL 30 DAY), 0) AS last_30_days
+     FROM payment_transactions pt WHERE ${scope.join(" AND ")}`
+  );
+
+  const subIds = [...new Set(rows.map((r) => r.stripe_subscription_id).filter(Boolean))];
+
+  // Phone from Checkout, for a follow-up call.
+  const phoneBySub = new Map();
+  if (subIds.length) {
+    try {
+      const [ship] = await pool.query(
+        "SELECT stripe_subscription_id, phone FROM subscription_shipping_addresses WHERE stripe_subscription_id IN (?)",
+        [subIds]
+      );
+      for (const s of ship) phoneBySub.set(s.stripe_subscription_id, s.phone || null);
+    } catch (err) {
+      console.error("SUPER_ADMIN_ORDERS_FAILED_RENEWAL_SHIPPING_ERROR:", { code: err?.code, message: err?.message });
+    }
+  }
+
+  // Paid since? A later renewal of the same subscription that went through
+  // means the member is back on track even though this invoice failed.
+  const paidLater = new Map();
+  if (subIds.length) {
+    const [paid] = await pool.query(
+      `
+        SELECT stripe_subscription_id, MAX(COALESCE(paid_at, created_at)) AS last_paid_at
+        FROM payment_transactions
+        WHERE stripe_subscription_id IN (?) AND status IN (?)
+        GROUP BY stripe_subscription_id
+      `,
+      [subIds, PAID_STATUSES]
+    );
+    for (const p of paid) paidLater.set(p.stripe_subscription_id, toIso(p.last_paid_at));
+  }
+
+  // The decline reason, card and retry schedule live in Stripe. Best-effort:
+  // a Stripe hiccup leaves `stripe` null and the page falls back to the
+  // message saved by the webhook.
+  const details = new Map();
+  try {
+    const stripe = requireStripe();
+    const CHUNK = 8;
+    for (let i = 0; i < rows.length; i += CHUNK) {
+      await Promise.all(
+        rows.slice(i, i + CHUNK).map(async (r) => {
+          try {
+            details.set(r.id, await failedRenewalDetails(stripe, r));
+          } catch (err) {
+            console.warn("FAILED_RENEWAL_STRIPE_LOOKUP_FAILED:", { invoice: r.stripe_invoice_id, code: err?.code, message: err?.message });
+          }
+        })
+      );
+    }
+  } catch {
+    // No Stripe key configured: details stay null.
+  }
+
+  const codeOf = (r) => String(r.attributed_partner_code || "").toUpperCase() || null;
+  const facilities = await facilityByCode(rows, codeOf);
+
+  const now = Date.now();
+  return {
+    filters: { state, search, search_min_length: SEARCH_MIN_LENGTH },
+    failed_renewals: rows.map((r) => {
+      const d = details.get(r.id) || null;
+      const lastPaid = paidLater.get(r.stripe_subscription_id) || null;
+      const createdIso = toIso(r.created_at);
+      return {
+        id: Number(r.id),
+        failed_at: createdIso,
+        // failed = Stripe reported a failure; pending = no outcome after a day.
+        state: r.status === "failed" ? "failed" : "pending",
+        customer: {
+          name: r.purchaser_name || null,
+          email: r.purchaser_email || null,
+          phone: phoneBySub.get(r.stripe_subscription_id) || null,
+          // The linked app profile (null until the buyer redeems their code).
+          profile_id: r.profile_id || null,
+        },
+        partner_code: r.attributed_partner_code || null,
+        qr_id: r.qr_id || null,
+        facility: (codeOf(r) && facilities.get(codeOf(r))) || null,
+        purchased_at: toIso(r.purchased_at),
+        renewal_number: r.renewal_number == null ? null : Number(r.renewal_number),
+        period_start: toIso(r.period_start),
+        period_end: toIso(r.period_end),
+        // Amount Stripe tried to charge (from Stripe; plan price as fallback).
+        amount_due:
+          d?.amount_due ||
+          (r.unit_amount_minor != null
+            ? { amount: minorToMajor(r.unit_amount_minor), currency: String(r.plan_currency || r.currency || "usd").toUpperCase() }
+            : null),
+        // Why it failed: the webhook's saved message, plus Stripe's detail.
+        failure_message: r.failure_message || null,
+        reason: d?.reason || null,
+        card: d?.card || (r.card_last4 ? { brand: null, last4: r.card_last4, exp_month: null, exp_year: null } : null),
+        attempt_count: d?.attempt_count ?? null,
+        next_retry_at: d?.next_retry_at || null,
+        invoice_status: d?.invoice_status || null,
+        payment_status: d?.payment_status || null,
+        // A paid invoice of this subscription newer than this failure.
+        paid_since: lastPaid && createdIso && Date.parse(lastPaid) > Date.parse(createdIso) ? lastPaid : null,
+        plan: {
+          subscription_status: deriveSubscriptionStatus(r, now),
+          stripe_status: r.subscription_status || null,
+          current_period_start: toIso(r.current_period_start),
+          current_period_end: toIso(r.current_period_end),
+          canceled_at: toIso(r.canceled_at),
+        },
+        stripe_subscription_id: r.stripe_subscription_id,
+        stripe_invoice_id: r.stripe_invoice_id,
+      };
+    }),
+    summary: {
+      total: Number(counts.total || 0),
+      failed: Number(counts.failed || 0),
+      pending: Number(counts.total || 0) - Number(counts.failed || 0),
+      last_30_days: Number(counts.last_30_days || 0),
+    },
+    state_options: FAILED_RENEWAL_STATES,
+    pagination: { page, limit, total: Number(total), total_pages: Math.max(1, Math.ceil(Number(total) / limit)) },
+  };
+}
+
 // ─── Controller ──────────────────────────────────────────────────────────────
 
 const superAdminOrders = async (req, res) => {
@@ -860,7 +1202,8 @@ const superAdminOrders = async (req, res) => {
     else if (view === "payments") payload = await payments(body);
     else if (view === "upcoming_renewals") payload = await upcomingRenewals(body);
     else if (view === "cancellations") payload = await cancellations(body);
-    else return res.status(422).json({ status: false, ok: false, message: "view must be shipping, payments, upcoming_renewals or cancellations" });
+    else if (view === "failed_renewals") payload = await failedRenewals(body);
+    else return res.status(422).json({ status: false, ok: false, message: "view must be shipping, payments, upcoming_renewals, cancellations or failed_renewals" });
 
     // Shipping rows carry buyers' home addresses and phones: log every read.
     await H.writeAuthLogSafe(req, {
