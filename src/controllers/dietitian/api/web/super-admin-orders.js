@@ -20,6 +20,11 @@
  *                  paid_only=true drops invoices that never went through
  *                  (failed / open): the Renewals tab lists members who did
  *                  renew. Refunds stay, since the renewal was paid first.
+ *   facility_id    (optional, every view except facility_options) narrows the
+ *                  list, summary and counts to one facility's network: the
+ *                  facility's and its facility admin's codes plus its trainers
+ *                  (see facilityFilter). view=facility_options lists the
+ *                  facilities with their facility admin for the picker.
  *   view=upcoming_renewals
  *                  referral_subscriptions still set to renew (active or
  *                  trialing, not cancelled) whose current_period_end falls in
@@ -133,6 +138,77 @@ function parseSearch(body) {
 
 const like = (s) => `%${s.replace(/[\\%_]/g, (c) => `\\${c}`)}%`;
 
+// Optional facility filter (body.facility_id): the sales of one facility's
+// network, the same people the Facility column names. A sale belongs to the
+// facility when the subscription was stamped with it (rs.facility_id) or its
+// partner code is one of: the facility's own code, its facility admin's code,
+// any account or invitation tied to the facility, or a trainer the facility
+// admin invited (as on the admin's own Sales & Payments page).
+// Returns null (no filter) or { facility, sql, params } where sql uses `rs.`.
+async function facilityFilter(body) {
+  const raw = body.facility_id;
+  if (raw == null || raw === "" || String(raw).toLowerCase() === "all") return null;
+  const id = Number(raw);
+  if (!Number.isInteger(id) || id <= 0) throw httpError(422, "facility_id must be all or a facility id");
+
+  const [[f]] = await pool.query(
+    `SELECT f.id, f.name, UPPER(TRIM(f.partner_code)) AS partner_code, LOWER(f.facility_admin_user_id) AS admin_user_id,
+            NULLIF(TRIM(td.name), '') AS admin_name
+     FROM facilities f
+     LEFT JOIN table_dietician td ON LOWER(td.email) = LOWER(f.facility_admin_user_id)
+     WHERE f.id = ? LIMIT 1`,
+    [id]
+  );
+  if (!f) throw httpError(404, "Facility not found");
+
+  const admin = f.admin_user_id || "";
+  const [roleCodes] = await pool.query(
+    `SELECT DISTINCT UPPER(TRIM(partner_code)) AS code FROM app_user_roles
+     WHERE partner_code IS NOT NULL AND TRIM(partner_code) <> ''
+       AND (facility_id = ? OR LOWER(user_id) = ? OR (role = 'trainer' AND LOWER(parent_user_id) = ?))`,
+    [id, admin, admin]
+  );
+  const [inviteCodes] = await pool.query(
+    `SELECT DISTINCT UPPER(TRIM(partner_code)) AS code FROM app_user_invitations
+     WHERE partner_code IS NOT NULL AND TRIM(partner_code) <> '' AND facility_id = ?`,
+    [id]
+  );
+  const codes = [...new Set([f.partner_code, ...roleCodes.map((r) => r.code), ...inviteCodes.map((r) => r.code)].filter(Boolean))];
+
+  return {
+    facility: { id: Number(f.id), name: f.name, partner_code: f.partner_code || null, admin_user_id: f.admin_user_id || null, admin_name: f.admin_name || null },
+    sql: codes.length ? "(rs.facility_id = ? OR UPPER(rs.attributed_partner_code) IN (?))" : "rs.facility_id = ?",
+    params: codes.length ? [id, codes] : [id],
+  };
+}
+
+// Facilities for the Orders filter, with their facility admin, by name.
+async function facilityOptions() {
+  const [rows] = await pool.query(
+    `SELECT f.id, f.name, UPPER(TRIM(f.partner_code)) AS partner_code, f.status,
+            LOWER(f.facility_admin_user_id) AS admin_user_id, NULLIF(TRIM(td.name), '') AS admin_name
+     FROM facilities f
+     LEFT JOIN table_dietician td ON LOWER(td.email) = LOWER(f.facility_admin_user_id)
+     ORDER BY f.name, f.id`
+  );
+  // table_dietician can hold the same email twice: keep one row per facility.
+  const seen = new Set();
+  const facilities = [];
+  for (const r of rows) {
+    if (seen.has(r.id)) continue;
+    seen.add(r.id);
+    facilities.push({
+      id: Number(r.id),
+      name: r.name,
+      partner_code: r.partner_code || null,
+      status: r.status || null,
+      admin_user_id: r.admin_user_id || null,
+      admin_name: r.admin_name || null,
+    });
+  }
+  return { facilities };
+}
+
 // Partner code → { id, name, partner_code, status, admin_user_id, admin_name }
 // for the codes on this page. Only names a column, so a failed lookup leaves
 // the facility empty instead of failing the shipping list.
@@ -195,6 +271,11 @@ async function shipping(body) {
   // Internal test subscriptions stay off the Orders page.
   const where = [notHiddenOnOrdersSql("sa.stripe_subscription_id")];
   const params = [];
+  const fac = await facilityFilter(body);
+  if (fac) {
+    where.push(fac.sql);
+    params.push(...fac.params);
+  }
   if (search) {
     where.push(`(
       rs.purchaser_email LIKE ? OR rs.purchaser_name LIKE ? OR sa.name LIKE ? OR sa.phone LIKE ?
@@ -292,6 +373,11 @@ async function payments(body) {
     scope.push(`pt.status IN (${PAID_STATUSES.map(() => "?").join(", ")})`);
     scopeParams.push(...PAID_STATUSES);
   }
+  const fac = await facilityFilter(body);
+  if (fac) {
+    scope.push(fac.sql);
+    scopeParams.push(...fac.params);
+  }
 
   const where = [];
   const params = [];
@@ -344,8 +430,10 @@ async function payments(body) {
   // Totals per status and currency across every payment of this type (not
   // just this page, and ignoring the status and search filters).
   const [counts] = await pool.query(
-    `SELECT status, currency, COUNT(*) AS n, SUM(amount_paid_minor) AS paid, SUM(amount_refunded_minor) AS refunded
-     FROM payment_transactions pt WHERE ${scope.join(" AND ")} GROUP BY status, currency`,
+    `SELECT pt.status, pt.currency, COUNT(*) AS n, SUM(pt.amount_paid_minor) AS paid, SUM(pt.amount_refunded_minor) AS refunded
+     FROM payment_transactions pt
+     ${fac ? "LEFT JOIN referral_subscriptions rs ON rs.stripe_subscription_id = pt.stripe_subscription_id" : ""}
+     WHERE ${scope.join(" AND ")} GROUP BY pt.status, pt.currency`,
     scopeParams
   );
 
@@ -461,6 +549,11 @@ async function upcomingRenewals(body) {
     notHiddenOnOrdersSql("rs.stripe_subscription_id"),
   ];
   const params = [days];
+  const fac = await facilityFilter(body);
+  if (fac) {
+    where.push(fac.sql);
+    params.push(...fac.params);
+  }
   if (search) {
     where.push(`(
       rs.purchaser_email LIKE ? OR rs.purchaser_name LIKE ? OR rs.attributed_partner_code LIKE ?
@@ -714,8 +807,14 @@ async function cancellations(body) {
     "LEFT(rs.stripe_subscription_id, 5) <> 'test_'",
     notHiddenOnOrdersSql("rs.stripe_subscription_id"),
   ];
+  const scopeParams = [];
+  const fac = await facilityFilter(body);
+  if (fac) {
+    scope.push(fac.sql);
+    scopeParams.push(...fac.params);
+  }
   const where = [...scope];
-  const params = [];
+  const params = [...scopeParams];
   if (state === "scheduled") where.push(SCHEDULED_SQL);
   else if (state === "ended") where.push(`NOT ${SCHEDULED_SQL}`);
   if (search) {
@@ -748,7 +847,8 @@ async function cancellations(body) {
   const [[counts]] = await pool.query(
     `SELECT COUNT(*) AS total, COALESCE(SUM(${SCHEDULED_SQL}), 0) AS scheduled,
             COALESCE(SUM(rs.canceled_at >= UTC_TIMESTAMP() - INTERVAL 30 DAY), 0) AS last_30_days
-     FROM referral_subscriptions rs WHERE ${scope.join(" AND ")}`
+     FROM referral_subscriptions rs WHERE ${scope.join(" AND ")}`,
+    scopeParams
   );
 
   const subIds = rows.map((r) => r.stripe_subscription_id).filter(Boolean);
@@ -1009,8 +1109,14 @@ async function failedRenewals(body) {
     FAILED_RENEWAL_SQL,
     notHiddenOnOrdersSql("pt.stripe_subscription_id"),
   ];
+  const scopeParams = [];
+  const fac = await facilityFilter(body);
+  if (fac) {
+    scope.push(fac.sql);
+    scopeParams.push(...fac.params);
+  }
   const where = [...scope];
-  const params = [];
+  const params = [...scopeParams];
   if (state === "failed") where.push("pt.status = 'failed'");
   else if (state === "pending") where.push("pt.status = 'open'");
   if (search) {
@@ -1054,7 +1160,10 @@ async function failedRenewals(body) {
     `SELECT COUNT(*) AS total,
             COALESCE(SUM(pt.status = 'failed'), 0) AS failed,
             COALESCE(SUM(pt.created_at >= UTC_TIMESTAMP() - INTERVAL 30 DAY), 0) AS last_30_days
-     FROM payment_transactions pt WHERE ${scope.join(" AND ")}`
+     FROM payment_transactions pt
+     ${fac ? "LEFT JOIN referral_subscriptions rs ON rs.stripe_subscription_id = pt.stripe_subscription_id" : ""}
+     WHERE ${scope.join(" AND ")}`,
+    scopeParams
   );
 
   const subIds = [...new Set(rows.map((r) => r.stripe_subscription_id).filter(Boolean))];
@@ -1203,7 +1312,8 @@ const superAdminOrders = async (req, res) => {
     else if (view === "upcoming_renewals") payload = await upcomingRenewals(body);
     else if (view === "cancellations") payload = await cancellations(body);
     else if (view === "failed_renewals") payload = await failedRenewals(body);
-    else return res.status(422).json({ status: false, ok: false, message: "view must be shipping, payments, upcoming_renewals, cancellations or failed_renewals" });
+    else if (view === "facility_options") payload = await facilityOptions();
+    else return res.status(422).json({ status: false, ok: false, message: "view must be shipping, payments, upcoming_renewals, cancellations, failed_renewals or facility_options" });
 
     // Shipping rows carry buyers' home addresses and phones: log every read.
     await H.writeAuthLogSafe(req, {
