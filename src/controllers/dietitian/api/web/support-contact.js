@@ -4,7 +4,7 @@
  * POST /dietitian/api/web/support-contact                 (public — no JWT)
  *
  * The "Still need help?" form on rysflo.com/help. Emails the message to the
- * team (SUPPORT_CONTACT_EMAILS, default connect@humorstech.com) through Resend,
+ * team (SUPPORT_CONTACT_EMAILS, default connect@humorstech.com + support@rysflo.com) through Resend,
  * with Reply-To set to the visitor so the team can answer straight from the
  * inbox. Nothing is stored.
  *
@@ -37,10 +37,10 @@ const RESEND_FROM_EMAIL = process.env.RESEND_FROM_EMAIL || "Rysflo <no-reply@res
 const SKIP_OUTBOUND_EMAIL =
   process.env.NODE_ENV !== "production" && String(process.env.SKIP_OUTBOUND_EMAIL || "").toLowerCase() === "true";
 
-// Team inboxes. Comma / semicolon / space separated. Unset → connect@humorstech.com.
+// Team inboxes. Comma / semicolon / space separated. Unset → connect@humorstech.com + support@rysflo.com.
 const SUPPORT_CONTACT_EMAILS = [
   ...new Set(
-    String(process.env.SUPPORT_CONTACT_EMAILS ?? "connect@humorstech.com")
+    String(process.env.SUPPORT_CONTACT_EMAILS ?? "connect@humorstech.com,support@rysflo.com")
       .split(/[,;\s]+/)
       .map((e) => e.trim().toLowerCase())
       .filter((e) => e.includes("@"))
