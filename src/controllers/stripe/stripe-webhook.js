@@ -243,9 +243,14 @@ async function onCheckoutSessionCompleted(stripe, session) {
     }
   }
 
-  // Payment confirmation to the buyer (once per session).
-  const receipt = await paymentEmails.sendPaymentReceipt({ session, subscription, partnerCode: md.attributed_partner_code || null, purchaseCodeSent });
-  if (!receipt.ok) console.warn("PAYMENT_RECEIPT_EMAIL_NOT_SENT:", { session: session.id, reason: receipt.reason });
+  // Payment confirmation to the buyer (once per session). An app renewal gets
+  // the renewal confirmation instead (sent from invoice.paid), not the
+  // new-purchase receipt: nothing ships with a renewal.
+  const appRenewal = md.source === "app_renewal";
+  if (!appRenewal) {
+    const receipt = await paymentEmails.sendPaymentReceipt({ session, subscription, partnerCode: md.attributed_partner_code || null, purchaseCodeSent });
+    if (!receipt.ok) console.warn("PAYMENT_RECEIPT_EMAIL_NOT_SENT:", { session: session.id, reason: receipt.reason });
+  }
 
   // Internal copy to the team (once per session). A delayed payment method
   // leaves the session completed but unpaid; that is reported as PENDING and
@@ -253,7 +258,7 @@ async function onCheckoutSessionCompleted(stripe, session) {
   const pendingPayment = session.payment_status === "unpaid";
   await paymentEmails.sendPaymentAlert({
     outcome: pendingPayment ? "pending" : "success",
-    kind: pendingPayment ? "New purchase (payment pending)" : "New purchase",
+    kind: (appRenewal ? "App renewal" : "New purchase") + (pendingPayment ? " (payment pending)" : ""),
     amountMinor: session.amount_total,
     currency: session.currency || subscription.currency,
     buyerEmail: purchaserEmail,
@@ -469,7 +474,14 @@ async function onInvoicePaid(stripe, invoice) {
   await recordInvoice(invoice);
 
   // First invoices are announced by checkout.session.completed; renewals here.
-  if (!synced || invoice.billing_reason === "subscription_create") return;
+  // An app renewal's first invoice is a renewal for the member, so it gets the
+  // renewal confirmation (the team alert comes from checkout.session.completed).
+  if (!synced) return;
+  if (invoice.billing_reason === "subscription_create") {
+    const md = invoice.parent?.subscription_details?.metadata || invoice.subscription_details?.metadata || invoice.metadata || {};
+    if (md.source === "app_renewal") await paymentEmails.sendRenewalConfirmation(invoice);
+    return;
+  }
   if (invoice.billing_reason === "subscription_cycle") await paymentEmails.sendRenewalConfirmation(invoice);
   const subId = invoiceSubscriptionId(invoice);
   await paymentEmails.sendPaymentAlert({

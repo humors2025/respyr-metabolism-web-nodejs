@@ -184,6 +184,15 @@ async function syncInvoice(stripe, invoiceOrId, { failure = false } = {}) {
 
   const rs = await referralSubscriptionFor(subscriptionId);
 
+  const md = invoice.parent?.subscription_details?.metadata || invoice.subscription_details?.metadata || invoice.metadata || {};
+  // An app renewal (Renew button for an ended plan) is a new Stripe
+  // subscription, so its first invoice says subscription_create. Store it as
+  // a renewal so every dashboard counts it as one, not as a new sale.
+  const billingReason =
+    invoice.billing_reason === "subscription_create" && md.source === "app_renewal"
+      ? "subscription_cycle"
+      : invoice.billing_reason;
+
   await optionalTable("payment_transactions", () => pool.execute(
     `
       INSERT INTO payment_transactions (
@@ -213,7 +222,7 @@ async function syncInvoice(stripe, invoiceOrId, { failure = false } = {}) {
       invoice.id,
       paymentIntentId,
       idOf(charge),
-      clip(invoice.billing_reason, 32),
+      clip(billingReason, 32),
       toMysqlDateTime(line?.period?.start ?? invoice.period_start),
       toMysqlDateTime(line?.period?.end ?? invoice.period_end),
       Number(invoice.amount_paid || 0),
@@ -231,7 +240,6 @@ async function syncInvoice(stripe, invoiceOrId, { failure = false } = {}) {
 
   // Sales team copy (sales_crm.stripe_payments). Best-effort: logs and moves
   // on, so a sales_crm problem can never cost the ledger or the buyer.
-  const md = invoice.parent?.subscription_details?.metadata || invoice.subscription_details?.metadata || invoice.metadata || {};
   const purchaserEmail = clip(invoice.customer_email || rs?.purchaser_email, 255);
   const shipping = salesCrm.isEnabled() ? await shippingForSalesCrm(subscriptionId, invoice) : {};
   await salesCrm.upsertPayment({
@@ -244,7 +252,7 @@ async function syncInvoice(stripe, invoiceOrId, { failure = false } = {}) {
     purchaser_email: purchaserEmail ? purchaserEmail.toLowerCase() : null,
     purchaser_name: clip(invoice.customer_name || rs?.purchaser_name, 150),
     partner_code: clip(md.attributed_partner_code || rs?.attributed_partner_code, 50),
-    billing_reason: clip(invoice.billing_reason, 32),
+    billing_reason: clip(billingReason, 32),
     period_start: toMysqlDateTime(line?.period?.start ?? invoice.period_start),
     period_end: toMysqlDateTime(line?.period?.end ?? invoice.period_end),
     amount_paid_minor: Number(invoice.amount_paid || 0),

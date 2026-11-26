@@ -144,6 +144,12 @@ async function loadPurchases(p) {
       FROM referral_subscriptions rs
       WHERE rs.created_at >= ? AND rs.created_at < ?
         AND ${realSubscriptionSql("rs.stripe_subscription_id")}
+        -- An app renewal is a new subscription for an ended plan: counted
+        -- as a renewal (payment_transactions), never as a new sale.
+        AND NOT EXISTS (
+          SELECT 1 FROM referral_subscriptions od
+          WHERE od.renewal_session_id = rs.stripe_checkout_session_id
+        )
       ORDER BY rs.created_at DESC, rs.id DESC
     `,
     [p.startUtc, p.endUtc]
