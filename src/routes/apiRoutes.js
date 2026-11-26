@@ -320,6 +320,7 @@ const { listFacilities } = require("../controllers/dietitian/api/web/list-facili
 const { updateFacility } = require("../controllers/dietitian/api/web/update-facility");
 const { facilityEditLogs } = require("../controllers/dietitian/api/web/facility-edit-logs");
 const { supportContact } = require("../controllers/dietitian/api/web/support-contact");
+const renewal = require("../controllers/renewal/renewal");
 const { supportContactRateLimiter, supportContactIpRateLimiter } = require("../middlewares/supportContactRateLimiter");
 
 const {
@@ -1131,6 +1132,11 @@ router.post("/dietitian/api/web/order-page-context", referralOps.orderPageContex
 router.post("/dietitian/api/web/order-session-status", referralOps.orderSessionStatus);
 // Public: rysflo.com/help "Still need help?" form → team inbox (no JWT).
 router.post("/dietitian/api/web/support-contact", supportContactIpRateLimiter, supportContactRateLimiter, supportContact);
+// App "Renew plan" button → rysflo.com/renewal. /v1 is stripped in index.js, so
+// these answer at /v1/renewal/link and /v1/renewal/session. The link route checks
+// the APP's login JWT itself (APP_JWT_* env), not the dashboard authMiddleware.
+router.post("/renewal/link", renewal.createRenewalLink);
+router.post("/renewal/session", renewal.getRenewalSession);
 // … and authenticated operations.
 router.post("/dietitian/api/web/referred-members", authMiddleware, referralOps.referredMembers);
 router.post("/dietitian/api/web/resend-purchase-code", authMiddleware, referralOps.resendPurchaseCode);
