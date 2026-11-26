@@ -132,6 +132,7 @@
 
 const crypto = require("crypto");
 const pool = require("../../../../config/db");
+const { applyOverridesToFeed } = require("../../../../services/macroOverrides");
 const {
   serviceKeyCanUseDieticianCode,
 } = require("../../../../middlewares/serviceAuthMiddleware");
@@ -658,6 +659,12 @@ ${latestHabitsJoin}
         },
       });
     }
+
+    // ── 4b. Hand-edited macros (same as get_latest_72hr_tests) ──────────────
+    // An edit made on the dashboard's Macros Analysis tab replaces
+    // final_macro_summary while its date range covers the plan week, so an
+    // operator can re-run one client right after their macros were edited.
+    await applyOverridesToFeed(data);
 
     // ── 5. Audit the PHI read ───────────────────────────────────────────────
     // Awaited, not fire-and-forget: on Lambda the environment can freeze as soon

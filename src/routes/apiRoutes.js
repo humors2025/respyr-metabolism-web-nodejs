@@ -120,6 +120,12 @@ const {
 } = require("../controllers/dietitian/api/web/get_macro_summary_by_date");
 
 const {
+  get_macro_overrides,
+  save_macro_override,
+  remove_macro_override,
+} = require("../controllers/dietitian/api/web/macro-overrides");
+
+const {
   habitsTrackingUsersChoice,
 } = require("../controllers/dietitian/api/web/habits-tracking-users-choice1");
 
@@ -790,6 +796,26 @@ router.post(
   "/dietitian/api/web/get_macro_summary_by_date",
   authMiddleware,
   get_macro_summary_by_date
+);
+
+// Hand-edited macros (Macros Analysis tab) — used by the diet-plan worker feed
+// while their date range covers the plan week. See services/macroOverrides.js.
+router.post(
+  "/dietitian/api/web/get_macro_overrides",
+  authMiddleware,
+  get_macro_overrides
+);
+
+router.post(
+  "/dietitian/api/web/save_macro_override",
+  authMiddleware,
+  save_macro_override
+);
+
+router.post(
+  "/dietitian/api/web/remove_macro_override",
+  authMiddleware,
+  remove_macro_override
 );
 
 

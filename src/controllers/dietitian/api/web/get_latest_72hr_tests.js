@@ -95,6 +95,10 @@
 
 const crypto = require("crypto");
 const pool = require("../../../../config/db");
+const {
+  applyOverridesToFeed,
+  recentOverrideFeedUnion,
+} = require("../../../../services/macroOverrides");
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -372,9 +376,13 @@ const getLatest72hrTests = async (req, res) => {
         ? ""
         : `AND UPPER(TRIM(t.dietitian_id)) IN (${codeList.map(() => "?").join(", ")})`;
 
-    const params = [safeCursor, ...codeList];
+    // Clients whose macros were hand-edited recently (or whose edit starts
+    // today) are added to the feed even without a test in the last 72 hours,
+    // so the worker re-plans them with the edited numbers. Empty when the
+    // macro_overrides table does not exist — then the feed is unchanged.
+    const overrideUnion = await recentOverrideFeedUnion();
 
-    const [rows] = await pool.execute(
+    const runFeedQuery = (union) => pool.execute(
       `
         SELECT
           t.dietitian_id,
@@ -401,8 +409,12 @@ const getLatest72hrTests = async (req, res) => {
                 dietitian_id,
                 profile_id,
                 MAX(test_id) AS latest_test_id
-            FROM table_test_data FORCE INDEX (idx_72hr_fetch_unique_user)
-            WHERE date_time >= (NOW() - INTERVAL 72 HOUR)
+            FROM (
+                SELECT dietitian_id, profile_id, test_id
+                FROM table_test_data FORCE INDEX (idx_72hr_fetch_unique_user)
+                WHERE date_time >= (NOW() - INTERVAL 72 HOUR)
+                ${union.sql}
+            ) feed_tests
             GROUP BY dietitian_id, profile_id
         ) latest
             ON latest.dietitian_id = t.dietitian_id
@@ -440,8 +452,20 @@ const getLatest72hrTests = async (req, res) => {
         ORDER BY t.test_id ASC
         LIMIT ${limit}
       `,
-      params
+      [...union.params, safeCursor, ...codeList]
     );
+
+    let rows;
+    try {
+      [rows] = await runFeedQuery(overrideUnion);
+    } catch (err) {
+      // The edited-macros branch must never stop the feed: if it fails (e.g. a
+      // collation mismatch between macro_overrides and table_test_data), log
+      // it and run the original 72-hour query on its own.
+      if (!overrideUnion.sql) throw err;
+      console.error("LATEST_72HR_OVERRIDE_UNION_FAILED:", err?.code || err?.message);
+      [rows] = await runFeedQuery({ sql: "", params: [] });
+    }
 
     // ── 4. Shape the rows ───────────────────────────────────────────────────
     let nextCursor = safeCursor;
@@ -492,6 +516,13 @@ const getLatest72hrTests = async (req, res) => {
         },
       });
     }
+
+    // ── 4b. Hand-edited macros ──────────────────────────────────────────────
+    // Where a dashboard user edited this client's macros for the week being
+    // planned, final_macro_summary carries the edited numbers and
+    // original_macro_summary the test's own; macro_override says who and for
+    // which dates. Never throws — on failure the test numbers are kept.
+    await applyOverridesToFeed(data);
 
     // ── 5. Audit the bulk PHI read ──────────────────────────────────────────
     // Awaited, not fire-and-forget: on Lambda the environment can freeze as soon as
