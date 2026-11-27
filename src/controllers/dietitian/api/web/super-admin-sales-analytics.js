@@ -60,6 +60,49 @@ const SUB_STATUS_LABEL = { canceled: "cancelled", incomplete_expired: "expired" 
 const minorToMajor = (v) => (v == null ? null : Math.round(Number(v)) / 100);
 const pad = (n) => String(n).padStart(2, "0");
 
+// ─── Members who come back ───────────────────────────────────────────────────
+//
+// Once a plan is cancelled and over, Stripe cannot restart it: buying again
+// (website or app Renew button) creates a NEW subscription row. The page
+// treats that as the same member renewing (user's rule, 27 Nov 2026):
+//   - the old plan is not listed under Cancellations any more
+//   - the old plan's last month counts as renewed
+//   - the new plan's first payment is a renewal, not a new sale
+// Same member = same app profile, else same purchase email. The old plan must
+// have been cancelled (or ended) before the new one was bought, so a second
+// plan bought alongside a running one stays a new sale.
+
+const LIVE_ROW_SQL = (a) => `${a}.status NOT IN ('incomplete', 'incomplete_expired')`;
+
+const samePersonSql = (a, b) => `(
+  (${a}.profile_id IS NOT NULL AND ${a}.profile_id <> '' AND ${a}.profile_id = ${b}.profile_id)
+  OR (${a}.purchaser_email IS NOT NULL AND ${a}.purchaser_email <> '' AND LOWER(${a}.purchaser_email) = LOWER(${b}.purchaser_email))
+)`;
+
+/** SQL: subscription row `nw` is the member of row `od` coming back. */
+const cameBackSql = (od, nw) => `(
+  ${nw}.id <> ${od}.id
+  AND ${nw}.created_at > ${od}.created_at
+  AND ${samePersonSql(od, nw)}
+  AND ${LIVE_ROW_SQL(od)} AND ${LIVE_ROW_SQL(nw)}
+  AND ${realSubscriptionSql(`${od}.stripe_subscription_id`)}
+  AND ${realSubscriptionSql(`${nw}.stripe_subscription_id`)}
+  AND (
+    ${od}.canceled_at <= ${nw}.created_at
+    OR (${od}.status IN ('canceled', 'unpaid') AND ${od}.current_period_end <= DATE_ADD(${nw}.created_at, INTERVAL 1 DAY))
+  )
+)`;
+
+/** SQL: row `a` is a comeback purchase (a renewal, not a new sale). */
+const isComebackSql = (a) => `EXISTS (SELECT 1 FROM referral_subscriptions cb_old WHERE ${cameBackSql("cb_old", a)})`;
+
+/** SQL: the member of row `a` came back later on a new plan. */
+const cameBackLaterSql = (a) => `EXISTS (SELECT 1 FROM referral_subscriptions cb_new WHERE ${cameBackSql(a, "cb_new")})`;
+
+/** SQL: payment `pt` (of subscription row `rs`) is a renewal payment. */
+const renewalPaymentSql = (pt, rs) =>
+  `(${pt}.billing_reason = 'subscription_cycle' OR (${pt}.billing_reason = 'subscription_create' AND ${isComebackSql(rs)}))`;
+
 function fmtUtc(ms) {
   const d = new Date(ms);
   return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`;
@@ -150,6 +193,8 @@ async function loadPurchases(p) {
           SELECT 1 FROM referral_subscriptions od
           WHERE od.renewal_session_id = rs.stripe_checkout_session_id
         )
+        -- A member coming back after a cancelled, finished plan is a renewal.
+        AND NOT ${isComebackSql("rs")}
       ORDER BY rs.created_at DESC, rs.id DESC
     `,
     [p.startUtc, p.endUtc]
@@ -582,7 +627,7 @@ async function renewalsAndRetention(p, scope, currency, counted, firstPaymentNet
                rs.attributed_partner_code, rs.attributed_user_id, rs.facility_id
         FROM payment_transactions pt
         JOIN referral_subscriptions rs ON rs.stripe_subscription_id = pt.stripe_subscription_id
-        WHERE pt.billing_reason = 'subscription_cycle'
+        WHERE ${renewalPaymentSql("pt", "rs")}
           AND pt.status IN ${PAID_INVOICE}
           AND COALESCE(pt.paid_at, pt.created_at) >= ? AND COALESCE(pt.paid_at, pt.created_at) < ?
           AND ${realSubscriptionSql("rs.stripe_subscription_id")}
@@ -600,6 +645,11 @@ async function renewalsAndRetention(p, scope, currency, counted, firstPaymentNet
                    AND n.billing_reason = 'subscription_cycle'
                    AND n.status IN ${PAID_INVOICE}
                    AND n.period_start >= DATE_SUB(pt.period_end, INTERVAL 1 DAY)
+               ) OR EXISTS (
+                 -- came back later on a new plan after cancelling
+                 SELECT 1 FROM referral_subscriptions nw
+                 WHERE ${cameBackSql("rs", "nw")}
+                   AND nw.created_at >= DATE_SUB(pt.period_end, INTERVAL 1 DAY)
                ) AS renewed
         FROM payment_transactions pt
         JOIN referral_subscriptions rs ON rs.stripe_subscription_id = pt.stripe_subscription_id
@@ -661,10 +711,12 @@ async function renewalsAndRetention(p, scope, currency, counted, firstPaymentNet
   // Every paid membership ever sold in scope.
   const [memberRows] = await pool.query(
     `
-      SELECT status, canceled_at, attributed_partner_code, attributed_user_id, facility_id
-      FROM referral_subscriptions
-      WHERE ${realSubscriptionSql()}
-        AND status NOT IN ('incomplete', 'incomplete_expired')
+      SELECT rs.status, rs.canceled_at, rs.attributed_partner_code, rs.attributed_user_id, rs.facility_id
+      FROM referral_subscriptions rs
+      WHERE ${realSubscriptionSql("rs.stripe_subscription_id")}
+        AND rs.status NOT IN ('incomplete', 'incomplete_expired')
+        -- a member who came back is counted once, on the newer plan
+        AND NOT ${cameBackLaterSql("rs")}
     `
   );
   const members = { total: 0, active: 0, cancellation_scheduled: 0, at_risk: 0, ended: 0 };
@@ -681,7 +733,8 @@ async function renewalsAndRetention(p, scope, currency, counted, firstPaymentNet
       SELECT rs.id, rs.purchaser_name, rs.purchaser_email, rs.profile_id,
              rs.attributed_partner_code, rs.attributed_user_id, rs.facility_id,
              rs.canceled_at, rs.current_period_end, rs.created_at,
-             (rs.status IN ('active', 'trialing', 'past_due') AND rs.current_period_end > UTC_TIMESTAMP()) AS still_active
+             (rs.status IN ('active', 'trialing', 'past_due') AND rs.current_period_end > UTC_TIMESTAMP()) AS still_active,
+             ${cameBackLaterSql("rs")} AS came_back
       FROM referral_subscriptions rs
       WHERE rs.canceled_at >= ? AND rs.canceled_at < ?
         AND ${realSubscriptionSql("rs.stripe_subscription_id")}
@@ -690,11 +743,15 @@ async function renewalsAndRetention(p, scope, currency, counted, firstPaymentNet
     `,
     [p.startUtc, p.endUtc]
   );
-  const cancelled = cancelRows.filter(inScope);
+  // Members who renewed on a new plan afterwards are counted under renewals,
+  // not here; came_back says how many were taken out.
+  const cancelledInScope = cancelRows.filter(inScope);
+  const cancelled = cancelledInScope.filter((r) => !Number(r.came_back));
   const cancelScheduled = cancelled.filter((r) => Number(r.still_active)).length;
   const CANCEL_LIST_MAX = 50;
   const cancellations = {
     total: cancelled.length,
+    came_back: cancelledInScope.length - cancelled.length,
     scheduled: cancelScheduled,
     ended: cancelled.length - cancelScheduled,
     list_limit: CANCEL_LIST_MAX,
@@ -907,7 +964,7 @@ async function monthly(body) {
                rs.attributed_partner_code, rs.attributed_user_id, rs.facility_id
         FROM payment_transactions pt
         JOIN referral_subscriptions rs ON rs.stripe_subscription_id = pt.stripe_subscription_id
-        WHERE pt.billing_reason = 'subscription_cycle'
+        WHERE ${renewalPaymentSql("pt", "rs")}
           AND pt.status IN ${PAID_INVOICE}
           AND ${realSubscriptionSql("rs.stripe_subscription_id")}
       `
@@ -1023,7 +1080,7 @@ async function engagement(p, body) {
                  rs.attributed_user_id, rs.facility_id, rs.status, rs.canceled_at, rs.created_at
           FROM payment_transactions pt
           JOIN referral_subscriptions rs ON rs.stripe_subscription_id = pt.stripe_subscription_id
-          WHERE pt.billing_reason = 'subscription_cycle'
+          WHERE ${renewalPaymentSql("pt", "rs")}
             AND pt.status IN ${PAID_INVOICE}
             AND COALESCE(pt.paid_at, pt.created_at) >= ? AND COALESCE(pt.paid_at, pt.created_at) < ?
             AND ${realSubscriptionSql("rs.stripe_subscription_id")}
