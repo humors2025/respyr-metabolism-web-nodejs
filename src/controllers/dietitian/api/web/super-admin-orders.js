@@ -65,6 +65,7 @@
 
 const pool = require("../../../../config/db");
 const { notHiddenOnOrdersSql } = require("../../../../services/excludedSubscriptions");
+const { isComebackSql, rejoinedAtSql, renewalPaymentSql, firstPaymentSql } = require("../../../../services/rejoinedMembers");
 const { requireStripe } = require("../../../../config/stripe");
 const { creditForReadingDays } = require("../../../../services/breathCredits");
 const { BREATH_CREDIT_EXCLUDE_PROFILES } = require("../../../../config/stripe");
@@ -359,16 +360,15 @@ async function payments(body) {
   if (type !== "all" && !PAYMENT_TYPES[type]) {
     throw httpError(422, `type must be all or one of ${Object.keys(PAYMENT_TYPES).join(", ")}`);
   }
-  const billingReason = type === "all" ? null : PAYMENT_TYPES[type];
 
   // Type and paid-only scope both the list and the summary chips; internal
   // test subscriptions are always left out.
   const scope = [notHiddenOnOrdersSql("pt.stripe_subscription_id")];
   const scopeParams = [];
-  if (billingReason) {
-    scope.push("pt.billing_reason = ?");
-    scopeParams.push(billingReason);
-  }
+  // A member who re-joined after cancelling ("Re-joined Again") pays a new
+  // plan's first invoice, but it counts as a renewal (services/rejoinedMembers).
+  if (type === "renewal") scope.push(renewalPaymentSql("pt", "rs"));
+  else if (type === "first_payment") scope.push(firstPaymentSql("pt", "rs"));
   if (paidOnly) {
     scope.push(`pt.status IN (${PAID_STATUSES.map(() => "?").join(", ")})`);
     scopeParams.push(...PAID_STATUSES);
@@ -412,6 +412,7 @@ async function payments(body) {
         rs.purchaser_email, rs.purchaser_name, rs.profile_id, rs.attributed_partner_code, rs.qr_id,
         rs.status AS subscription_status, rs.current_period_start, rs.current_period_end, rs.canceled_at,
         rs.unit_amount_minor, rs.currency AS plan_currency,
+        (pt.billing_reason = 'subscription_create' AND ${isComebackSql("rs")}) AS rejoined,
         -- Which renewal of its subscription this invoice is (rows are written
         -- in billing order, so earlier renewals have lower ids).
         CASE WHEN pt.billing_reason = 'subscription_cycle' THEN (
@@ -432,7 +433,7 @@ async function payments(body) {
   const [counts] = await pool.query(
     `SELECT pt.status, pt.currency, COUNT(*) AS n, SUM(pt.amount_paid_minor) AS paid, SUM(pt.amount_refunded_minor) AS refunded
      FROM payment_transactions pt
-     ${fac ? "LEFT JOIN referral_subscriptions rs ON rs.stripe_subscription_id = pt.stripe_subscription_id" : ""}
+     ${fac || type !== "all" ? "LEFT JOIN referral_subscriptions rs ON rs.stripe_subscription_id = pt.stripe_subscription_id" : ""}
      WHERE ${scope.join(" AND ")} GROUP BY pt.status, pt.currency`,
     scopeParams
   );
@@ -489,7 +490,12 @@ async function payments(body) {
       partner_code: r.attributed_partner_code || null,
       qr_id: r.qr_id || null, // set = bought by scanning this QR sticker
       facility: (codeOf(r) && facilities.get(codeOf(r))) || null,
-      type: r.billing_reason === "subscription_create" ? "first_payment" : r.billing_reason === "subscription_cycle" ? "renewal" : r.billing_reason || null,
+      type: Number(r.rejoined)
+        ? "renewal"
+        : r.billing_reason === "subscription_create" ? "first_payment" : r.billing_reason === "subscription_cycle" ? "renewal" : r.billing_reason || null,
+      // "Re-joined Again": first payment of a new plan after the member's
+      // earlier plan was cancelled and ended; counted as a renewal.
+      rejoined: Boolean(Number(r.rejoined)),
       renewal_number: r.renewal_number == null ? null : Number(r.renewal_number),
       period_start: toIso(r.period_start),
       period_end: toIso(r.period_end),
@@ -834,7 +840,8 @@ async function cancellations(body) {
         rs.attributed_partner_code, rs.qr_id,
         rs.status AS subscription_status, rs.current_period_start, rs.current_period_end, rs.canceled_at,
         rs.currency, rs.created_at AS purchased_at,
-        ${SCHEDULED_SQL} AS still_active
+        ${SCHEDULED_SQL} AS still_active,
+        ${rejoinedAtSql("rs")} AS rejoined_at
       FROM referral_subscriptions rs
       ${whereSql}
       ORDER BY COALESCE(rs.canceled_at, rs.created_at) DESC, rs.id DESC
@@ -947,6 +954,9 @@ async function cancellations(body) {
         // scheduled = cancelled but still has access until access_ends;
         // ended = the plan is over.
         cancel_state: stillActive ? "scheduled" : "ended",
+        // "Re-joined Again": when the member bought a new plan after this one
+        // (null = has not come back).
+        rejoined_at: toIso(r.rejoined_at),
         access_ends: s?.ended_at || toIso(r.current_period_end),
         payments: h
           ? {
