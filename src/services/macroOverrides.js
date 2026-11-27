@@ -11,7 +11,7 @@
  *     (diet-plan worker feed: edited numbers replace final_macro_summary)
  *
  * Dates are India calendar dates, the same calendar the weekly diet plan uses
- * (store_weekly_food_json_suggestion: Sunday → Saturday, Asia/Kolkata).
+ * (store_weekly_food_json_suggestion_newtest: Friday → Thursday, Asia/Kolkata).
  *
  * The table may not exist on every database (prod has refused new tables
  * before). Every reader here treats a missing table as "no overrides", so the
@@ -31,8 +31,10 @@ const MACRO_LIMITS = {
   fiber_g: { min: 0, max: 150 },
 };
 
-// The longest range one override may cover.
-const MAX_RANGE_DAYS = 366;
+// How many days one edit may cover, counting both the start and end day:
+// at least one full plan week, at most about two months.
+const MIN_RANGE_DAYS = 7;
+const MAX_RANGE_DAYS = 60;
 
 /* ─── Dates ─────────────────────────────────────────────────────────────── */
 
@@ -65,15 +67,20 @@ function daysBetween(a, b) {
 }
 
 /**
- * The diet-plan week that contains `nowMs`, in India: Sunday → Saturday, and
- * on a Sunday the week starts that day. Same rule as
- * store_weekly_food_json_suggestion.js computeWeekWindow().
+ * The diet-plan week the generator writes to at `nowMs`, in India. Same rule
+ * as store_weekly_food_json_suggestion_newtest.js computeWeekWindow() — the
+ * store the dashboard's Diet plan tab reads: weeks run Friday → Thursday, the
+ * generator runs on Thursday for the week starting the next day, so the week
+ * is worked out from "tomorrow":
+ *   Thursday  → the Friday-to-Thursday week starting tomorrow
+ *   Friday    → the week starting today
+ *   Sat … Wed → the week in progress (started the most recent Friday)
  */
 function currentPlanWeek(nowMs = Date.now()) {
-  const today = istToday(nowMs);
-  const [y, m, d] = today.split("-").map(Number);
-  const dayOfWeek = new Date(Date.UTC(y, m - 1, d)).getUTCDay(); // 0 = Sunday
-  const weekStart = addDays(today, -dayOfWeek);
+  const tomorrow = addDays(istToday(nowMs), 1);
+  const [y, m, d] = tomorrow.split("-").map(Number);
+  const dayOfWeek = new Date(Date.UTC(y, m - 1, d)).getUTCDay(); // 0 = Sunday, 5 = Friday
+  const weekStart = addDays(tomorrow, -((dayOfWeek - 5 + 7) % 7));
   return { week_start_date: weekStart, week_end_date: addDays(weekStart, 6) };
 }
 
@@ -185,8 +192,12 @@ function parseRangeInput(body, nowMs = Date.now()) {
   if (validTo < validFrom) {
     return { ok: false, message: "valid_to must be on or after valid_from" };
   }
-  if (daysBetween(validFrom, validTo) > MAX_RANGE_DAYS) {
-    return { ok: false, message: `The range can be at most ${MAX_RANGE_DAYS} days` };
+  const rangeDays = daysBetween(validFrom, validTo) + 1; // both days count
+  if (rangeDays < MIN_RANGE_DAYS) {
+    return { ok: false, message: `Use until must be at least ${MIN_RANGE_DAYS} days (start and end day included)` };
+  }
+  if (rangeDays > MAX_RANGE_DAYS) {
+    return { ok: false, message: `Use until can be at most ${MAX_RANGE_DAYS} days (start and end day included)` };
   }
   return { ok: true, valid_from: validFrom, valid_to: validTo };
 }
@@ -470,6 +481,7 @@ async function recentOverrideFeedUnion({ nowMs = Date.now(), db = pool } = {}) {
 
 module.exports = {
   MACRO_LIMITS,
+  MIN_RANGE_DAYS,
   MAX_RANGE_DAYS,
   KCAL_PER_GRAM,
   istToday,

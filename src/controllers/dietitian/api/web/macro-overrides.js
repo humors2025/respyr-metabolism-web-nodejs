@@ -34,6 +34,7 @@ const {
 } = require("../../../../utils/accessControl");
 const {
   MACRO_LIMITS,
+  MIN_RANGE_DAYS,
   MAX_RANGE_DAYS,
   istToday,
   currentPlanWeek,
@@ -229,6 +230,7 @@ async function buildListPayload(dieticianId, profileId) {
     today,
     plan_week: week,
     limits: MACRO_LIMITS,
+    min_range_days: MIN_RANGE_DAYS,
     max_range_days: MAX_RANGE_DAYS,
     applies_to_current_plan_week: currentRow ? Number(currentRow.id) : null,
     overrides: rows.map((row) => shapeOverride(row, today)),
